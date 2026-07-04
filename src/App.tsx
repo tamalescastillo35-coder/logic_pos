@@ -62,6 +62,8 @@ const BluetoothPrinter = registerPlugin<{
   printEscPos(options: { address: string; data: string }): Promise<{ value: boolean }>;
 }>('BluetoothPrinter');
 import { buildReceiptEscPos, buildTestPrint, uint8ToBase64, columnsForPaperWidth } from './lib/escpos';
+import { isWebUsbSupported, requestUsbPrinter, getPairedUsbPrinters, printUsb } from './lib/webUsbPrinter';
+import { isWebBluetoothSupported, requestBluetoothPrinter, printBluetooth } from './lib/webBluetoothPrinter';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
@@ -368,6 +370,66 @@ export default function App() {
     if (!bluetoothPrinter) return;
     const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth));
     await BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(bytes) });
+  };
+
+  // Direct-to-printer for the plain web build (no APK installed) — WebUSB for a cabled
+  // printer, Web Bluetooth as a best-effort option for printers whose chip also speaks BLE
+  // (see src/lib/webBluetoothPrinter.ts for why classic Bluetooth can't be reached this way).
+  // The live device handle only lives in memory for the session; `webPrinterInfo` persists
+  // just the display name so the settings screen can show what was last connected.
+  const [webUsbDevice, setWebUsbDevice] = useState<USBDevice | null>(null);
+  const [webBluetoothDevice, setWebBluetoothDevice] = useState<BluetoothDevice | null>(null);
+  const [webPrinterInfo, setWebPrinterInfo] = useState<{ mode: 'usb' | 'bluetooth'; name: string } | null>(() => {
+    try {
+      const raw = localStorage.getItem('logicpos_web_printer_info');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  // WebUSB (unlike Web Bluetooth) can silently reattach a previously-authorized device on
+  // load, since the printer is almost certainly still plugged into the same cable.
+  React.useEffect(() => {
+    if (isNativePlatform) return;
+    getPairedUsbPrinters().then(devices => {
+      if (devices.length > 0) {
+        setWebUsbDevice(devices[0]);
+        setWebPrinterInfo({ mode: 'usb', name: devices[0].productName || 'Impresora USB' });
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleConnectWebUsbPrinter = async () => {
+    const device = await requestUsbPrinter();
+    setWebUsbDevice(device);
+    setWebBluetoothDevice(null);
+    const info = { mode: 'usb' as const, name: device.productName || 'Impresora USB' };
+    setWebPrinterInfo(info);
+    localStorage.setItem('logicpos_web_printer_info', JSON.stringify(info));
+  };
+
+  const handleConnectWebBluetoothPrinter = async () => {
+    const device = await requestBluetoothPrinter();
+    setWebBluetoothDevice(device);
+    setWebUsbDevice(null);
+    const info = { mode: 'bluetooth' as const, name: device.name || 'Impresora Bluetooth' };
+    setWebPrinterInfo(info);
+    localStorage.setItem('logicpos_web_printer_info', JSON.stringify(info));
+  };
+
+  const handleForgetWebPrinter = () => {
+    setWebUsbDevice(null);
+    setWebBluetoothDevice(null);
+    setWebPrinterInfo(null);
+    localStorage.removeItem('logicpos_web_printer_info');
+  };
+
+  const handleTestPrintWeb = async () => {
+    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth));
+    if (webUsbDevice) return printUsb(webUsbDevice, bytes);
+    if (webBluetoothDevice) return printBluetooth(webBluetoothDevice, bytes);
+    throw new Error('No hay impresora conectada.');
   };
 
   // Apply branding palette to CSS variables and inject dynamic styles
@@ -1846,29 +1908,32 @@ export default function App() {
       </html>
     `;
 
+    // Shared ESC/POS bytes for every direct-to-printer path below (native Bluetooth, WebUSB,
+    // Web Bluetooth) — only the transport differs between them.
+    const buildEscPosTicket = () => buildReceiptEscPos({
+      businessName: ticketBusinessName,
+      tagline: ticketTagline,
+      saleId: sale.id,
+      timestamp: sale.timestamp,
+      payLabel,
+      customerName: sale.customerName,
+      employeeName: sale.employeeName,
+      items: sale.items,
+      subtotal: sale.subtotal,
+      discount: sale.discount,
+      tax: sale.tax,
+      total: sale.total,
+      showTaxLine: printConfig.showTaxLine,
+      footerText: printConfig.footerText || '¡Gracias por su compra!',
+      columns: columnsForPaperWidth(printConfig.paperWidth),
+      formatMXN,
+    });
+
     if (isNativePlatform && bluetoothPrinter) {
       // Thermal ESC/POS printers (e.g. MERION PT-B1) don't implement Android's Print
       // Framework, so they never appear in ReceiptPrinter's system dialog below — instead we
       // talk straight to the paired device over Bluetooth SPP with raw ESC/POS bytes.
-      const escPosBytes = buildReceiptEscPos({
-        businessName: ticketBusinessName,
-        tagline: ticketTagline,
-        saleId: sale.id,
-        timestamp: sale.timestamp,
-        payLabel,
-        customerName: sale.customerName,
-        employeeName: sale.employeeName,
-        items: sale.items,
-        subtotal: sale.subtotal,
-        discount: sale.discount,
-        tax: sale.tax,
-        total: sale.total,
-        showTaxLine: printConfig.showTaxLine,
-        footerText: printConfig.footerText || '¡Gracias por su compra!',
-        columns: columnsForPaperWidth(printConfig.paperWidth),
-        formatMXN,
-      });
-      BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(escPosBytes) }).catch(err => {
+      BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(buildEscPosTicket()) }).catch(err => {
         console.error('Bluetooth print error:', err);
         alert(`No se pudo imprimir en "${bluetoothPrinter.name}". Verifica que esté encendida y emparejada.`);
       });
@@ -1884,6 +1949,26 @@ export default function App() {
         console.error('Native print error:', err);
         alert('No se pudo abrir el diálogo de impresión. Intenta de nuevo.');
       });
+      return;
+    }
+
+    if (webUsbDevice || webBluetoothDevice) {
+      // Same idea as the native Bluetooth path above, but reached from a plain browser tab —
+      // WebUSB/Web Bluetooth talk straight to the printer, bypassing window.print() entirely.
+      const printPromise = webUsbDevice
+        ? printUsb(webUsbDevice, buildEscPosTicket())
+        : printBluetooth(webBluetoothDevice!, buildEscPosTicket());
+      printPromise.catch(err => {
+        console.error('Web printer error:', err);
+        alert(`No se pudo imprimir en "${webPrinterInfo?.name || 'la impresora'}". ${err?.message || ''}`);
+      });
+      return;
+    }
+
+    if (webPrinterInfo) {
+      // A Bluetooth printer was configured, but Web Bluetooth doesn't allow silently
+      // reattaching after a page reload the way WebUSB does — needs one click to resume.
+      alert(`Reconecta tu impresora "${webPrinterInfo.name}" desde Ajustes > Impresora antes de imprimir.`);
       return;
     }
 
@@ -5249,6 +5334,13 @@ export default function App() {
                 onScanBluetoothPrinters={handleScanBluetoothPrinters}
                 onSelectBluetoothPrinter={saveBluetoothPrinter}
                 onTestPrintBluetooth={handleTestPrintBluetooth}
+                webUsbSupported={isWebUsbSupported()}
+                webBluetoothSupported={isWebBluetoothSupported()}
+                webPrinterInfo={webPrinterInfo}
+                onConnectWebUsbPrinter={handleConnectWebUsbPrinter}
+                onConnectWebBluetoothPrinter={handleConnectWebBluetoothPrinter}
+                onForgetWebPrinter={handleForgetWebPrinter}
+                onTestPrintWeb={handleTestPrintWeb}
                 isCredentialEmployee={isCredentialEmployee}
               />
             )

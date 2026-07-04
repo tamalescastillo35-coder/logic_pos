@@ -94,6 +94,13 @@ interface CompanySettingsViewProps {
   onScanBluetoothPrinters?: () => Promise<BluetoothPrinterDevice[]>;
   onSelectBluetoothPrinter?: (device: BluetoothPrinterDevice | null) => void;
   onTestPrintBluetooth?: () => Promise<void>;
+  webUsbSupported?: boolean;
+  webBluetoothSupported?: boolean;
+  webPrinterInfo?: { mode: 'usb' | 'bluetooth'; name: string } | null;
+  onConnectWebUsbPrinter?: () => Promise<void>;
+  onConnectWebBluetoothPrinter?: () => Promise<void>;
+  onForgetWebPrinter?: () => void;
+  onTestPrintWeb?: () => Promise<void>;
   isCredentialEmployee?: boolean;
 }
 
@@ -123,6 +130,13 @@ export default function CompanySettingsView({
   onScanBluetoothPrinters,
   onSelectBluetoothPrinter,
   onTestPrintBluetooth,
+  webUsbSupported = false,
+  webBluetoothSupported = false,
+  webPrinterInfo = null,
+  onConnectWebUsbPrinter,
+  onConnectWebBluetoothPrinter,
+  onForgetWebPrinter,
+  onTestPrintWeb,
   isCredentialEmployee = false
 }: CompanySettingsViewProps) {
   const [activeSubTab, setActiveSubTab] = useState<'info' | 'team' | 'code' | 'branding' | 'print' | 'backup'>('team');
@@ -245,6 +259,39 @@ export default function CompanySettingsView({
       setBtError(err?.message || 'No se pudo imprimir la prueba.');
     } finally {
       setBtTesting(false);
+    }
+  };
+
+  // Web printer (WebUSB / Web Bluetooth) connect flow — used when the POS runs in a plain
+  // browser tab instead of the installed APK.
+  const [webConnecting, setWebConnecting] = useState<'usb' | 'bluetooth' | null>(null);
+  const [webTesting, setWebTesting] = useState(false);
+  const [webError, setWebError] = useState('');
+
+  const handleConnectWeb = async (mode: 'usb' | 'bluetooth') => {
+    const connect = mode === 'usb' ? onConnectWebUsbPrinter : onConnectWebBluetoothPrinter;
+    if (!connect) return;
+    setWebConnecting(mode);
+    setWebError('');
+    try {
+      await connect();
+    } catch (err: any) {
+      setWebError(err?.message || 'No se pudo conectar la impresora.');
+    } finally {
+      setWebConnecting(null);
+    }
+  };
+
+  const handleTestWeb = async () => {
+    if (!onTestPrintWeb) return;
+    setWebTesting(true);
+    setWebError('');
+    try {
+      await onTestPrintWeb();
+    } catch (err: any) {
+      setWebError(err?.message || 'No se pudo imprimir la prueba.');
+    } finally {
+      setWebTesting(false);
     }
   };
 
@@ -1737,6 +1784,69 @@ export default function CompanySettingsView({
                   )}
 
                   {btError && <p className="text-[10px] text-red-500">{btError}</p>}
+                </div>
+              )}
+
+              {/* Web printer (WebUSB / Web Bluetooth) — only relevant outside the APK, in a
+                  plain browser tab, and only where the browser actually implements these APIs
+                  (Chrome/Edge; not Safari/Firefox). */}
+              {!isNativePlatform && (webUsbSupported || webBluetoothSupported) && (
+                <div className="space-y-2 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                  <label className="text-[11px] font-bold text-slate-600 block">Impresora térmica (navegador)</label>
+                  <p className="text-[10px] text-slate-400">
+                    Para imprimir directo desde esta página web, sin instalar la app. Por USB funciona con cualquier impresora térmica conectada por cable. Por Bluetooth es experimental: solo funciona si el modelo de impresora también soporta Bluetooth de baja energía (BLE) — pruébalo con "Prueba" para confirmar.
+                  </p>
+
+                  {webPrinterInfo ? (
+                    <div className="flex items-center justify-between p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg">
+                      <div>
+                        <p className="text-xs font-bold text-emerald-800">{webPrinterInfo.name}</p>
+                        <p className="text-[10px] text-emerald-600">{webPrinterInfo.mode === 'usb' ? 'Conectada por USB' : 'Conectada por Bluetooth (BLE)'}</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={handleTestWeb}
+                          disabled={webTesting}
+                          className="px-2.5 py-1.5 text-[10px] font-bold text-sky-700 bg-sky-100 hover:bg-sky-200 rounded-lg cursor-pointer transition disabled:opacity-50"
+                        >
+                          {webTesting ? 'Imprimiendo...' : 'Prueba'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onForgetWebPrinter?.()}
+                          className="px-2.5 py-1.5 text-[10px] font-bold text-red-700 bg-red-100 hover:bg-red-200 rounded-lg cursor-pointer transition"
+                        >
+                          Quitar
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex gap-2">
+                      {webUsbSupported && (
+                        <button
+                          type="button"
+                          onClick={() => handleConnectWeb('usb')}
+                          disabled={webConnecting !== null}
+                          className="flex-1 py-2 text-xs font-bold text-sky-700 bg-sky-100 hover:bg-sky-200 rounded-lg cursor-pointer transition disabled:opacity-50"
+                        >
+                          {webConnecting === 'usb' ? 'Conectando...' : 'Conectar por USB'}
+                        </button>
+                      )}
+                      {webBluetoothSupported && (
+                        <button
+                          type="button"
+                          onClick={() => handleConnectWeb('bluetooth')}
+                          disabled={webConnecting !== null}
+                          className="flex-1 py-2 text-xs font-bold text-indigo-700 bg-indigo-100 hover:bg-indigo-200 rounded-lg cursor-pointer transition disabled:opacity-50"
+                        >
+                          {webConnecting === 'bluetooth' ? 'Conectando...' : 'Conectar por Bluetooth'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {webError && <p className="text-[10px] text-red-500">{webError}</p>}
                 </div>
               )}
 
