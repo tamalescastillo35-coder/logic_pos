@@ -1849,33 +1849,10 @@ export default function App() {
     const bodyPadding = isA4 ? '20px 40px' : '10px 14px';
     const baseFontSize = pw === '58mm' ? '11px' : '12px';
 
-    const ticketText = `
-      <html>
-        <head>
-          <title>Ticket ${sale.id}</title>
-          <style>
-            * { box-sizing: border-box; }
-            body { font-family: 'Courier New', Courier, monospace; font-size: ${baseFontSize}; line-height: 1.45; color: #000; padding: ${bodyPadding}; max-width: ${bodyMaxWidth}; margin: 0 auto; background: #fff; }
-            .header { text-align: center; margin-bottom: 6px; }
-            .logo { display: block; margin: 0 auto 6px; width: 64px; height: 64px; object-fit: contain; filter: grayscale(1) contrast(1.1); }
-            .biz-name { font-size: ${isA4 ? '20px' : '15px'}; font-weight: 900; letter-spacing: 0.5px; margin: 0 0 2px; text-transform: uppercase; }
-            .tagline { font-size: 9px; margin: 0 0 4px; color: #555; }
-            .txn-id { font-size: 9px; color: #666; margin: 0; }
-            p { margin: 0 0 4px; }
-            .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
-            .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
-            .bold { font-weight: bold; }
-            .total-row { font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; border-top: 2px solid #000; padding-top: 4px; margin-top: 4px; }
-            .footer { text-align: center; margin-top: 8px; }
-            .footer .thanks { font-weight: 900; font-size: ${isA4 ? '14px' : '12px'}; }
-            .footer .legal { font-size: 9px; color: #777; margin-top: 3px; }
-            @media print {
-              @page { size: ${pageSize}; margin: ${pageMargin}; }
-              body { padding: 0; margin: 0 auto; }
-            }
-          </style>
-        </head>
-        <body>
+    // Inner ticket markup, shared by every HTML-based path (native ReceiptPrinter full-doc,
+    // and the web @media-print container). Kept separate from the <style> so the same markup
+    // can be printed either as a standalone document or scoped inside the live page.
+    const ticketBodyHtml = `
           <div class="header">
             ${ticketLogo ? `<img src="${ticketLogo}" class="logo" alt="logo">` : ''}
             <p class="biz-name">${ticketBusinessName}</p>
@@ -1904,7 +1881,42 @@ export default function App() {
             <p class="thanks">${printConfig.footerText || '¡Gracias por su compra!'}</p>
             <p class="legal">Comprobante simplificado sin validez fiscal</p>
           </div>
-        </body>
+    `;
+
+    // Ticket CSS, generated for a given scope selector so it can style either a full document
+    // (scope 'body') or a container div living inside the app (scope '#logicpos-print-root').
+    const ticketStyles = (scope: string) => `
+            ${scope} { font-family: 'Courier New', Courier, monospace; font-size: ${baseFontSize}; line-height: 1.45; color: #000; max-width: ${bodyMaxWidth}; margin: 0 auto; background: #fff; box-sizing: border-box; }
+            ${scope} * { box-sizing: border-box; }
+            ${scope} .header { text-align: center; margin-bottom: 6px; }
+            ${scope} .logo { display: block; margin: 0 auto 6px; width: 64px; height: 64px; object-fit: contain; filter: grayscale(1) contrast(1.1); }
+            ${scope} .biz-name { font-size: ${isA4 ? '20px' : '15px'}; font-weight: 900; letter-spacing: 0.5px; margin: 0 0 2px; text-transform: uppercase; }
+            ${scope} .tagline { font-size: 9px; margin: 0 0 4px; color: #555; }
+            ${scope} .txn-id { font-size: 9px; color: #666; margin: 0; }
+            ${scope} p { margin: 0 0 4px; }
+            ${scope} .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
+            ${scope} .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+            ${scope} .bold { font-weight: bold; }
+            ${scope} .total-row { font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; border-top: 2px solid #000; padding-top: 4px; margin-top: 4px; }
+            ${scope} .footer { text-align: center; margin-top: 8px; }
+            ${scope} .footer .thanks { font-weight: 900; font-size: ${isA4 ? '14px' : '12px'}; }
+            ${scope} .footer .legal { font-size: 9px; color: #777; margin-top: 3px; }
+    `;
+
+    const ticketText = `
+      <html>
+        <head>
+          <title>Ticket ${sale.id}</title>
+          <style>
+            ${ticketStyles('body')}
+            body { padding: ${bodyPadding}; }
+            @media print {
+              @page { size: ${pageSize}; margin: ${pageMargin}; }
+              body { padding: 0; margin: 0 auto; }
+            }
+          </style>
+        </head>
+        <body>${ticketBodyHtml}</body>
       </html>
     `;
 
@@ -1972,52 +1984,63 @@ export default function App() {
       return;
     }
 
-    // Web: a hidden iframe + its own print() reliably triggers the browser's print dialog,
-    // scoped correctly to just this iframe's content (real browsers, unlike Android's WebView,
-    // handle window.print() out of the box — no native bridge needed here).
-    //
-    // The iframe needs real pixel dimensions, not 0×0: on Chrome for Android, window.print()
-    // hands off to the OS print dialog (the same PrintManager the APK uses), and that bridge
-    // can't compute a page layout for a zero-size frame — it silently falls back to rasterizing
-    // whatever is visible on screen instead (e.g. the "¡Venta Registrada!" modal with its
-    // buttons, not the ticket). Positioning it far off-screen keeps it invisible without
-    // collapsing its size.
-    const iframe = document.createElement('iframe');
-    iframe.style.position = 'fixed';
-    iframe.style.top = '0';
-    iframe.style.left = '-10000px';
-    iframe.style.width = bodyMaxWidth;
-    iframe.style.height = '3000px';
-    iframe.style.border = '0';
-    document.body.appendChild(iframe);
+    // Web: render the ticket into the *main* document and use @media print to hide everything
+    // else, then print the top window. The previous approach (a hidden iframe + its own
+    // print()) works on desktop but NOT on Chrome for Android: there window.print() hands off
+    // to Android's OS print service, which prints the top document and ignores the sub-frame —
+    // so it captured whatever was on screen (the "¡Venta Registrada!" modal and its buttons)
+    // instead of the ticket. Printing the top window with only the ticket visible sidesteps
+    // that entirely and renders identically to the desktop PDF preview.
+    document.getElementById('logicpos-print-root')?.remove();
+    document.getElementById('logicpos-print-style')?.remove();
+
+    const printStyle = document.createElement('style');
+    printStyle.id = 'logicpos-print-style';
+    printStyle.textContent = `
+      #logicpos-print-root { display: none; }
+      ${ticketStyles('#logicpos-print-root')}
+      @media print {
+        @page { size: ${pageSize}; margin: ${pageMargin}; }
+        html, body { background: #fff !important; }
+        body > *:not(#logicpos-print-root) { display: none !important; }
+        #logicpos-print-root { display: block !important; padding: ${bodyPadding}; }
+      }
+    `;
+
+    const printRoot = document.createElement('div');
+    printRoot.id = 'logicpos-print-root';
+    printRoot.innerHTML = ticketBodyHtml;
+
+    document.body.appendChild(printStyle);
+    document.body.appendChild(printRoot);
 
     let cleaned = false;
     const cleanup = () => {
       if (cleaned) return;
       cleaned = true;
-      if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      printRoot.remove();
+      printStyle.remove();
+      window.removeEventListener('afterprint', cleanup);
     };
+    window.addEventListener('afterprint', cleanup);
 
-    const idoc = iframe.contentWindow?.document;
-    if (!idoc) { cleanup(); return; }
-    idoc.open();
-    idoc.write(ticketText);
-    idoc.close();
-
-    // Print once content (incl. logo) has had a moment to render. `afterprint` cleans up
-    // right away; a long fallback covers browsers that never fire it (the hidden 0×0 iframe
-    // is harmless in the meantime).
-    if (iframe.contentWindow) iframe.contentWindow.onafterprint = cleanup;
-    setTimeout(() => {
-      try {
-        iframe.contentWindow?.focus();
-        iframe.contentWindow?.print();
-      } catch (err) {
-        console.error('Print error:', err);
-        cleanup();
-      }
-      setTimeout(cleanup, 120000);
-    }, 500);
+    // Wait for the logo image (if any) to finish loading, otherwise it prints blank.
+    const images = Array.from(printRoot.querySelectorAll('img'));
+    const imagesReady = Promise.all(
+      images.map(img => img.complete ? Promise.resolve() : new Promise<void>(res => { img.onload = () => res(); img.onerror = () => res(); }))
+    );
+    imagesReady.then(() => {
+      setTimeout(() => {
+        try {
+          window.print();
+        } catch (err) {
+          console.error('Print error:', err);
+          cleanup();
+        }
+        // Fallback for browsers that never fire `afterprint`.
+        setTimeout(cleanup, 120000);
+      }, 100);
+    });
   };
 
   // Product Creator/Editor State
