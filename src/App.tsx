@@ -1975,12 +1975,19 @@ export default function App() {
     // Web: a hidden iframe + its own print() reliably triggers the browser's print dialog,
     // scoped correctly to just this iframe's content (real browsers, unlike Android's WebView,
     // handle window.print() out of the box — no native bridge needed here).
+    //
+    // The iframe needs real pixel dimensions, not 0×0: on Chrome for Android, window.print()
+    // hands off to the OS print dialog (the same PrintManager the APK uses), and that bridge
+    // can't compute a page layout for a zero-size frame — it silently falls back to rasterizing
+    // whatever is visible on screen instead (e.g. the "¡Venta Registrada!" modal with its
+    // buttons, not the ticket). Positioning it far off-screen keeps it invisible without
+    // collapsing its size.
     const iframe = document.createElement('iframe');
     iframe.style.position = 'fixed';
-    iframe.style.right = '0';
-    iframe.style.bottom = '0';
-    iframe.style.width = '0';
-    iframe.style.height = '0';
+    iframe.style.top = '0';
+    iframe.style.left = '-10000px';
+    iframe.style.width = bodyMaxWidth;
+    iframe.style.height = '3000px';
     iframe.style.border = '0';
     document.body.appendChild(iframe);
 
