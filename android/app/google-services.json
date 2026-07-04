@@ -1,0 +1,55 @@
+{
+  "project_info": {
+    "project_number": "399327721041",
+    "project_id": "gen-lang-client-0749443687",
+    "storage_bucket": "gen-lang-client-0749443687.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:399327721041:android:b32d173b5d93a56aadaa70",
+        "android_client_info": {
+          "package_name": "mx.einnovacion.swiftsalepos"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "399327721041-7ffoh9mbn96hdgk1iqofc12vs3cqi4jv.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "mx.einnovacion.swiftsalepos",
+            "certificate_hash": "40e55499ffc91152b2edfd5e1e698bf8107b94a3"
+          }
+        },
+        {
+          "client_id": "399327721041-o34oc7khrg6jeol4mdqb108scgc6qrq8.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "mx.einnovacion.swiftsalepos",
+            "certificate_hash": "55442999ad9d5260d14e711289a7139fa6bb01cd"
+          }
+        },
+        {
+          "client_id": "399327721041-f373mkjolicd1s5c84mpuidi925r63bu.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAjEV3DRlpCM48jzKr-ffLPSPK5w3mXCTU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "399327721041-f373mkjolicd1s5c84mpuidi925r63bu.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

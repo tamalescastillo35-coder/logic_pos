@@ -1,0 +1,353 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net default catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions for Fortress Rules
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    
+    function incoming() { 
+      return request.resource.data; 
+    }
+    
+    function existing() { 
+      return resource.data; 
+    }
+    
+    function isSignedIn() { 
+      return request.auth != null; 
+    }
+    
+    function isVerifiedUser() {
+      // Note: rules language has no endsWith(); matches() is a full-string RE2 match
+      return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.email.matches('.*@logicpos\\.com'));
+    }
+
+    // Membership verification helper functions
+    function isMemberOfCompany(companyId) {
+      return exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid));
+    }
+    
+    function getMemberRole(companyId) {
+      return get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.role;
+    }
+    
+    function isOwnerOrAdmin(companyId) {
+      return isMemberOfCompany(companyId) && (getMemberRole(companyId) == 'owner' || getMemberRole(companyId) == 'master_admin' || getMemberRole(companyId) == 'admin');
+    }
+
+    function isOwner(companyId) {
+      return isMemberOfCompany(companyId) && getMemberRole(companyId) == 'owner';
+    }
+
+    // Role-hierarchy: only 'owner' may grant/keep 'owner' or 'master_admin'; admin/master_admin may only grant 'employee' or 'admin'
+    function isValidRoleGrant(granterRole, newRole) {
+      return granterRole == 'owner'
+          || ((granterRole == 'master_admin' || granterRole == 'admin') && (newRole == 'employee' || newRole == 'admin'));
+    }
+
+    // A member's permissions array, used for fine-grained (non-admin) write access
+    function hasPermission(companyId, perm) {
+      return isOwnerOrAdmin(companyId) ||
+        (isMemberOfCompany(companyId) &&
+         'permissions' in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data &&
+         perm in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.permissions);
+    }
+
+    // Validation shape rules
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() <= 128
+          && data.email is string && data.email.size() <= 200
+          && (!('name' in data) || (data.name is string && data.name.size() <= 200))
+          && (!('createdAt' in data) || (data.createdAt is string || data.createdAt is timestamp))
+          && (!('companies' in data) || (data.companies is map))
+          && (!('activeCompanyId' in data) || (data.activeCompanyId is string || data.activeCompanyId == null));
+    }
+
+    function isValidCompany(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && data.ownerId is string && data.ownerId.size() <= 128
+          && (!('invitationCode' in data) || (data.invitationCode is string && data.invitationCode.size() <= 100) || data.invitationCode == null)
+          && (!('createdAt' in data) || (data.createdAt is string || data.createdAt is timestamp));
+    }
+
+    function isValidCompanyMember(data) {
+      return data.userId is string && data.userId.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && data.email is string && data.email.size() <= 200
+          && data.role is string && (data.role == 'owner' || data.role == 'master_admin' || data.role == 'admin' || data.role == 'employee')
+          && (!('joinedAt' in data) || (data.joinedAt is string || data.joinedAt is timestamp));
+    }
+
+    function isValidInvitationCode(data) {
+      return data.code is string && data.code.size() <= 100
+          && data.companyId is string && data.companyId.size() <= 128
+          && data.companyName is string && data.companyName.size() <= 200
+          && data.role is string && (data.role == 'employee' || data.role == 'admin' || data.role == 'master_admin');
+    }
+
+    function isValidProduct(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && data.category is string && data.category.size() <= 100
+          && data.costPrice is number && data.costPrice >= 0.0
+          && data.salePrice is number && data.salePrice >= 0.0
+          && data.stock is int && data.stock >= -1000 && data.stock <= 1000000
+          && data.minStock is int && data.minStock >= 0
+          && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 1000))
+          && (!('sku' in data) || (data.sku is string && data.sku.size() <= 100))
+          && (!('supplierId' in data) || (data.supplierId is string && data.supplierId.size() <= 128));
+    }
+
+    function isValidCustomer(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && (!('phone' in data) || (data.phone is string && data.phone.size() <= 50))
+          && (!('email' in data) || (data.email is string && data.email.size() <= 200))
+          && (!('unpaidBalance' in data) || (data.unpaidBalance is number))
+          && (!('registeredDate' in data) || (data.registeredDate is string && data.registeredDate.size() <= 100));
+    }
+
+    function isValidBranch(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && (!('address' in data) || (data.address is string && data.address.size() <= 500))
+          && (!('phone' in data) || (data.phone is string && data.phone.size() <= 50))
+          && (!('manager' in data) || (data.manager is string && data.manager.size() <= 200));
+    }
+
+    function isValidSupplier(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.name is string && data.name.size() <= 200
+          && (!('contactName' in data) || (data.contactName is string && data.contactName.size() <= 200))
+          && (!('phone' in data) || (data.phone is string && data.phone.size() <= 50))
+          && (!('email' in data) || (data.email is string && data.email.size() <= 200))
+          && (!('address' in data) || (data.address is string && data.address.size() <= 500))
+          && (!('category' in data) || (data.category is string && data.category.size() <= 100));
+    }
+
+    // Schema Validation Helpers
+    function isValidSale(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.items is list && data.items.size() <= 500
+          && data.total is number && data.total >= 0.0
+          && data.paymentMethod is string && (data.paymentMethod == 'Cash' || data.paymentMethod == 'Card' || data.paymentMethod == 'Debit' || data.paymentMethod == 'Transfer' || data.paymentMethod == 'Credit')
+          && (!('customerId' in data) || (data.customerId is string && data.customerId.size() <= 128))
+          && (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 200))
+          && data.timestamp is string && data.timestamp.size() <= 100
+          && data.status is string && (data.status == 'Completed' || data.status == 'Refunded')
+          && (!('branchId' in data) || (data.branchId is string && data.branchId.size() <= 128));
+    }
+
+    function isValidCashRegister(data) {
+      return data.isOpen is bool
+          && data.initialCash is number && data.initialCash >= 0.0
+          && data.currentCash is number
+          && (!('transactions' in data) || (data.transactions is list && data.transactions.size() <= 2000));
+    }
+
+    function isValidStockMovement(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.type is string && (data.type == 'surtido' || data.type == 'merma' || data.type == 'transfer_in' || data.type == 'transfer_out')
+          && data.productId is string && data.productId.size() <= 128
+          && data.productName is string && data.productName.size() <= 200
+          && data.quantity is number
+          && data.branchId is string && data.branchId.size() <= 128
+          && (!('counterpartBranchId' in data) || (data.counterpartBranchId is string && data.counterpartBranchId.size() <= 128))
+          && (!('createdAt' in data) || data.createdAt is number);
+    }
+
+    // User Profile Document Access Rules
+    match /users/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
+      allow delete: if isVerifiedUser() && request.auth.uid == userId;
+
+      // Legacy collections (Backwards compatibility)
+      match /products/{productId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(productId) && 
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidProduct(incoming()) && incoming().id == productId));
+      }
+
+      match /customers/{customerId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(customerId) &&
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidCustomer(incoming()) && incoming().id == customerId));
+      }
+
+      match /branches/{branchId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(branchId) &&
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidBranch(incoming()) && incoming().id == branchId));
+      }
+
+      match /suppliers/{supplierId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(supplierId) &&
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidSupplier(incoming()) && incoming().id == supplierId));
+      }
+
+      match /sales/{saleId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, delete: if isSignedIn() && request.auth.uid == userId && isValidId(saleId) &&
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidSale(incoming()) && incoming().id == saleId));
+        allow update: if isVerifiedUser() && request.auth.uid == userId && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
+          && (incoming().diff(existing()).affectedKeys().hasOnly(['status']));
+      }
+
+      match /cashRegisters/{registerId} {
+        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(registerId) &&
+          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidCashRegister(incoming())));
+      }
+    }
+
+    // Companies Collection Root
+    match /companies/{companyId} {
+      allow get: if isSignedIn() && isMemberOfCompany(companyId);
+      allow list: if isSignedIn() && isMemberOfCompany(companyId);
+      allow create: if isVerifiedUser() && isValidCompany(incoming()) && incoming().id == companyId && incoming().ownerId == request.auth.uid;
+      allow update: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidCompany(incoming()) && incoming().id == companyId && incoming().ownerId == existing().ownerId;
+      allow delete: if isVerifiedUser() && isOwner(companyId);
+
+      // Members Subcollection inside Company
+      match /members/{memberId} {
+        allow get, list: if isSignedIn() && isMemberOfCompany(companyId);
+
+        // A member document may only be created through one of three legitimate paths:
+        //   A) Founder self-claiming 'owner' right after creating their own company doc
+        //   B) Self-join backed by a real invitation code matching this company + role
+        //   C) An existing owner/admin directly provisioning a new member (e.g. credential employees)
+        allow create: if isVerifiedUser() && isValidCompanyMember(incoming()) && incoming().userId == memberId && (
+          (request.auth.uid == memberId && incoming().role == 'owner' &&
+            exists(/databases/$(database)/documents/companies/$(companyId)) &&
+            get(/databases/$(database)/documents/companies/$(companyId)).data.ownerId == request.auth.uid)
+          ||
+          (request.auth.uid == memberId && 'inviteCode' in incoming() && incoming().inviteCode is string &&
+            exists(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)) &&
+            get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.companyId == companyId &&
+            get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.role == incoming().role)
+          ||
+          (request.auth.uid != memberId && isMemberOfCompany(companyId) &&
+            isValidRoleGrant(getMemberRole(companyId), incoming().role))
+        );
+
+        // Updating a member: owner can do anything; admin/master_admin can only touch members
+        // who are currently 'employee' or 'admin', and may only grant 'employee' or 'admin'
+        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidCompanyMember(incoming()) &&
+          incoming().userId == memberId && existing().userId == memberId && (
+            getMemberRole(companyId) == 'owner' ||
+            (isValidRoleGrant(getMemberRole(companyId), incoming().role) &&
+              existing().role != 'owner' && existing().role != 'master_admin')
+          );
+
+        // Deleting/removing a member: owner can remove anyone; admin/master_admin only employee/admin targets
+        allow delete: if isVerifiedUser() && isMemberOfCompany(companyId) && (
+          getMemberRole(companyId) == 'owner' ||
+          ((getMemberRole(companyId) == 'master_admin' || getMemberRole(companyId) == 'admin') &&
+            existing().role != 'owner' && existing().role != 'master_admin')
+        );
+      }
+
+      // Products subcollection inside Company
+      match /products/{productId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(productId) &&
+          (request.method == 'delete' || (isValidProduct(incoming()) && incoming().id == productId));
+        // Selling/transferring only ever touches stock/branchStocks — that's a basic right
+        // of any cashier ringing up a sale. Changing any other field (price, cost, name,
+        // sku, supplier...) is a catalogue edit and needs an explicit permission.
+        allow update: if isVerifiedUser() && isValidId(productId) &&
+          isValidProduct(incoming()) && incoming().id == productId && (
+            (isMemberOfCompany(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks']))
+            || hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'stock_transfer') || hasPermission(companyId, 'suppliers_restock')
+          );
+      }
+
+      // Customers subcollection inside Company
+      match /customers/{customerId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create, update, delete: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(customerId) &&
+          (request.method == 'delete' || (isValidCustomer(incoming()) && incoming().id == customerId));
+      }
+
+      // Branches subcollection inside Company
+      match /branches/{branchId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create, update, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(branchId) &&
+          (request.method == 'delete' || (isValidBranch(incoming()) && incoming().id == branchId));
+      }
+
+      // Suppliers subcollection inside Company
+      match /suppliers/{supplierId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create, update, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(supplierId) &&
+          (request.method == 'delete' || (isValidSupplier(incoming()) && incoming().id == supplierId));
+      }
+
+      // Sales subcollection inside Company
+      match /sales/{saleId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        // Any member can ring up a new sale; only owner/admin can void a completed sale record
+        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(saleId) &&
+          isValidSale(incoming()) && incoming().id == saleId;
+        allow delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(saleId);
+        // Status changes (refunds) require owner/admin approval; marking an invoice as
+        // billed/pending is a routine bookkeeping action any member may perform
+        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
+          && (
+            (isOwnerOrAdmin(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
+            || incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus'])
+          );
+      }
+
+      // Cash Registers subcollection inside Company
+      match /cashRegisters/{registerId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        // Any member can update the running register (every sale touches currentCash)
+        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(registerId) && isValidCashRegister(incoming());
+        // Only owner/admin can create a new register doc or remove one entirely
+        allow create, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(registerId) &&
+          (request.method == 'delete' || isValidCashRegister(incoming()));
+      }
+
+      // Settings subcollection (branding, config, etc.)
+      match /settings/{settingId} {
+        allow read: if isSignedIn() && isMemberOfCompany(companyId);
+        allow write: if isVerifiedUser() && isOwnerOrAdmin(companyId);
+      }
+
+      // Stock movements — append-only audit log of restocks ("surtido") and inter-branch
+      // transfers. Any member can record a movement (it accompanies a stock change they're
+      // already allowed to make); nobody may edit/delete entries except owner/admin, so the
+      // history can't be quietly rewritten.
+      match /stockMovements/{movementId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(movementId)
+          && isValidStockMovement(incoming()) && incoming().id == movementId;
+        allow update: if false;
+        allow delete: if isVerifiedUser() && isOwnerOrAdmin(companyId);
+      }
+    }
+
+    // Global Invitation Codes Collection
+    match /invitationCodes/{code} {
+      allow get: if isSignedIn();
+      allow list: if false; // Deny standard listing for security
+      // Only an owner/admin of the target company may mint or modify an invite for it
+      allow create, update: if isVerifiedUser() && isValidInvitationCode(incoming()) && incoming().code == code
+        && isOwnerOrAdmin(incoming().companyId);
+      allow delete: if isVerifiedUser() && isOwnerOrAdmin(resource.data.companyId);
+    }
+
+  }
+}

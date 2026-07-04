@@ -1,0 +1,6 @@
+{
+  "name": "LOGIC POS",
+  "description": "Un completo sistema de punto de venta inteligente y moderno con gestión de inventario, ventas, clientes e Inteligencia Artificial.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

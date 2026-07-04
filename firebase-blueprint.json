@@ -1,0 +1,187 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Information and state of a logged-in user profile, including associated companies.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "The firebase auth unique id" },
+        "email": { "type": "string", "format": "email", "description": "Email address of the merchant" },
+        "name": { "type": "string", "description": "Full name of the merchant" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp of creation" },
+        "companies": { "type": "object", "description": "Map of companyId to mapped company info" },
+        "activeCompanyId": { "type": "string", "description": "Active selected company ID" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Company": {
+      "title": "Company Profile",
+      "description": "Details of an independent business/store company context.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique Company ID" },
+        "name": { "type": "string", "description": "Company Trade / Business Name" },
+        "ownerId": { "type": "string", "description": "Firebase UID of company creator" },
+        "invitationCode": { "type": "string", "description": "Active staff invitation code" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["id", "name", "ownerId"]
+    },
+    "CompanyMember": {
+      "title": "Company Member",
+      "description": "Affiliated employee / administrator of a company.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Firebase user UID" },
+        "name": { "type": "string", "description": "Member full name" },
+        "email": { "type": "string", "format": "email", "description": "Member email" },
+        "role": { "type": "string", "enum": ["owner", "admin", "employee"], "description": "Team staff access privileges" },
+        "joinedAt": { "type": "string", "format": "date-time", "description": "Join timestamp" }
+      },
+      "required": ["userId", "name", "email", "role"]
+    },
+    "InvitationCode": {
+      "title": "Invitation Code",
+      "description": "Globally unique code mapping to add employee status.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "description": "Unique upper-cased code string" },
+        "companyId": { "type": "string", "description": "Reference target company ID" },
+        "companyName": { "type": "string", "description": "Pre-fetched company trade name" },
+        "role": { "type": "string", "enum": ["employee", "admin"], "description": "Assigned join level role" }
+      },
+      "required": ["code", "companyId", "role"]
+    },
+    "Product": {
+      "title": "Product Entity",
+      "description": "A single product in the catalog.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Product ID" },
+        "name": { "type": "string", "description": "Product Name" },
+        "category": { "type": "string", "description": "Category name link" },
+        "costPrice": { "type": "number", "description": "Direct cost price to buy product" },
+        "salePrice": { "type": "number", "description": "Selling price of product" },
+        "stock": { "type": "integer", "description": "On-hand stock level" },
+        "minStock": { "type": "integer", "description": "Low-stock notification threshold" },
+        "imageUrl": { "type": "string", "description": "URL option of product picture" },
+        "sku": { "type": "string", "description": "Stock Keeping Unit scan code" },
+        "supplierId": { "type": "string", "description": "Link reference to supplier" }
+      },
+      "required": ["id", "name", "category", "costPrice", "salePrice", "stock", "minStock"]
+    },
+    "Customer": {
+      "title": "Customer Entity",
+      "description": "Details of store customers.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Customer ID" },
+        "name": { "type": "string", "description": "Customer full name" },
+        "phone": { "type": "string", "description": "Phone number" },
+        "email": { "type": "string", "format": "email", "description": "Email address" },
+        "unpaidBalance": { "type": "number", "description": "Open credit balance or unpaid sales" },
+        "registeredDate": { "type": "string", "description": "Registration date string" }
+      },
+      "required": ["id", "name"]
+    },
+    "Branch": {
+      "title": "Branch Entity",
+      "description": "Store Branch coordinates.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Branch code" },
+        "name": { "type": "string", "description": "Branch Name" },
+        "address": { "type": "string", "description": "Physical location address" },
+        "phone": { "type": "string", "description": "Branch contact phone" },
+        "manager": { "type": "string", "description": "Appointed branch manager name" }
+      },
+      "required": ["id", "name"]
+    },
+    "Supplier": {
+      "title": "Supplier Entity",
+      "description": "Manufacturer or food ingredient provider info.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Supplier reference code" },
+        "name": { "type": "string", "description": "Business Corporate name" },
+        "contactName": { "type": "string", "description": "Point-of-contact executive" },
+        "phone": { "type": "string", "description": "Surtido Telephone link" },
+        "email": { "type": "string", "format": "email", "description": "Order placement corporate email" },
+        "address": { "type": "string", "description": "Corporate headquarters address" },
+        "category": { "type": "string", "description": "Commercial supply niche Category" }
+      },
+      "required": ["id", "name"]
+    },
+    "Sale": {
+      "title": "Sale Entity",
+      "description": "A recorded customer sale.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique transaction receipt sequence" },
+        "items": { "type": "array", "description": "Line items sold" },
+        "total": { "type": "number", "description": "Total final cash amount paid" },
+        "paymentMethod": { "type": "string", "enum": ["Cash", "Card", "Debit", "Transfer"], "description": "Selected checkout means" },
+        "customerId": { "type": "string", "description": "Optionally linked customer profile" },
+        "customerName": { "type": "string", "description": "Optional name of buying customer" },
+        "timestamp": { "type": "string", "description": "DateTime string" },
+        "status": { "type": "string", "enum": ["Completed", "Refunded"], "description": "Deal process final status" },
+        "branchId": { "type": "string", "description": "Branch office ID where the sale happened" }
+      },
+      "required": ["id", "items", "total", "paymentMethod", "timestamp", "status"]
+    },
+    "CashRegister": {
+      "title": "CashRegister Session Entity",
+      "description": "The daily cash register state with detailed ledger movements.",
+      "type": "object",
+      "properties": {
+        "isOpen": { "type": "boolean", "description": "Whether the safe is currently open" },
+        "initialCash": { "type": "number", "description": "Opening drawer float" },
+        "currentCash": { "type": "number", "description": "Real-time on-hand float" },
+        "transactions": { "type": "array", "description": "Audit trail ledger transaction movements" }
+      },
+      "required": ["isOpen", "initialCash", "currentCash"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Individual merchant user profile, credentials, and affiliations."
+    },
+    "/companies/{companyId}": {
+      "schema": "Company",
+      "description": "Company registration and profile."
+    },
+    "/companies/{companyId}/members/{memberId}": {
+      "schema": "CompanyMember",
+      "description": "Authorized staff and active privileges for the company."
+    },
+    "/invitationCodes/{code}": {
+      "schema": "InvitationCode",
+      "description": "Secure reference mappings of invitation letters to companies."
+    },
+    "/companies/{companyId}/products/{productId}": {
+      "schema": "Product",
+      "description": "Product listing of the company."
+    },
+    "/companies/{companyId}/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Registered shoppers of the company."
+    },
+    "/companies/{companyId}/branches/{branchId}": {
+      "schema": "Branch",
+      "description": "Configured shop locations of the company."
+    },
+    "/companies/{companyId}/suppliers/{supplierId}": {
+      "schema": "Supplier",
+      "description": "Suppliers catalogue of the company."
+    },
+    "/companies/{companyId}/sales/{saleId}": {
+      "schema": "Sale",
+      "description": "Invoiced checkouts for the company."
+    },
+    "/companies/{companyId}/cashRegisters/{registerId}": {
+      "schema": "CashRegister",
+      "description": "Active/closed cash registers of the company."
+    }
+  }
+}
