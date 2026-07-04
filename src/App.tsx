@@ -1989,12 +1989,36 @@ export default function App() {
     // device): its print service rasterizes the *visible page* — it ignores both hidden
     // iframes and @media print show/hide scoping in the main document, which is why those
     // two earlier attempts printed a screenshot of the app (the "¡Venta Registrada!" modal)
-    // instead of the ticket. In a dedicated tab, the visible page IS the ticket. `onload`
-    // only fires once images (the logo) are in, and window.close() leaves no stray tab.
+    // instead of the ticket. In a dedicated tab, the visible page IS the ticket. `load`
+    // only fires once images (the logo) are in.
     // The in-app-WebView navigation bug that originally motivated moving away from
     // window.open only affected the APK, which no longer reaches this code path at all
     // (native Bluetooth/ReceiptPrinter branches return above).
-    const popupHtml = ticketText.replace('<body>', '<body onload="window.print(); window.close();">');
+    //
+    // Closing the tab needs per-platform care: on desktop print() blocks until the dialog
+    // is dismissed, so close() right after is safe. On Chrome for Android print() returns
+    // immediately while the system print UI is still compositing the page in the background —
+    // closing right away kills the source document mid-read and the print preview shows
+    // "error al cargar el archivo". There the tab goes hidden while the print UI is on top,
+    // so we close it only when it becomes visible again (job sent or cancelled).
+    const printScript = `
+      <script>
+        window.addEventListener('load', function () {
+          if (/Android/i.test(navigator.userAgent)) {
+            var wasHidden = false;
+            document.addEventListener('visibilitychange', function () {
+              if (document.visibilityState === 'hidden') { wasHidden = true; }
+              else if (wasHidden) { window.close(); }
+            });
+            window.print();
+          } else {
+            window.print();
+            window.close();
+          }
+        });
+      <\/script>
+    `;
+    const popupHtml = ticketText.replace('</body>', printScript + '</body>');
     const ticketWindow = window.open('', '_blank');
     if (ticketWindow) {
       ticketWindow.document.open();
