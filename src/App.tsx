@@ -332,15 +332,6 @@ export const getAvailableMonths = (allSales: Sale[]): string[] => {
   return Array.from(keys).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
 };
 
-// Default Catalog to boost experience immediately (Kyte Demo Catalog)
-const DEFAULT_PRODUCTS: Product[] = [];
-
-const DEFAULT_CUSTOMERS: Customer[] = [];
-
-const DEFAULT_BRANCHES: Branch[] = [];
-
-const DEFAULT_SUPPLIERS: Supplier[] = [];
-
 export default function App() {
   // Tabs: 'pos' | 'products' | 'customers' | 'history' | 'analytics' | 'branches' | 'suppliers' | 'settings' | 'invoicing'
   const [activeTab, setActiveTab] = useState<'pos' | 'products' | 'customers' | 'history' | 'analytics' | 'branches' | 'suppliers' | 'settings' | 'invoicing'>('pos');
@@ -540,8 +531,8 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
 
-  // Unified Authentication Modal (Google & Credentials)
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  // Employee-credential login form (used by the mandatory login gate — see the early
+  // return before the main JSX)
   const [authCompanyId, setAuthCompanyId] = useState('');
   const [authUsername, setAuthUsername] = useState('');
   const [isSignInLoading, setIsSignInLoading] = useState(false);
@@ -571,7 +562,6 @@ export default function App() {
       // Clean local Form State
       setAuthCompanyId('');
       setAuthUsername('');
-      setIsAuthModalOpen(false);
     } catch (err: any) {
       console.error("Error signing in with employee credentials:", err);
       let errMsg = "Credenciales incorrectas o problemas de conexión.";
@@ -1118,49 +1108,22 @@ export default function App() {
     }
   }, [currentUserMember, activeCompanyRole, selectedBranchId, activeCompanyId, user]);
 
-  // Sync state from Firestore / Local Fallback
+  // Sync state from Firestore
   useEffect(() => {
     if (!user) {
+      // Logged out: the whole app is gated behind login (see the early return before the
+      // main JSX), so nothing here is ever visible — but we still clear state rather than
+      // loading the old "modo local" fallback from localStorage. That fallback used to read
+      // back `logic_products`/`logic_sales`/etc., which are the SAME keys saveAllData() mirrors
+      // on every authenticated write as an offline-durability cache — so a logged-out session
+      // on a device that had previously been signed in could load and briefly hold real
+      // production data in memory. Clearing avoids that entirely.
       setBranding({});
-      // Local fallback loading
-      const savedProducts = localStorage.getItem('logic_products') || localStorage.getItem('kyte_products');
-      const savedCustomers = localStorage.getItem('logic_customers') || localStorage.getItem('kyte_customers');
-      const savedSales = localStorage.getItem('logic_sales') || localStorage.getItem('kyte_sales');
-      const savedCash = localStorage.getItem('logic_cash') || localStorage.getItem('kyte_cash');
-      const savedBranches = localStorage.getItem('logic_branches');
-      const savedSuppliers = localStorage.getItem('logic_suppliers');
-      const savedActiveBranch = localStorage.getItem('logic_active_branch');
-
-      if (savedProducts) setProducts(JSON.parse(savedProducts));
-      else {
-        setProducts(DEFAULT_PRODUCTS);
-        localStorage.setItem('logic_products', JSON.stringify(DEFAULT_PRODUCTS));
-      }
-
-      if (savedCustomers) setCustomers(JSON.parse(savedCustomers));
-      else {
-        setCustomers(DEFAULT_CUSTOMERS);
-        localStorage.setItem('logic_customers', JSON.stringify(DEFAULT_CUSTOMERS));
-      }
-
-      if (savedBranches) setBranches(JSON.parse(savedBranches));
-      else {
-        setBranches(DEFAULT_BRANCHES);
-        localStorage.setItem('logic_branches', JSON.stringify(DEFAULT_BRANCHES));
-      }
-
-      if (savedSuppliers) setSuppliers(JSON.parse(savedSuppliers));
-      else {
-        setSuppliers(DEFAULT_SUPPLIERS);
-        localStorage.setItem('logic_suppliers', JSON.stringify(DEFAULT_SUPPLIERS));
-      }
-
-      if (savedActiveBranch) setSelectedBranchId(savedActiveBranch);
-      else setSelectedBranchId('b-ideal');
-
-      if (savedSales) setSales(JSON.parse(savedSales));
-      if (savedCash) setCashRegister(JSON.parse(savedCash));
-
+      setProducts([]);
+      setCustomers([]);
+      setBranches([]);
+      setSuppliers([]);
+      setSales([]);
       return;
     }
 
@@ -3039,6 +3002,110 @@ export default function App() {
   const navInactiveClass = `${navBaseClass} text-slate-600 hover:bg-slate-50 hover:text-slate-900`;
   const navActiveClass = `${navBaseClass} shadow-sm border`;
 
+  // Hard login gate: nothing below this point (catalog, sales, sucursales, estadisticas,
+  // caja, etc.) mounts until Firebase Auth resolves to a real user. There used to be a
+  // "Modo Local" that ran the whole POS off localStorage without any login — besides
+  // showing operational data to whoever opened the page, saveAllData() mirrors every
+  // authenticated write into those same localStorage keys as an offline-durability cache,
+  // so a logged-out session on a previously-used device could actually surface real
+  // production data. Gating the entire render on `user` closes that regardless of what's
+  // sitting in localStorage.
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="flex items-center gap-2 text-slate-400 text-sm font-bold">
+          <ShoppingCart className="w-5 h-5 animate-pulse" />
+          Conectando...
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-sm p-6 space-y-5 text-left animate-slide-up">
+          <div className="text-center pb-2.5 border-b border-slate-100 space-y-2">
+            <div className="w-12 h-12 mx-auto bg-indigo-50 rounded-2xl flex items-center justify-center">
+              <ShoppingCart className="w-6 h-6 text-indigo-500" />
+            </div>
+            <div>
+              <h3 className="font-extrabold text-base text-slate-800">LOGIC POS</h3>
+              <p className="text-[10px] text-slate-400 mt-0.5">Ingresa con tu número de empleado o cuenta de propietario.</p>
+            </div>
+          </div>
+
+          <div className="space-y-4">
+            {/* EMPLOYEE CODE LOGIN */}
+            <form onSubmit={handleCredentialSignIn} className="space-y-3.5">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-left">
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Ingresa el <strong className="text-slate-700">Código de Comercio</strong> y tu <strong className="text-slate-700">Número de Empleado</strong> asignado por tu encargado.
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 font-bold block">Código de Comercio *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ej: comp_123456"
+                  value={authCompanyId}
+                  onChange={(e) => setAuthCompanyId(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 placeholder-slate-300 text-xs font-mono"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-500 font-bold block">Número de Empleado *</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ej: 1001"
+                  value={authUsername}
+                  onChange={(e) => setAuthUsername(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 placeholder-slate-300 text-xs font-mono"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSignInLoading}
+                className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition select-none tracking-wide text-center disabled:opacity-50 mt-1"
+              >
+                {isSignInLoading ? 'Verificando...' : 'Entrar al Sistema 🔑'}
+              </button>
+            </form>
+
+            {/* SEPARATOR */}
+            <div className="relative flex py-1 items-center">
+              <div className="flex-grow border-t border-slate-200"></div>
+              <span className="flex-shrink mx-3 text-[9px] text-slate-400 font-extrabold uppercase tracking-wide bg-white px-1">propietarios</span>
+              <div className="flex-grow border-t border-slate-200"></div>
+            </div>
+
+            {/* GOOGLE OPTION - owners only */}
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await signInWithGoogle();
+                } catch (err: any) {
+                  console.error(err);
+                  alert("Error al conectar con Google: " + (err.message || String(err)));
+                }
+              }}
+              className="w-full py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs rounded-xl shadow-sm cursor-pointer transition flex items-center justify-center gap-2 select-none border border-slate-200"
+            >
+              <Sparkles className="w-4 h-4 text-indigo-500" />
+              <span>Acceso con Google (Propietario)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div id="logic-main-container" className="min-h-screen bg-slate-50 flex flex-col font-sans">
       
@@ -3110,50 +3177,38 @@ export default function App() {
             </span>
           </div>
 
-          {/* Authentication Status UI */}
-          {isAuthLoading ? (
-            <div className="text-xs text-white/70">Conectando...</div>
-          ) : user ? (
-            <div className="flex items-center space-x-1.5 lg:space-x-2.5 px-2 lg:px-3 py-1 lg:py-1.5 rounded-xl border" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 45%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
-              {user.photoURL ? (
-                <img src={user.photoURL} alt={user.displayName || ''} className="hidden sm:block w-5 h-5 lg:w-6 lg:h-6 rounded-full border-2" style={{ borderColor: 'var(--brand-primary)' }} referrerPolicy="no-referrer" />
-              ) : (
-                <div className="hidden sm:flex w-5 h-5 lg:w-6 lg:h-6 rounded-full font-black text-xs text-center leading-6 text-white items-center justify-center" style={{ backgroundColor: 'var(--brand-primary)' }}>
-                  {user.displayName ? user.displayName[0].toUpperCase() : 'U'}
-                </div>
-              )}
-              <div className="hidden xl:block text-left">
-                <p className="text-[11px] font-bold text-white leading-tight truncate max-w-[120px]">{user.displayName || 'Comerciante'}</p>
-                <p className="text-[9px] leading-none truncate max-w-[120px]" style={{ color: 'color-mix(in srgb, var(--brand-primary) 70%, white)' }}>{user.email}</p>
+          {/* Authentication Status UI — `user` is always set here: the login gate above
+              already returned early otherwise. */}
+          <div className="flex items-center space-x-1.5 lg:space-x-2.5 px-2 lg:px-3 py-1 lg:py-1.5 rounded-xl border" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 45%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
+            {user.photoURL ? (
+              <img src={user.photoURL} alt={user.displayName || ''} className="hidden sm:block w-5 h-5 lg:w-6 lg:h-6 rounded-full border-2" style={{ borderColor: 'var(--brand-primary)' }} referrerPolicy="no-referrer" />
+            ) : (
+              <div className="hidden sm:flex w-5 h-5 lg:w-6 lg:h-6 rounded-full font-black text-xs text-center leading-6 text-white items-center justify-center" style={{ backgroundColor: 'var(--brand-primary)' }}>
+                {user.displayName ? user.displayName[0].toUpperCase() : 'U'}
               </div>
-              <div className="flex space-x-1 lg:space-x-1.5 flex-shrink-0">
-                <button
-                  onClick={() => { localStorage.removeItem(`logic_active_company_${user.uid}`); setActiveCompanyId(null); }}
-                  className="text-[9px] lg:text-[10px] text-white font-bold px-2 lg:px-2.5 py-1 rounded-lg cursor-pointer transition select-none border"
-                  style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 70%, black)', borderColor: 'color-mix(in srgb, var(--brand-primary) 35%, transparent)' }}
-                  title="Cambiar de comercio / empresa"
-                >
-                  <span className="hidden sm:inline">Empresas</span>
-                  <span className="sm:hidden">Emp</span>
-                </button>
-                <button
-                  onClick={() => signOut(auth)}
-                  className="text-[9px] lg:text-[10px] bg-red-700 hover:bg-red-600 border border-red-600 text-white font-bold px-2 lg:px-2.5 py-1 rounded-lg cursor-pointer transition select-none"
-                >
-                  Salir
-                </button>
-              </div>
+            )}
+            <div className="hidden xl:block text-left">
+              <p className="text-[11px] font-bold text-white leading-tight truncate max-w-[120px]">{user.displayName || 'Comerciante'}</p>
+              <p className="text-[9px] leading-none truncate max-w-[120px]" style={{ color: 'color-mix(in srgb, var(--brand-primary) 70%, white)' }}>{user.email}</p>
             </div>
-          ) : (
-            <button
-              onClick={() => setIsAuthModalOpen(true)}
-              className="flex items-center space-x-1.5 text-white font-extrabold text-[10px] lg:text-xs px-2 lg:px-3.5 py-1.5 lg:py-2 rounded-xl shadow-md cursor-pointer transition group whitespace-nowrap"
-              style={{ backgroundColor: 'var(--brand-primary)' }}
-            >
-              <Sparkles className="w-3.5 h-3.5 text-white/80 group-hover:rotate-12 transition duration-200" />
-              <span>Conectar Nube</span>
-            </button>
-          )}
+            <div className="flex space-x-1 lg:space-x-1.5 flex-shrink-0">
+              <button
+                onClick={() => { localStorage.removeItem(`logic_active_company_${user.uid}`); setActiveCompanyId(null); }}
+                className="text-[9px] lg:text-[10px] text-white font-bold px-2 lg:px-2.5 py-1 rounded-lg cursor-pointer transition select-none border"
+                style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 70%, black)', borderColor: 'color-mix(in srgb, var(--brand-primary) 35%, transparent)' }}
+                title="Cambiar de comercio / empresa"
+              >
+                <span className="hidden sm:inline">Empresas</span>
+                <span className="sm:hidden">Emp</span>
+              </button>
+              <button
+                onClick={() => signOut(auth)}
+                className="text-[9px] lg:text-[10px] bg-red-700 hover:bg-red-600 border border-red-600 text-white font-bold px-2 lg:px-2.5 py-1 rounded-lg cursor-pointer transition select-none"
+              >
+                Salir
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -3278,26 +3333,6 @@ export default function App() {
           {/* SCREEN: TERMINAL POS */}
           {activeTab === 'pos' && (
             <div className="space-y-4">
-              {!user && (
-                <div className="bg-gradient-to-r from-slate-900 to-indigo-950 text-white p-4 rounded-2xl border border-indigo-900 shadow-md flex flex-col md:flex-row justify-between items-center space-y-3 md:space-y-0 md:space-x-4">
-                  <div className="flex items-center space-x-3.5 text-left">
-                    <div className="p-3 bg-indigo-900/40 rounded-xl border border-indigo-850">
-                      <Sparkles className="w-5 h-5 text-indigo-400 animate-pulse" />
-                    </div>
-                    <div>
-                      <h4 className="font-extrabold text-xs sm:text-sm text-slate-100">¡Sincroniza tu POS en la Nube con Google Cloud / Firebase!</h4>
-                      <p className="text-[11px] text-indigo-300">Estás operando en modo Local. Conecta tu cuenta Google para respaldar tu catálogo de ventas, clientes, sucursales y proveedores en base de datos segura de tiempo real.</p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setIsAuthModalOpen(true)}
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow cursor-pointer transition flex items-center space-x-1.5 whitespace-nowrap"
-                  >
-                    <Check className="w-4 h-4" />
-                    <span>Conectar Google Cloud</span>
-                  </button>
-                </div>
-              )}
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               
               {/* Product Catalog Column */}
@@ -5290,33 +5325,23 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-col sm:flex-row justify-center gap-3 pt-2">
-                  {!user ? (
+                  {/* `user` is always set here — the login gate already returned early otherwise. */}
+                  <div className="space-y-4 w-full">
+                    <p className="text-xs text-amber-600 font-semibold bg-amber-50 rounded-lg p-2.5 inline-block">
+                      ⚠️ Estás conectado como {user.email} pero no tienes ninguna Empresa activa.
+                    </p>
                     <button
-                      onClick={() => setIsAuthModalOpen(true)}
-                      className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2"
+                      onClick={() => {
+                        // Allow choosing / creating a company - clear any storage and let screen display selection
+                        localStorage.removeItem(`logic_active_company_${user.uid}`);
+                        setActiveCompanyId(null);
+                      }}
+                      className="px-6 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-sm rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2 mx-auto"
                     >
-                      <Sparkles className="w-4 h-4 text-indigo-200 animate-pulse" />
-                      <span>Conectar Cuenta con Google</span>
+                      <Building2 className="w-4 h-4" />
+                      <span>Abrir Panel de Selección de Empresa</span>
                     </button>
-                  ) : (
-                    // User is signed in but has no active company
-                    <div className="space-y-4 w-full">
-                      <p className="text-xs text-amber-600 font-semibold bg-amber-50 rounded-lg p-2.5 inline-block">
-                        ⚠️ Estás conectado como {user.email} pero no tienes ninguna Empresa activa.
-                      </p>
-                      <button
-                        onClick={() => {
-                          // Allow choosing / creating a company - clear any storage and let screen display selection
-                          localStorage.removeItem(`logic_active_company_${user.uid}`);
-                          setActiveCompanyId(null);
-                        }}
-                        className="px-6 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-sm rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2 mx-auto"
-                      >
-                        <Building2 className="w-4 h-4" />
-                        <span>Abrir Panel de Selección de Empresa</span>
-                      </button>
-                    </div>
-                  )}
+                  </div>
                 </div>
 
                 {/* Local actions catalog */}
@@ -6635,95 +6660,6 @@ export default function App() {
       )}
 
       {/* GLOBAL MOUNT CHECKPOINT: UNIFIED AUTHENTICATION SELECTION DIALOG (GOOGLE & DIRECT CREDENTIALS) */}
-      {isAuthModalOpen && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-[9999] animate-fade-in select-none">
-          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-sm p-6 space-y-5 text-left transition duration-200 animate-slide-up">
-            <div className="flex justify-between items-center pb-2.5 border-b border-slate-100">
-              <div>
-                <h3 className="font-extrabold text-base text-slate-800">
-                  Acceso al Sistema
-                </h3>
-                <p className="text-[10px] text-slate-400 mt-0.5">Ingresa con tu número de empleado o cuenta de propietario.</p>
-              </div>
-              <button 
-                onClick={() => setIsAuthModalOpen(false)} 
-                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-50 hover:bg-slate-100 rounded-full cursor-pointer transition select-none"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-4">
-              {/* EMPLOYEE CODE LOGIN */}
-              <form onSubmit={handleCredentialSignIn} className="space-y-3.5">
-                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-left">
-                  <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Ingresa el <strong className="text-slate-700">Código de Comercio</strong> y tu <strong className="text-slate-700">Número de Empleado</strong> asignado por tu encargado.
-                  </p>
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-[10px] text-slate-500 font-bold block">Código de Comercio *</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Ej: comp_123456"
-                    value={authCompanyId}
-                    onChange={(e) => setAuthCompanyId(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 placeholder-slate-300 text-xs font-mono"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-[10px] text-slate-500 font-bold block">Número de Empleado *</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Ej: 1001"
-                    value={authUsername}
-                    onChange={(e) => setAuthUsername(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 placeholder-slate-300 text-xs font-mono"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSignInLoading}
-                  className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition select-none tracking-wide text-center disabled:opacity-50 mt-1"
-                >
-                  {isSignInLoading ? 'Verificando...' : 'Entrar al Sistema 🔑'}
-                </button>
-              </form>
-
-              {/* SEPARATOR */}
-              <div className="relative flex py-1 items-center">
-                <div className="flex-grow border-t border-slate-200"></div>
-                <span className="flex-shrink mx-3 text-[9px] text-slate-400 font-extrabold uppercase tracking-wide bg-white px-1">propietarios</span>
-                <div className="flex-grow border-t border-slate-200"></div>
-              </div>
-
-              {/* GOOGLE OPTION - owners only */}
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    await signInWithGoogle();
-                    setIsAuthModalOpen(false);
-                  } catch (err: any) {
-                    console.error(err);
-                    alert("Error al conectar con Google: " + (err.message || String(err)));
-                  }
-                }}
-                className="w-full py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs rounded-xl shadow-sm cursor-pointer transition flex items-center justify-center gap-2 select-none border border-slate-200"
-              >
-                <Sparkles className="w-4 h-4 text-indigo-500" />
-                <span>Acceso con Google (Propietario)</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
     </div>
   );
 }
