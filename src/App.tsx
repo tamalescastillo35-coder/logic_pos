@@ -61,7 +61,7 @@ const BluetoothPrinter = registerPlugin<{
   listPairedDevices(): Promise<{ devices: BluetoothPrinterDevice[] }>;
   printEscPos(options: { address: string; data: string }): Promise<{ value: boolean }>;
 }>('BluetoothPrinter');
-import { buildReceiptEscPos, buildTestPrint, uint8ToBase64, columnsForPaperWidth } from './lib/escpos';
+import { buildReceiptEscPos, buildTestPrint, buildTransferEscPos, uint8ToBase64, columnsForPaperWidth } from './lib/escpos';
 import { isWebUsbSupported, requestUsbPrinter, getPairedUsbPrinters, printUsb } from './lib/webUsbPrinter';
 import { isWebBluetoothSupported, requestBluetoothPrinter, printBluetooth } from './lib/webBluetoothPrinter';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
@@ -249,6 +249,35 @@ interface StockMovement {
   userName?: string;
   timestamp: string; // human-readable display string
   createdAt: number; // epoch ms — for sorting and monthly filtering
+  transferId?: string; // groups the transfer_out/transfer_in pair(s) of one multi-product transfer
+}
+
+interface TransferLineItem {
+  productId: string;
+  quantity: number;
+}
+
+interface CompletedTransferItem {
+  productId: string;
+  productName: string;
+  quantity: number;
+}
+
+// Snapshot of a just-completed transfer, used to render the success modal and the printed
+// ticket without re-resolving `products`/`branches` state later (mirrors how SaleItem freezes
+// `name`/`salePrice` at sale time).
+interface CompletedTransfer {
+  id: string;
+  timestamp: string;
+  createdAt: number;
+  sourceBranchId: string;
+  sourceBranchName: string;
+  sourceBranchAddress?: string;
+  targetBranchId: string;
+  targetBranchName: string;
+  targetBranchAddress?: string;
+  initiatedByName?: string;
+  items: CompletedTransferItem[];
 }
 
 interface Member {
@@ -1798,80 +1827,28 @@ export default function App() {
   // view the user couldn't back out of (had to kill the app). A hidden iframe calls the
   // host's own print dialog (Android's system print → Bluetooth/WiFi printers or Save-as-PDF;
   // the OS handles printer selection), keeps the user in the app, and cleans itself up.
-  const handlePrintReceipt = (sale: Sale) => {
-    const ticketBusinessName = branding.displayName || (activeCompanyId ? userCompanies[activeCompanyId]?.name : '') || 'Mi Comercio';
-    const ticketTagline = branding.tagline || '';
-    const ticketLogo = (printConfig.showLogo && branding.logoUrl) ? branding.logoUrl : '';
-    const payLabel = sale.paymentMethod === 'Cash' ? 'Efectivo' : sale.paymentMethod === 'Card' ? 'Tarjeta' : sale.paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito/Fiado';
-
-    const pw = printConfig.paperWidth;
-    const isA4 = pw === 'A4';
-    const pageSize = isA4 ? 'A4' : `${pw} auto`;
-    const pageMargin = isA4 ? '1cm' : '0mm';
-    const bodyMaxWidth = pw === '58mm' ? '220px' : pw === '80mm' ? '302px' : '640px';
-    const bodyPadding = isA4 ? '20px 40px' : '10px 14px';
-    const baseFontSize = pw === '58mm' ? '11px' : '12px';
-
-    // Inner ticket markup, shared by every HTML-based path (native ReceiptPrinter full-doc,
-    // and the web @media-print container). Kept separate from the <style> so the same markup
-    // can be printed either as a standalone document or scoped inside the live page.
-    const ticketBodyHtml = `
-          <div class="header">
-            ${ticketLogo ? `<img src="${ticketLogo}" class="logo" alt="logo">` : ''}
-            <p class="biz-name">${ticketBusinessName}</p>
-            ${ticketTagline ? `<p class="tagline">${ticketTagline}</p>` : ''}
-            <p class="txn-id">Transacción: ${sale.id}</p>
-          </div>
-          <hr class="sep">
-          <p><b>Fecha:</b> ${sale.timestamp}</p>
-          <p><b>Método de Pago:</b> ${payLabel}</p>
-          ${sale.customerName ? `<p><b>Cliente:</b> ${sale.customerName}</p>` : ''}
-          ${sale.employeeName ? `<p><b>Atendido por:</b> ${sale.employeeName}</p>` : ''}
-          <hr class="sep">
-          <p class="bold">ARTÍCULOS:</p>
-          ${sale.items.map(it => `
-            <div class="row">
-              <span>${it.quantity}x ${it.name}</span>
-              <span>${formatMXN(it.salePrice * it.quantity)}</span>
-            </div>
-          `).join('')}
-          <hr class="sep">
-          <div class="row"><span>Subtotal:</span><span>${formatMXN(sale.subtotal)}</span></div>
-          ${sale.discount > 0 ? `<div class="row"><span>Descuento:</span><span>-${formatMXN(sale.discount)}</span></div>` : ''}
-          ${printConfig.showTaxLine ? `<div class="row"><span>Impuestos:</span><span>${formatMXN(sale.tax)}</span></div>` : ''}
-          <div class="row total-row"><span>TOTAL:</span><span>${formatMXN(sale.total)}</span></div>
-          <div class="footer">
-            <p class="thanks">${printConfig.footerText || '¡Gracias por su compra!'}</p>
-            <p class="legal">Comprobante simplificado sin validez fiscal</p>
-          </div>
-    `;
-
-    // Ticket CSS, generated for a given scope selector so it can style either a full document
-    // (scope 'body') or a container div living inside the app (scope '#logicpos-print-root').
-    const ticketStyles = (scope: string) => `
-            ${scope} { font-family: 'Courier New', Courier, monospace; font-size: ${baseFontSize}; line-height: 1.45; color: #000; max-width: ${bodyMaxWidth}; margin: 0 auto; background: #fff; box-sizing: border-box; }
-            ${scope} * { box-sizing: border-box; }
-            ${scope} .header { text-align: center; margin-bottom: 6px; }
-            ${scope} .logo { display: block; margin: 0 auto 6px; width: 64px; height: 64px; object-fit: contain; filter: grayscale(1) contrast(1.1); }
-            ${scope} .biz-name { font-size: ${isA4 ? '20px' : '15px'}; font-weight: 900; letter-spacing: 0.5px; margin: 0 0 2px; text-transform: uppercase; }
-            ${scope} .tagline { font-size: 9px; margin: 0 0 4px; color: #555; }
-            ${scope} .txn-id { font-size: 9px; color: #666; margin: 0; }
-            ${scope} p { margin: 0 0 4px; }
-            ${scope} .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
-            ${scope} .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
-            ${scope} .bold { font-weight: bold; }
-            ${scope} .total-row { font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; border-top: 2px solid #000; padding-top: 4px; margin-top: 4px; }
-            ${scope} .footer { text-align: center; margin-top: 8px; }
-            ${scope} .footer .thanks { font-weight: 900; font-size: ${isA4 ? '14px' : '12px'}; }
-            ${scope} .footer .legal { font-size: 9px; color: #777; margin-top: 3px; }
-    `;
+  // Shared transport dispatcher for every printable ticket (sale receipts, transfer tickets).
+  // Builds the full-document `ticketText` internally — the popup-blocked fallback needs the
+  // *scoped* CSS variant (`ticketStylesFn('#logicpos-print-root')`) while the native-dialog
+  // and popup-window paths need the *full-document* variant (`ticketStylesFn('body')`), so
+  // callers hand over the body markup + a styles function rather than a prebuilt HTML string.
+  const printHtmlTicket = (params: {
+    docTitle: string;
+    ticketBodyHtml: string;
+    ticketStylesFn: (scope: string) => string;
+    pageSize: string;
+    pageMargin: string;
+    bodyPadding: string;
+    buildEscPosBytes: () => Uint8Array;
+  }) => {
+    const { docTitle, ticketBodyHtml, ticketStylesFn, pageSize, pageMargin, bodyPadding, buildEscPosBytes } = params;
 
     const ticketText = `
       <html>
         <head>
-          <title>Ticket ${sale.id}</title>
+          <title>${docTitle}</title>
           <style>
-            ${ticketStyles('body')}
+            ${ticketStylesFn('body')}
             body { padding: ${bodyPadding}; }
             @media print {
               @page { size: ${pageSize}; margin: ${pageMargin}; }
@@ -1883,32 +1860,11 @@ export default function App() {
       </html>
     `;
 
-    // Shared ESC/POS bytes for every direct-to-printer path below (native Bluetooth, WebUSB,
-    // Web Bluetooth) — only the transport differs between them.
-    const buildEscPosTicket = () => buildReceiptEscPos({
-      businessName: ticketBusinessName,
-      tagline: ticketTagline,
-      saleId: sale.id,
-      timestamp: sale.timestamp,
-      payLabel,
-      customerName: sale.customerName,
-      employeeName: sale.employeeName,
-      items: sale.items,
-      subtotal: sale.subtotal,
-      discount: sale.discount,
-      tax: sale.tax,
-      total: sale.total,
-      showTaxLine: printConfig.showTaxLine,
-      footerText: printConfig.footerText || '¡Gracias por su compra!',
-      columns: columnsForPaperWidth(printConfig.paperWidth),
-      formatMXN,
-    });
-
     if (isNativePlatform && bluetoothPrinter) {
       // Thermal ESC/POS printers (e.g. MERION PT-B1) don't implement Android's Print
       // Framework, so they never appear in ReceiptPrinter's system dialog below — instead we
       // talk straight to the paired device over Bluetooth SPP with raw ESC/POS bytes.
-      BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(buildEscPosTicket()) }).catch(err => {
+      BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(buildEscPosBytes()) }).catch(err => {
         console.error('Bluetooth print error:', err);
         alert(`No se pudo imprimir en "${bluetoothPrinter.name}". Verifica que esté encendida y emparejada.`);
       });
@@ -1920,7 +1876,7 @@ export default function App() {
       // native support wired up (see ReceiptPrinterPlugin.java), which loads this HTML into
       // its own offscreen WebView and hands it to android.print.PrintManager. That's the
       // native "elige tu impresora" dialog: Bluetooth/WiFi printers or Guardar como PDF.
-      ReceiptPrinter.print({ html: ticketText, jobName: `Ticket ${sale.id}` }).catch(err => {
+      ReceiptPrinter.print({ html: ticketText, jobName: docTitle }).catch(err => {
         console.error('Native print error:', err);
         alert('No se pudo abrir el diálogo de impresión. Intenta de nuevo.');
       });
@@ -1931,8 +1887,8 @@ export default function App() {
       // Same idea as the native Bluetooth path above, but reached from a plain browser tab —
       // WebUSB/Web Bluetooth talk straight to the printer, bypassing window.print() entirely.
       const printPromise = webUsbDevice
-        ? printUsb(webUsbDevice, buildEscPosTicket())
-        : printBluetooth(webBluetoothDevice!, buildEscPosTicket());
+        ? printUsb(webUsbDevice, buildEscPosBytes())
+        : printBluetooth(webBluetoothDevice!, buildEscPosBytes());
       printPromise.catch(err => {
         console.error('Web printer error:', err);
         alert(`No se pudo imprimir en "${webPrinterInfo?.name || 'la impresora'}". ${err?.message || ''}`);
@@ -2000,7 +1956,7 @@ export default function App() {
     printStyle.id = 'logicpos-print-style';
     printStyle.textContent = `
       #logicpos-print-root { display: none; }
-      ${ticketStyles('#logicpos-print-root')}
+      ${ticketStylesFn('#logicpos-print-root')}
       @media print {
         @page { size: ${pageSize}; margin: ${pageMargin}; }
         html, body { background: #fff !important; }
@@ -2042,6 +1998,226 @@ export default function App() {
         // Fallback for browsers that never fire `afterprint`.
         setTimeout(cleanup, 120000);
       }, 100);
+    });
+  };
+
+  const handlePrintReceipt = (sale: Sale) => {
+    const ticketBusinessName = branding.displayName || (activeCompanyId ? userCompanies[activeCompanyId]?.name : '') || 'Mi Comercio';
+    const ticketTagline = branding.tagline || '';
+    const ticketLogo = (printConfig.showLogo && branding.logoUrl) ? branding.logoUrl : '';
+    const payLabel = sale.paymentMethod === 'Cash' ? 'Efectivo' : sale.paymentMethod === 'Card' ? 'Tarjeta' : sale.paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito/Fiado';
+
+    const pw = printConfig.paperWidth;
+    const isA4 = pw === 'A4';
+    const pageSize = isA4 ? 'A4' : `${pw} auto`;
+    const pageMargin = isA4 ? '1cm' : '0mm';
+    const bodyMaxWidth = pw === '58mm' ? '220px' : pw === '80mm' ? '302px' : '640px';
+    const bodyPadding = isA4 ? '20px 40px' : '10px 14px';
+    const baseFontSize = pw === '58mm' ? '11px' : '12px';
+
+    // Inner ticket markup, shared by every HTML-based path (native ReceiptPrinter full-doc,
+    // and the web @media-print container). Kept separate from the <style> so the same markup
+    // can be printed either as a standalone document or scoped inside the live page.
+    const ticketBodyHtml = `
+          <div class="header">
+            ${ticketLogo ? `<img src="${ticketLogo}" class="logo" alt="logo">` : ''}
+            <p class="biz-name">${ticketBusinessName}</p>
+            ${ticketTagline ? `<p class="tagline">${ticketTagline}</p>` : ''}
+            <p class="txn-id">Transacción: ${sale.id}</p>
+          </div>
+          <hr class="sep">
+          <p><b>Fecha:</b> ${sale.timestamp}</p>
+          <p><b>Método de Pago:</b> ${payLabel}</p>
+          ${sale.customerName ? `<p><b>Cliente:</b> ${sale.customerName}</p>` : ''}
+          ${sale.employeeName ? `<p><b>Atendido por:</b> ${sale.employeeName}</p>` : ''}
+          <hr class="sep">
+          <p class="bold">ARTÍCULOS:</p>
+          ${sale.items.map(it => `
+            <div class="row">
+              <span>${it.quantity}x ${it.name}</span>
+              <span>${formatMXN(it.salePrice * it.quantity)}</span>
+            </div>
+          `).join('')}
+          <hr class="sep">
+          <div class="row"><span>Subtotal:</span><span>${formatMXN(sale.subtotal)}</span></div>
+          ${sale.discount > 0 ? `<div class="row"><span>Descuento:</span><span>-${formatMXN(sale.discount)}</span></div>` : ''}
+          ${printConfig.showTaxLine ? `<div class="row"><span>Impuestos:</span><span>${formatMXN(sale.tax)}</span></div>` : ''}
+          <div class="row total-row"><span>TOTAL:</span><span>${formatMXN(sale.total)}</span></div>
+          <div class="footer">
+            <p class="thanks">${printConfig.footerText || '¡Gracias por su compra!'}</p>
+            <p class="legal">Comprobante simplificado sin validez fiscal</p>
+          </div>
+    `;
+
+    // Ticket CSS, generated for a given scope selector so it can style either a full document
+    // (scope 'body') or a container div living inside the app (scope '#logicpos-print-root').
+    const ticketStylesFn = (scope: string) => `
+            ${scope} { font-family: 'Courier New', Courier, monospace; font-size: ${baseFontSize}; line-height: 1.45; color: #000; max-width: ${bodyMaxWidth}; margin: 0 auto; background: #fff; box-sizing: border-box; }
+            ${scope} * { box-sizing: border-box; }
+            ${scope} .header { text-align: center; margin-bottom: 6px; }
+            ${scope} .logo { display: block; margin: 0 auto 6px; width: 64px; height: 64px; object-fit: contain; filter: grayscale(1) contrast(1.1); }
+            ${scope} .biz-name { font-size: ${isA4 ? '20px' : '15px'}; font-weight: 900; letter-spacing: 0.5px; margin: 0 0 2px; text-transform: uppercase; }
+            ${scope} .tagline { font-size: 9px; margin: 0 0 4px; color: #555; }
+            ${scope} .txn-id { font-size: 9px; color: #666; margin: 0; }
+            ${scope} p { margin: 0 0 4px; }
+            ${scope} .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
+            ${scope} .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+            ${scope} .bold { font-weight: bold; }
+            ${scope} .total-row { font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; border-top: 2px solid #000; padding-top: 4px; margin-top: 4px; }
+            ${scope} .footer { text-align: center; margin-top: 8px; }
+            ${scope} .footer .thanks { font-weight: 900; font-size: ${isA4 ? '14px' : '12px'}; }
+            ${scope} .footer .legal { font-size: 9px; color: #777; margin-top: 3px; }
+    `;
+
+    printHtmlTicket({
+      docTitle: `Ticket ${sale.id}`,
+      ticketBodyHtml,
+      ticketStylesFn,
+      pageSize,
+      pageMargin,
+      bodyPadding,
+      buildEscPosBytes: () => buildReceiptEscPos({
+        businessName: ticketBusinessName,
+        tagline: ticketTagline,
+        saleId: sale.id,
+        timestamp: sale.timestamp,
+        payLabel,
+        customerName: sale.customerName,
+        employeeName: sale.employeeName,
+        items: sale.items,
+        subtotal: sale.subtotal,
+        discount: sale.discount,
+        tax: sale.tax,
+        total: sale.total,
+        showTaxLine: printConfig.showTaxLine,
+        footerText: printConfig.footerText || '¡Gracias por su compra!',
+        columns: columnsForPaperWidth(printConfig.paperWidth),
+        formatMXN,
+      }),
+    });
+  };
+
+  // Printable transfer ticket (delivery note) for inter-branch stock transfers — same
+  // paper-width/logo config and print pipeline as the sale receipt, but no prices/totals,
+  // and 3 blank signature blocks for physical (pen) signatures collected as the merchandise
+  // changes hands.
+  const handlePrintTransferTicket = (transfer: CompletedTransfer) => {
+    const ticketBusinessName = branding.displayName || (activeCompanyId ? userCompanies[activeCompanyId]?.name : '') || 'Mi Comercio';
+    const ticketTagline = branding.tagline || '';
+    const ticketLogo = (printConfig.showLogo && branding.logoUrl) ? branding.logoUrl : '';
+
+    const pw = printConfig.paperWidth;
+    const isA4 = pw === 'A4';
+    const pageSize = isA4 ? 'A4' : `${pw} auto`;
+    const pageMargin = isA4 ? '1cm' : '0mm';
+    const bodyMaxWidth = pw === '58mm' ? '220px' : pw === '80mm' ? '302px' : '640px';
+    const bodyPadding = isA4 ? '20px 40px' : '10px 14px';
+    const baseFontSize = pw === '58mm' ? '11px' : '12px';
+
+    const signatures: { title: string; subtitle: string }[] = [
+      { title: 'FIRMA DE RECOLECCIÓN', subtitle: '(Repartidor)' },
+      { title: 'FIRMA DE RECEPCIÓN', subtitle: '(Personal, sucursal destino)' },
+      { title: 'FIRMA DE VALIDACIÓN', subtitle: '(Encargado, sucursal destino)' },
+    ];
+
+    const ticketBodyHtml = `
+          <div class="header">
+            ${ticketLogo ? `<img src="${ticketLogo}" class="logo" alt="logo">` : ''}
+            <p class="biz-name">${ticketBusinessName}</p>
+            ${ticketTagline ? `<p class="tagline">${ticketTagline}</p>` : ''}
+            <p class="bold" style="margin-top:4px;">TRASPASO ENTRE SUCURSALES</p>
+            <p class="txn-id">Folio: ${transfer.id}</p>
+          </div>
+          <hr class="sep">
+          <p><b>Fecha:</b> ${transfer.timestamp}</p>
+          <p><b>Origen:</b> ${transfer.sourceBranchName}${transfer.sourceBranchAddress ? ` — ${transfer.sourceBranchAddress}` : ''}</p>
+          <p><b>Destino:</b> ${transfer.targetBranchName}${transfer.targetBranchAddress ? ` — ${transfer.targetBranchAddress}` : ''}</p>
+          ${transfer.initiatedByName ? `<p><b>Iniciado por:</b> ${transfer.initiatedByName}</p>` : ''}
+          <hr class="sep">
+          <p class="bold">PRODUCTOS:</p>
+          ${transfer.items.map(it => `
+            <div class="row"><span>${it.quantity}x ${it.productName}</span></div>
+          `).join('')}
+          <hr class="sep">
+          ${signatures.map((sig, idx) => `
+            <div class="sig-block">
+              <p class="sig-label">${idx + 1}) ${sig.title}</p>
+              <p class="sig-sub">${sig.subtitle}</p>
+              <div class="sig-line"></div>
+              <p class="sig-name">Nombre: ____________________________</p>
+            </div>
+          `).join('')}
+    `;
+
+    const ticketStylesFn = (scope: string) => `
+            ${scope} { font-family: 'Courier New', Courier, monospace; font-size: ${baseFontSize}; line-height: 1.45; color: #000; max-width: ${bodyMaxWidth}; margin: 0 auto; background: #fff; box-sizing: border-box; }
+            ${scope} * { box-sizing: border-box; }
+            ${scope} .header { text-align: center; margin-bottom: 6px; }
+            ${scope} .logo { display: block; margin: 0 auto 6px; width: 64px; height: 64px; object-fit: contain; filter: grayscale(1) contrast(1.1); }
+            ${scope} .biz-name { font-size: ${isA4 ? '20px' : '15px'}; font-weight: 900; letter-spacing: 0.5px; margin: 0 0 2px; text-transform: uppercase; }
+            ${scope} .tagline { font-size: 9px; margin: 0 0 4px; color: #555; }
+            ${scope} .txn-id { font-size: 9px; color: #666; margin: 0; }
+            ${scope} p { margin: 0 0 4px; }
+            ${scope} .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
+            ${scope} .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+            ${scope} .bold { font-weight: bold; }
+            ${scope} .sig-block { margin-top: 16px; text-align: center; }
+            ${scope} .sig-label { font-weight: 900; font-size: ${isA4 ? '13px' : '11px'}; margin-bottom: 0; }
+            ${scope} .sig-sub { font-size: 9px; color: #555; margin-bottom: 20px; }
+            ${scope} .sig-line { border-top: 1px solid #000; width: 90%; margin: 0 auto 4px; }
+            ${scope} .sig-name { font-size: 10px; }
+    `;
+
+    printHtmlTicket({
+      docTitle: `Traspaso ${transfer.id}`,
+      ticketBodyHtml,
+      ticketStylesFn,
+      pageSize,
+      pageMargin,
+      bodyPadding,
+      buildEscPosBytes: () => buildTransferEscPos({
+        businessName: ticketBusinessName,
+        tagline: ticketTagline,
+        transferId: transfer.id,
+        timestamp: transfer.timestamp,
+        sourceBranchName: transfer.sourceBranchName,
+        sourceBranchAddress: transfer.sourceBranchAddress,
+        targetBranchName: transfer.targetBranchName,
+        targetBranchAddress: transfer.targetBranchAddress,
+        initiatedByName: transfer.initiatedByName,
+        items: transfer.items.map(it => ({ productName: it.productName, quantity: it.quantity })),
+        columns: columnsForPaperWidth(printConfig.paperWidth),
+      }),
+    });
+  };
+
+  // Reprints a transfer ticket from the Historial > Inventario audit log — for when it wasn't
+  // printed (or was lost) at the time. Reconstructs a CompletedTransfer from every StockMovement
+  // sharing this transferId: the 'transfer_out' side alone has everything needed (product list,
+  // both branch names, who initiated it), since each product's out/in pair carries identical
+  // quantity/productName info from the two branches' perspectives. Only works for transfers made
+  // after transferId started being recorded — older movements won't have one.
+  const handleReprintTransfer = (transferId: string) => {
+    const outEntries = stockMovements.filter(mv => mv.transferId === transferId && mv.type === 'transfer_out');
+    if (outEntries.length === 0) {
+      alert('No se encontró la información completa de este traspaso para reimprimir.');
+      return;
+    }
+    const first = outEntries[0];
+    const sourceBranch = branches.find(b => b.id === first.branchId);
+    const targetBranch = branches.find(b => b.id === first.counterpartBranchId);
+    handlePrintTransferTicket({
+      id: transferId,
+      timestamp: first.timestamp,
+      createdAt: first.createdAt,
+      sourceBranchId: first.branchId,
+      sourceBranchName: first.branchName || sourceBranch?.name || 'Sucursal',
+      sourceBranchAddress: sourceBranch?.address || undefined,
+      targetBranchId: first.counterpartBranchId || '',
+      targetBranchName: first.counterpartBranchName || targetBranch?.name || 'Sucursal',
+      targetBranchAddress: targetBranch?.address || undefined,
+      initiatedByName: first.userName || undefined,
+      items: outEntries.map(mv => ({ productId: mv.productId, productName: mv.productName, quantity: mv.quantity })),
     });
   };
 
@@ -2443,106 +2619,181 @@ export default function App() {
 
   // Goods Transfer between Branches (Transferencia multisuccursal y de matriz)
   const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
-  const [transferProductId, setTransferProductId] = useState('');
+  const [transferItems, setTransferItems] = useState<TransferLineItem[]>([]);
+  const [transferAddProductId, setTransferAddProductId] = useState(''); // pending selection in the "add product" row, before it's added to transferItems
   const [transferSourceBranchId, setTransferSourceBranchId] = useState('');
   const [transferTargetBranchId, setTransferTargetBranchId] = useState('');
-  const [transferQuantity, setTransferQuantity] = useState(1);
+  const [lastCompletedTransfer, setLastCompletedTransfer] = useState<CompletedTransfer | null>(null);
+
+  // Merge-by-id cart handlers for the transfer line items — same idea as addToCart/
+  // updateCartQty/removeFromCart, but storing just {productId, quantity} instead of a
+  // product snapshot: transfers have no price to freeze, so the product is resolved live.
+  const addTransferItem = (productId: string) => {
+    if (!productId) return;
+    setTransferItems(prev => {
+      const idx = prev.findIndex(it => it.productId === productId);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = { ...next[idx], quantity: next[idx].quantity + 1 };
+        return next;
+      }
+      return [...prev, { productId, quantity: 1 }];
+    });
+  };
+
+  const updateTransferItemQty = (productId: string, quantity: number) => {
+    const qty = Math.max(1, Math.floor(quantity) || 1);
+    setTransferItems(prev => prev.map(it => it.productId === productId ? { ...it, quantity: qty } : it));
+  };
+
+  const removeTransferItem = (productId: string) => {
+    setTransferItems(prev => prev.filter(it => it.productId !== productId));
+  };
 
   const handleOpenTransferModal = (prodId?: string) => {
-    setTransferProductId(prodId || (products[0]?.id || ''));
-    // Set default source and target if branches exist
+    // Always overwrites the cart (never merges with a leftover cart from a cancelled
+    // session), same as the single-product version used to fully overwrite transferProductId.
+    setTransferItems(prodId ? [{ productId: prodId, quantity: 1 }] : []);
+    // Default source to whatever branch this session is currently operating out of (the
+    // header branch selector) — not an arbitrary Matriz/first-branch guess — since that's
+    // almost always where the goods being transferred actually are. Falls back to Matriz/
+    // first branch only if the current selection isn't a valid branch (edge case).
     if (branches.length > 0) {
-      const matriz = branches.find(b => b.isMatriz) || branches[0];
-      setTransferSourceBranchId(matriz.id);
-      const other = branches.find(b => b.id !== matriz.id) || branches[0];
+      const current = branches.find(b => b.id === selectedBranchId) || branches.find(b => b.isMatriz) || branches[0];
+      setTransferSourceBranchId(current.id);
+      const other = branches.find(b => b.id !== current.id) || branches[0];
       setTransferTargetBranchId(other.id);
     }
-    setTransferQuantity(1);
     setIsTransferModalOpen(true);
   };
 
   const handleExecuteTransfer = async () => {
-    if (!transferProductId || !transferSourceBranchId || !transferTargetBranchId) {
-      alert("Por favor selecciona el producto, la sucursal origen y la sucursal destino.");
+    if (transferItems.length === 0) {
+      alert("Agrega al menos un producto a la transferencia.");
+      return;
+    }
+    if (!transferSourceBranchId || !transferTargetBranchId) {
+      alert("Por favor selecciona la sucursal origen y la sucursal destino.");
       return;
     }
     if (transferSourceBranchId === transferTargetBranchId) {
       alert("La sucursal de origen y destino no pueden ser la misma.");
       return;
     }
-    if (transferQuantity <= 0) {
-      alert("La cantidad a transferir debe ser mayor que cero.");
+
+    // Aggregate by productId defensively (not just relying on the cart's merge-on-add) —
+    // applyStockDeltas doesn't validate a combined delta against the read snapshot, it just
+    // clamps at zero, so two undetected lines for the same product could silently manufacture
+    // stock at the target while clamping the source to 0.
+    const aggregated = new Map<string, number>();
+    for (const it of transferItems) {
+      aggregated.set(it.productId, (aggregated.get(it.productId) || 0) + it.quantity);
+    }
+
+    const lines = Array.from(aggregated.entries()).map(([productId, quantity]) => {
+      const prod = products.find(p => p.id === productId);
+      return { productId, quantity, prod };
+    });
+
+    const missing = lines.filter(l => !l.prod);
+    if (missing.length > 0) {
+      alert("Uno o más productos de la transferencia ya no existen en el catálogo.");
       return;
     }
 
-    const prod = products.find(p => p.id === transferProductId);
-    if (!prod) {
-      alert("Producto no encontrado.");
+    const insufficient = lines
+      .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, transferSourceBranchId) }))
+      .filter(l => l.requested > l.available);
+    if (insufficient.length > 0) {
+      alert(
+        "Existencias insuficientes en la sucursal de origen:\n\n" +
+        insufficient.map(x => `• ${x.name}: pides ${x.requested}, disponible ${x.available}`).join('\n')
+      );
       return;
     }
 
-    // Source values (early UX-level check; the transfer itself re-applies atomically below)
-    const sourceStocks = { ...(prod.branchStocks || {}) };
-    const sourceStockVal = sourceStocks[transferSourceBranchId] !== undefined ? sourceStocks[transferSourceBranchId] : prod.stock;
+    const transferId = 'T-' + Math.floor(Math.random() * 900000 + 100000);
+    const sourceBranch = branches.find(b => b.id === transferSourceBranchId);
+    const targetBranch = branches.find(b => b.id === transferTargetBranchId);
+    const sourceBranchName = sourceBranch?.name || 'Sucursal';
+    const targetBranchName = targetBranch?.name || 'Sucursal';
 
-    if (sourceStockVal < transferQuantity) {
-      alert(`La sucursal de origen no tiene suficientes existencias. Stock disponible: ${sourceStockVal} unidades.`);
-      return;
-    }
+    const completedTransfer: CompletedTransfer = {
+      id: transferId,
+      timestamp: new Date().toLocaleString(),
+      createdAt: Date.now(),
+      sourceBranchId: transferSourceBranchId,
+      sourceBranchName,
+      sourceBranchAddress: sourceBranch?.address || undefined,
+      targetBranchId: transferTargetBranchId,
+      targetBranchName,
+      targetBranchAddress: targetBranch?.address || undefined,
+      initiatedByName: currentUserMember?.name || user?.displayName || undefined,
+      items: lines.map(l => ({ productId: l.productId, productName: l.prod!.name, quantity: l.quantity })),
+    };
 
     if (user && activeCompanyId) {
       try {
-        // Single Firestore transaction: decrements source + increments target together,
-        // reading the live document instead of a possibly-stale local copy.
-        await applyStockDeltas([
-          { productId: transferProductId, branchId: transferSourceBranchId, qtyDelta: -transferQuantity },
-          { productId: transferProductId, branchId: transferTargetBranchId, qtyDelta: transferQuantity }
+        // Single Firestore transaction: decrements source + increments target for every
+        // product together, reading the live documents instead of a possibly-stale local copy.
+        const deltas = lines.flatMap(l => [
+          { productId: l.productId, branchId: transferSourceBranchId, qtyDelta: -l.quantity },
+          { productId: l.productId, branchId: transferTargetBranchId, qtyDelta: l.quantity },
         ]);
+        await applyStockDeltas(deltas);
 
-        // Record both sides in the inventory audit log (dedicated collection, not the cash
-        // register): an "out" entry for the source branch and an "in" entry for the target.
-        const sourceBranchName = branches.find(b => b.id === transferSourceBranchId)?.name || 'Sucursal';
-        const targetBranchName = branches.find(b => b.id === transferTargetBranchId)?.name || 'Sucursal';
-        await logStockMovements([
+        // Record both sides of every product in the inventory audit log (dedicated
+        // collection, not the cash register), grouped by transferId.
+        const movements = lines.flatMap(l => [
           {
-            type: 'transfer_out',
-            productId: transferProductId,
-            productName: prod.name,
-            quantity: transferQuantity,
+            type: 'transfer_out' as const,
+            productId: l.productId,
+            productName: l.prod!.name,
+            quantity: l.quantity,
             branchId: transferSourceBranchId,
             branchName: sourceBranchName,
             counterpartBranchId: transferTargetBranchId,
             counterpartBranchName: targetBranchName,
+            transferId,
           },
           {
-            type: 'transfer_in',
-            productId: transferProductId,
-            productName: prod.name,
-            quantity: transferQuantity,
+            type: 'transfer_in' as const,
+            productId: l.productId,
+            productName: l.prod!.name,
+            quantity: l.quantity,
             branchId: transferTargetBranchId,
             branchName: targetBranchName,
             counterpartBranchId: transferSourceBranchId,
             counterpartBranchName: sourceBranchName,
+            transferId,
           },
         ]);
+        await logStockMovements(movements);
 
-        alert(`¡Transferencia exitosa! Se movieron ${transferQuantity} unidades de "${prod.name}" desde sucursal origen a destino.`);
         setIsTransferModalOpen(false);
-        setTransferProductId('');
-        setTransferQuantity(1);
+        setTransferItems([]);
+        setLastCompletedTransfer(completedTransfer);
       } catch (err) {
         console.error("Error executing branch transfer:", err);
         alert("Ocurrió un error al guardar los cambios en la base de datos de Firebase.");
       }
     } else {
-      const targetStocks = { ...(prod.branchStocks || {}) };
-      const targetStockVal = targetStocks[transferTargetBranchId] !== undefined ? targetStocks[transferTargetBranchId] : prod.stock;
-      sourceStocks[transferSourceBranchId] = sourceStockVal - transferQuantity;
-      sourceStocks[transferTargetBranchId] = targetStockVal + transferQuantity;
-      const updatedProducts = products.map(p => p.id === transferProductId ? { ...p, branchStocks: sourceStocks } : p);
+      let updatedProducts = products;
+      for (const l of lines) {
+        updatedProducts = updatedProducts.map(p => {
+          if (p.id !== l.productId) return p;
+          const stocks = { ...(p.branchStocks || {}) };
+          const sourceVal = stocks[transferSourceBranchId] !== undefined ? stocks[transferSourceBranchId] : p.stock;
+          const targetVal = stocks[transferTargetBranchId] !== undefined ? stocks[transferTargetBranchId] : p.stock;
+          stocks[transferSourceBranchId] = sourceVal - l.quantity;
+          stocks[transferTargetBranchId] = targetVal + l.quantity;
+          return { ...p, branchStocks: stocks };
+        });
+      }
       saveAllData(updatedProducts, customers, sales, cashRegister);
-      alert(`¡Transferencia exitosa (Modo Offline)!`);
       setIsTransferModalOpen(false);
+      setTransferItems([]);
+      setLastCompletedTransfer(completedTransfer);
     }
   };
 
@@ -4730,9 +4981,21 @@ export default function App() {
                                 </div>
                               </div>
                             </div>
-                            <span className={`font-black text-xs shrink-0 ml-2 ${isIn ? 'text-emerald-600' : 'text-rose-600'}`}>
-                              {isIn ? '+' : '-'}{mv.quantity} u.
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                              <span className={`font-black text-xs ${isIn ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                {isIn ? '+' : '-'}{mv.quantity} u.
+                              </span>
+                              {(mv.type === 'transfer_in' || mv.type === 'transfer_out') && mv.transferId && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleReprintTransfer(mv.transferId!)}
+                                  title="Reimprimir ticket de traspaso"
+                                  className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition cursor-pointer"
+                                >
+                                  <Printer className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
@@ -5767,34 +6030,18 @@ export default function App() {
                 <Store className="w-5 h-5 mr-2 text-indigo-600" />
                 <Package className="w-3.5 h-3.5 inline mr-1" /><span>Transferencia e Inventario</span>
               </h3>
-              <button 
-                onClick={() => setIsTransferModalOpen(false)} 
+              <button
+                onClick={() => { setIsTransferModalOpen(false); setTransferAddProductId(''); }}
                 className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-3.5">
-              <div>
-                <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block text-left">1. Seleccionar Artículo / Producto:</label>
-                <select
-                  value={transferProductId}
-                  onChange={(e) => setTransferProductId(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition mt-1.5"
-                >
-                  <option value="">Selecciona un producto...</option>
-                  {products.map(p => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} (Stock Global: {p.stock} u. | {p.category || 'Sin Cat'})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
+            <div className="space-y-3.5 max-h-[65vh] overflow-y-auto">
               <div className="grid grid-cols-2 gap-3 text-left">
                 <div>
-                  <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">2. Origen:</label>
+                  <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Origen:</label>
                   <select
                     value={transferSourceBranchId}
                     onChange={(e) => setTransferSourceBranchId(e.target.value)}
@@ -5810,7 +6057,7 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">3. Destino / Reparto:</label>
+                  <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Destino / Reparto:</label>
                   <select
                     value={transferTargetBranchId}
                     onChange={(e) => setTransferTargetBranchId(e.target.value)}
@@ -5826,38 +6073,79 @@ export default function App() {
                 </div>
               </div>
 
-              {transferProductId && transferSourceBranchId && (
-                <div className="bg-slate-50 border border-slate-100 p-3 rounded-xl text-left text-xs font-bold text-slate-600">
-                  📈 Existencia actual en Sucursal de Origen:{' '}
-                  <span className="text-indigo-600 font-extrabold">
-                    {(() => {
-                      const p = products.find(prod => prod.id === transferProductId);
-                      if (!p) return 0;
-                      return p.branchStocks && p.branchStocks[transferSourceBranchId] !== undefined 
-                        ? p.branchStocks[transferSourceBranchId] 
-                        : p.stock;
-                    })()}{' '}
-                    unidades.
-                  </span>
+              <div className="text-left">
+                <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Agregar producto:</label>
+                <div className="flex gap-2 mt-1.5">
+                  <select
+                    value={transferAddProductId}
+                    onChange={(e) => setTransferAddProductId(e.target.value)}
+                    className="flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition"
+                  >
+                    <option value="">Selecciona un producto...</option>
+                    {products
+                      .filter(p => !transferSourceBranchId || getProductStock(p, transferSourceBranchId) > 0)
+                      .map(p => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} ({getProductStock(p, transferSourceBranchId)} u. disponibles | {p.category || 'Sin Cat'})
+                        </option>
+                      ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!transferAddProductId) return;
+                      addTransferItem(transferAddProductId);
+                      setTransferAddProductId('');
+                    }}
+                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer shrink-0"
+                  >
+                    + Agregar
+                  </button>
+                </div>
+              </div>
+
+              {transferItems.length > 0 && (
+                <div className="space-y-2 text-left">
+                  <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Productos a transferir ({transferItems.length}):</label>
+                  {transferItems.map(item => {
+                    const prod = products.find(p => p.id === item.productId);
+                    const available = prod && transferSourceBranchId ? getProductStock(prod, transferSourceBranchId) : 0;
+                    const exceeds = transferSourceBranchId ? item.quantity > available : false;
+                    return (
+                      <div key={item.productId} className={`flex items-center gap-2 p-2.5 rounded-xl border ${exceeds ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-bold text-slate-700 truncate">{prod?.name || 'Producto no encontrado'}</p>
+                          {transferSourceBranchId && (
+                            <p className={`text-[10px] font-bold ${exceeds ? 'text-red-600' : 'text-slate-400'}`}>
+                              Disponible en origen: {available} u.
+                            </p>
+                          )}
+                        </div>
+                        <input
+                          type="number"
+                          min="1"
+                          value={item.quantity}
+                          onChange={(e) => updateTransferItemQty(item.productId, parseInt(e.target.value) || 1)}
+                          className="w-16 bg-white border border-slate-200 rounded-lg px-2 py-1.5 text-slate-800 text-xs font-black outline-none focus:border-indigo-500 transition text-center"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeTransferItem(item.productId)}
+                          className="p-1.5 text-red-500 hover:bg-red-100 rounded-lg transition cursor-pointer shrink-0"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
-
-              <div>
-                <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block text-left">4. Cantidad a Transferir / Repartir:</label>
-                <input
-                  type="number"
-                  min="1"
-                  value={transferQuantity}
-                  onChange={(e) => setTransferQuantity(Math.max(1, parseInt(e.target.value) || 1))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-800 text-xs font-black outline-none focus:border-indigo-500 transition mt-1.5"
-                />
-              </div>
             </div>
 
             <div className="flex gap-2.5 pt-3">
               <button
                 type="button"
-                onClick={() => setIsTransferModalOpen(false)}
+                onClick={() => { setIsTransferModalOpen(false); setTransferAddProductId(''); }}
                 className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition text-center cursor-pointer"
               >
                 Cancelar
@@ -5865,9 +6153,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleExecuteTransfer}
-                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition text-center cursor-pointer shadow-md"
+                disabled={transferItems.length === 0}
+                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition text-center cursor-pointer shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Confirmar Reparto
+                Confirmar Traspaso
               </button>
             </div>
           </div>
@@ -6482,6 +6771,64 @@ export default function App() {
               className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition shadow hover:shadow-md"
             >
               <ArrowLeft className="w-4 h-4" /> Regresar al POS / Nueva Venta
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL WINDOW: TRASPASO REGISTRADO (success + print) */}
+      {lastCompletedTransfer && (
+        <div className="fixed inset-0 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-sm p-6 space-y-5 text-slate-800 text-left relative">
+            <button
+              type="button"
+              onClick={() => setLastCompletedTransfer(null)}
+              aria-label="Cerrar"
+              className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer z-10"
+            >
+              <X className="w-4 h-4" />
+            </button>
+            <div className="text-center space-y-1">
+              <span className="inline-block p-3 bg-indigo-50 border border-indigo-100 rounded-full text-indigo-600 text-2xl animate-bounce">📦</span>
+              <h3 className="font-extrabold text-xl text-slate-800">¡Traspaso Registrado!</h3>
+              <p className="text-[11px] text-slate-400 font-bold uppercase tracking-wider">Folio {lastCompletedTransfer.id}</p>
+              {lastCompletedTransfer.initiatedByName && (
+                <p className="text-[11px] text-slate-500 font-bold">Iniciado por: <span style={{ color: 'var(--brand-primary)' }}>{lastCompletedTransfer.initiatedByName}</span></p>
+              )}
+            </div>
+
+            <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl text-xs space-y-2.5 font-mono">
+              <div className="flex justify-between text-slate-600">
+                <span className="font-bold">Origen:</span>
+                <span className="text-right">{lastCompletedTransfer.sourceBranchName}</span>
+              </div>
+              <div className="flex justify-between text-slate-600">
+                <span className="font-bold">Destino:</span>
+                <span className="text-right">{lastCompletedTransfer.targetBranchName}</span>
+              </div>
+              <div className="border-t border-dashed pt-2 space-y-1 select-text max-h-24 overflow-y-auto pr-1">
+                {lastCompletedTransfer.items.map((it, idx) => (
+                  <div key={idx} className="flex justify-between text-slate-600">
+                    <span>{it.quantity}x {it.productName}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => handlePrintTransferTicket(lastCompletedTransfer)}
+              className="w-full p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-250 text-indigo-700 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
+            >
+              <Printer className="w-4 h-4" /> Imprimir Ticket de Traspaso
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLastCompletedTransfer(null)}
+              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition shadow hover:shadow-md"
+            >
+              <ArrowLeft className="w-4 h-4" /> Cerrar
             </button>
           </div>
         </div>

@@ -92,6 +92,7 @@ function row(left: string, right: string, width: number): string {
 }
 
 const sep = (width: number) => '-'.repeat(width);
+const underscoreLine = (width: number) => '_'.repeat(Math.max(0, width));
 
 export function buildReceiptEscPos(p: EscPosReceiptParams): Uint8Array {
   const w = p.columns;
@@ -130,6 +131,79 @@ export function buildReceiptEscPos(p: EscPosReceiptParams): Uint8Array {
   b.align('center');
   b.bold(true).line(p.footerText).bold(false);
   b.line('Comprobante simplificado sin validez fiscal');
+  b.feed(3);
+  b.cut();
+
+  return b.toUint8Array();
+}
+
+export interface EscPosTransferItem {
+  productName: string;
+  quantity: number;
+}
+
+export interface EscPosTransferParams {
+  businessName: string;
+  tagline?: string;
+  transferId: string;
+  timestamp: string;
+  sourceBranchName: string;
+  sourceBranchAddress?: string;
+  targetBranchName: string;
+  targetBranchAddress?: string;
+  initiatedByName?: string;
+  items: EscPosTransferItem[];
+  columns: number;
+}
+
+// A physical delivery note for inter-branch stock transfers: no prices/totals, just what
+// moved and 3 blank spaces for pen signatures collected as the merchandise physically
+// changes hands (carrier pickup, destination staff, destination manager).
+export function buildTransferEscPos(p: EscPosTransferParams): Uint8Array {
+  const w = p.columns;
+  const b = new EscPosBuilder();
+
+  b.init();
+  b.align('center');
+  b.bold(true).doubleSize(true);
+  b.line(p.businessName.toUpperCase());
+  b.doubleSize(false).bold(false);
+  if (p.tagline) b.line(p.tagline);
+  b.bold(true).line('TRASPASO ENTRE SUCURSALES').bold(false);
+  b.line(`Folio: ${p.transferId}`);
+
+  b.align('left');
+  b.line(sep(w));
+  b.line(`Fecha: ${p.timestamp}`);
+  b.line(`Origen: ${p.sourceBranchName}`);
+  if (p.sourceBranchAddress) b.line(`  ${p.sourceBranchAddress}`);
+  b.line(`Destino: ${p.targetBranchName}`);
+  if (p.targetBranchAddress) b.line(`  ${p.targetBranchAddress}`);
+  if (p.initiatedByName) b.line(`Iniciado por: ${p.initiatedByName}`);
+  b.line(sep(w));
+
+  b.bold(true).line('PRODUCTOS:').bold(false);
+  for (const it of p.items) {
+    b.line(`${it.quantity}x ${it.productName}`);
+  }
+  b.line(sep(w));
+
+  const signatureBlock = (n: number, title: string, subtitle: string) => {
+    b.align('center');
+    b.bold(true).line(`${n}) ${title}`).bold(false);
+    b.line(subtitle);
+    b.align('left');
+    b.feed(3);
+    b.line(underscoreLine(w));
+    b.line(`Nombre: ${underscoreLine(Math.max(0, w - 8))}`);
+    b.feed(2);
+    if (n < 3) b.line(sep(w));
+  };
+
+  signatureBlock(1, 'FIRMA DE RECOLECCION', '(Repartidor)');
+  signatureBlock(2, 'FIRMA DE RECEPCION', '(Personal sucursal destino)');
+  signatureBlock(3, 'FIRMA DE VALIDACION', '(Encargado sucursal destino)');
+
   b.feed(3);
   b.cut();
 
