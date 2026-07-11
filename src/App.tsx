@@ -536,6 +536,10 @@ export default function App() {
   const [inventoryView, setInventoryView] = useState<'grid' | 'list'>(() =>
     (localStorage.getItem('logic_inventory_view') as 'grid' | 'list') || 'grid'
   );
+  // Independent from the Terminal POS search term: Inventario needs to find *any* catalog
+  // item (including out-of-stock ones, which the POS search intentionally hides), so sharing
+  // state would make the two screens' filtering feel inconsistent with each other.
+  const [inventorySearchTerm, setInventorySearchTerm] = useState('');
   // Same idea for the Terminal POS catalog — kept as its own preference (not shared with
   // Inventario) since each row needs different actions: quick add-to-cart here vs. edit/
   // delete/surtir there. List mode packs many more products on screen without scrolling.
@@ -1640,6 +1644,19 @@ export default function App() {
       return matchesSearch && matchesCat && hasStock;
     });
   }, [products, searchTerm, selectedCategory, selectedBranchId]);
+
+  // Inventario's own search — unlike the Terminal POS list above, this must surface every
+  // catalog item (including 0-stock ones, since managing stock is the whole point of this
+  // screen) and also matches on SKU, which the POS search doesn't need.
+  const inventoryFilteredProducts = useMemo(() => {
+    const term = inventorySearchTerm.trim().toLowerCase();
+    if (!term) return products;
+    return products.filter(p =>
+      p.name.toLowerCase().includes(term) ||
+      (p.category && p.category.toLowerCase().includes(term)) ||
+      (p.sku && p.sku.toLowerCase().includes(term))
+    );
+  }, [products, inventorySearchTerm]);
 
   // Count of catalogue items hidden from the terminal purely because they're out of stock
   // in the active branch (used to explain an empty grid instead of implying "no products").
@@ -4320,10 +4337,28 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Inventario search — matches by name, category or SKU; unlike the Terminal
+                  POS search, out-of-stock items stay visible since managing stock is the point. */}
+              <div className="relative">
+                <Search className="absolute left-3.5 top-3.5 w-5 h-5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar producto por nombre, categoría o SKU..."
+                  value={inventorySearchTerm}
+                  onChange={e => setInventorySearchTerm(e.target.value)}
+                  className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-505 text-sm font-medium transition"
+                />
+              </div>
+
               {/* Inventory: card grid or compact list depending on the user's toggle */}
               {inventoryView === 'grid' ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {products.map(prod => (
+                {inventoryFilteredProducts.length === 0 && (
+                  <p className="col-span-full text-center text-sm text-slate-400 py-10">
+                    {products.length === 0 ? 'No hay productos en el catálogo.' : 'Ningún producto coincide con la búsqueda.'}
+                  </p>
+                )}
+                {inventoryFilteredProducts.map(prod => (
                   <div key={prod.id} className="border border-slate-200/80 rounded-2xl p-4 flex flex-col justify-between hover:border-indigo-30 shadow-sm duration-150">
                     <div className="space-y-2.5">
                       <div className="flex justify-between items-start">
@@ -4437,10 +4472,12 @@ export default function App() {
               </div>
               ) : (
               <div className="border border-slate-200 rounded-2xl overflow-hidden divide-y divide-slate-100">
-                {products.length === 0 && (
-                  <p className="text-center text-sm text-slate-400 py-10">No hay productos en el catálogo.</p>
+                {inventoryFilteredProducts.length === 0 && (
+                  <p className="text-center text-sm text-slate-400 py-10">
+                    {products.length === 0 ? 'No hay productos en el catálogo.' : 'Ningún producto coincide con la búsqueda.'}
+                  </p>
                 )}
-                {products.map(prod => {
+                {inventoryFilteredProducts.map(prod => {
                   const branchStock = getProductStock(prod, selectedBranchId);
                   const low = branchStock <= prod.minStock;
                   return (
