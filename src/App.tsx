@@ -569,11 +569,17 @@ export default function App() {
   const [authCompanyId, setAuthCompanyId] = useState('');
   const [authUsername, setAuthUsername] = useState('');
   const [isSignInLoading, setIsSignInLoading] = useState(false);
+  // Shown inline in the login form instead of alert(): alert() blocks JS execution until
+  // dismissed, and on some Android WebView builds that native dialog doesn't render (or
+  // renders somewhere the user never sees) — leaving the button stuck on "Verificando..."
+  // forever with no visible error, even though the code already knew exactly what went wrong.
+  const [authError, setAuthError] = useState('');
 
   const handleCredentialSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthError('');
     if (!authCompanyId.trim() || !authUsername.trim()) {
-      alert("Por favor completa el Código de Comercio y tu Número de Empleado.");
+      setAuthError("Por favor completa el Código de Comercio y tu Número de Empleado.");
       return;
     }
 
@@ -603,7 +609,7 @@ export default function App() {
       } else if (err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') {
         errMsg = "El ID de comercio, usuario o contraseña son incorrectos.";
       }
-      alert("Error de inicio de sesión: " + errMsg);
+      setAuthError(errMsg);
     } finally {
       setIsSignInLoading(false);
     }
@@ -3336,6 +3342,12 @@ export default function App() {
               </button>
             </form>
 
+            {authError && (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-[11px] text-red-700 font-semibold whitespace-pre-line">
+                {authError}
+              </div>
+            )}
+
             {/* SEPARATOR */}
             <div className="relative flex py-1 items-center">
               <div className="flex-grow border-t border-slate-200"></div>
@@ -3347,11 +3359,12 @@ export default function App() {
             <button
               type="button"
               onClick={async () => {
+                setAuthError('');
                 try {
                   await signInWithGoogle();
                 } catch (err: any) {
                   console.error(err);
-                  alert("Error al conectar con Google: " + (err.message || String(err)));
+                  setAuthError("Error al conectar con Google: " + (err.message || String(err)));
                 }
               }}
               className="w-full py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs rounded-xl shadow-sm cursor-pointer transition flex items-center justify-center gap-2 select-none border border-slate-200"
