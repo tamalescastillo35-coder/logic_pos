@@ -1002,78 +1002,64 @@ export default function App() {
           const emailLocal = user.email!.split('@')[0];
           const firstUnderscore = emailLocal.indexOf('_');
           const secondUnderscore = emailLocal.indexOf('_', firstUnderscore + 1);
-          if (secondUnderscore !== -1) {
-            const parsedCompanyId = emailLocal.substring(0, secondUnderscore);
-            getDoc(doc(db, 'companies', parsedCompanyId, 'members', user.uid)).then((memberSnap) => {
-              if (memberSnap.exists()) {
+          const parsedCompanyId = secondUnderscore !== -1 ? emailLocal.substring(0, secondUnderscore) : null;
+
+          if (parsedCompanyId) {
+            // Bootstraps a credential (virtual-email) employee's users/{uid} doc from their
+            // company member record, the first time they ever log in. Deliberately does NOT
+            // write anything on failure (just leaves activeCompanyId unset for this attempt):
+            // firestore.rules' isMemberOfCompany() gates the member-doc read on that exact
+            // doc's own existence, so reading it in the moment right after an Owner creates
+            // the account (before it's visible) throws permission-denied rather than a clean
+            // "not found". Writing a companies:{} fallback here used to PERMANENTLY strand the
+            // employee — every later login re-reads that same empty doc and never retries the
+            // lookup again. Leaving no doc behind means the next login attempt (or the "Salir
+            // e intentar de nuevo" button on the waiting screen) re-runs this whole bootstrap
+            // fresh, and one short built-in retry covers the common case without even needing
+            // the user to do that manually.
+            const bootstrapCredentialEmployee = async (attempt: number) => {
+              try {
+                const memberSnap = await getDoc(doc(db, 'companies', parsedCompanyId, 'members', user.uid));
+                if (!memberSnap.exists()) throw new Error('member-not-visible-yet');
                 const mData = memberSnap.data();
-                getDoc(doc(db, 'companies', parsedCompanyId)).then((compSnap) => {
-                  const compName = compSnap.exists() ? compSnap.data().name : 'Mi Empresa';
-                  
-                  setDoc(doc(db, 'users', user.uid), {
-                    uid: user.uid,
-                    email: user.email || '',
-                    name: mData.name || 'Empleado',
-                    createdAt: new Date().toISOString(),
-                    companies: {
-                      [parsedCompanyId]: {
-                        id: parsedCompanyId,
-                        name: compName,
-                        role: mData.role || 'employee'
-                      }
-                    },
-                    activeCompanyId: parsedCompanyId
-                  }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-                }).catch(() => {
-                  setDoc(doc(db, 'users', user.uid), {
-                    uid: user.uid,
-                    email: user.email || '',
-                    name: mData.name || 'Empleado',
-                    createdAt: new Date().toISOString(),
-                    companies: {
-                      [parsedCompanyId]: {
-                        id: parsedCompanyId,
-                        name: 'Mi Empresa',
-                        role: mData.role || 'employee'
-                      }
-                    },
-                    activeCompanyId: parsedCompanyId
-                  }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-                });
-              } else {
-                setDoc(doc(db, 'users', user.uid), {
+
+                let compName = 'Mi Empresa';
+                try {
+                  const compSnap = await getDoc(doc(db, 'companies', parsedCompanyId));
+                  if (compSnap.exists()) compName = compSnap.data().name || compName;
+                } catch {
+                  // Company name lookup failing isn't fatal — fall back to the generic label.
+                }
+
+                await setDoc(doc(db, 'users', user.uid), {
                   uid: user.uid,
                   email: user.email || '',
-                  name: user.displayName || 'Comerciante',
+                  name: mData.name || 'Empleado',
                   createdAt: new Date().toISOString(),
-                  companies: {}
-                }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-                setActiveCompanyId(null);
-                setUserCompanies({});
+                  companies: {
+                    [parsedCompanyId]: {
+                      id: parsedCompanyId,
+                      name: compName,
+                      role: mData.role || 'employee'
+                    }
+                  },
+                  activeCompanyId: parsedCompanyId
+                });
+              } catch (err) {
+                if (attempt < 1) {
+                  setTimeout(() => bootstrapCredentialEmployee(attempt + 1), 1500);
+                }
+                // Otherwise give up silently for this attempt — see comment above.
               }
-            }).catch(() => {
-              setDoc(doc(db, 'users', user.uid), {
-                uid: user.uid,
-                email: user.email || '',
-                name: user.displayName || 'Comerciante',
-                createdAt: new Date().toISOString(),
-                companies: {}
-              }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-              setActiveCompanyId(null);
-              setUserCompanies({});
-            });
-          } else {
-            setDoc(doc(db, 'users', user.uid), {
-              uid: user.uid,
-              email: user.email || '',
-              name: user.displayName || 'Comerciante',
-              createdAt: new Date().toISOString(),
-              companies: {}
-            }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-            setActiveCompanyId(null);
-            setUserCompanies({});
+            };
+            bootstrapCredentialEmployee(0);
           }
+          // parsedCompanyId null (malformed virtual email): nothing to bootstrap; stays on
+          // the waiting screen until "Salir e intentar de nuevo".
         } else {
+          // Genuine new signup (Google account that's never created/joined a company) — this
+          // IS the correct steady state, not a failure: seeds an empty companies map so they
+          // land on "create your first company" instead of the employee waiting screen.
           setDoc(doc(db, 'users', user.uid), {
             uid: user.uid,
             email: user.email || '',
