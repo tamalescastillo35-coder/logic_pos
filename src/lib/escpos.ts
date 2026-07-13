@@ -140,6 +140,7 @@ export function buildReceiptEscPos(p: EscPosReceiptParams): Uint8Array {
 export interface EscPosTransferItem {
   productName: string;
   quantity: number;
+  unitPrice: number;
 }
 
 export interface EscPosTransferParams {
@@ -154,11 +155,13 @@ export interface EscPosTransferParams {
   initiatedByName?: string;
   items: EscPosTransferItem[];
   columns: number;
+  formatMXN: (n: number) => string;
 }
 
-// A physical delivery note for inter-branch stock transfers: no prices/totals, just what
-// moved and 3 blank spaces for pen signatures collected as the merchandise physically
-// changes hands (carrier pickup, destination staff, destination manager).
+// A physical delivery note for inter-branch stock transfers — mostly about what moved and 3
+// blank spaces for pen signatures collected as the merchandise physically changes hands
+// (carrier pickup, destination staff, destination manager), but also shows each product's
+// sale price and the accumulated total value of the shipment (same layout as the sale receipt).
 export function buildTransferEscPos(p: EscPosTransferParams): Uint8Array {
   const w = p.columns;
   const b = new EscPosBuilder();
@@ -183,9 +186,15 @@ export function buildTransferEscPos(p: EscPosTransferParams): Uint8Array {
   b.line(sep(w));
 
   b.bold(true).line('PRODUCTOS:').bold(false);
+  let total = 0;
   for (const it of p.items) {
-    b.line(`${it.quantity}x ${it.productName}`);
+    total += it.unitPrice * it.quantity;
+    b.line(row(`${it.quantity}x ${it.productName}`, p.formatMXN(it.unitPrice * it.quantity), w));
   }
+  b.line(sep(w));
+  b.bold(true);
+  b.line(row('TOTAL:', p.formatMXN(total), w));
+  b.bold(false);
   b.line(sep(w));
 
   const signatureBlock = (n: number, title: string, subtitle: string) => {

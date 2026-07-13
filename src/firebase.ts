@@ -1,11 +1,27 @@
 import { initializeApp, getApps } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, createUserWithEmailAndPassword } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import { initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager, doc, getDocFromServer } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // Initialize Firebase SDK
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId); /* CRITICAL: The app will break without this line */
+// Persistent (IndexedDB) local cache: after a device's first sync, reloads/reconnects only
+// re-read documents that actually changed instead of the full collections again — cuts
+// Firestore read volume sharply on a POS device that gets reloaded/backgrounded often.
+// persistentMultipleTabManager keeps this working even if the same branch has 2 tabs open.
+// initializeFirestore() throws if Firestore was already initialized for this app instance —
+// harmless in production (this module only runs once per page load) but Vite's HMR re-runs
+// this file on every edit while the underlying app instance survives, so fall back to
+// getFirestore() (which just returns the already-initialized instance) in that case.
+let dbInstance;
+try {
+  dbInstance = initializeFirestore(app, {
+    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+  }, (firebaseConfig as any).firestoreDatabaseId);
+} catch {
+  dbInstance = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
+}
+export const db = dbInstance; /* CRITICAL: The app will break without this line */
 export const auth = getAuth(app);
 // Plain login provider — only basic (non-sensitive) Google scopes. Keeping this free of
 // sensitive scopes means the OAuth consent screen can be published immediately (no Google

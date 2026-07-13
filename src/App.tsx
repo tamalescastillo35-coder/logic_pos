@@ -102,7 +102,9 @@ import {
   updateDoc,
   increment,
   arrayUnion,
-  runTransaction
+  runTransaction,
+  query,
+  where
 } from 'firebase/firestore';
 
 // Custom Tenant Components
@@ -250,6 +252,7 @@ interface StockMovement {
   timestamp: string; // human-readable display string
   createdAt: number; // epoch ms — for sorting and monthly filtering
   transferId?: string; // groups the transfer_out/transfer_in pair(s) of one multi-product transfer
+  unitPrice?: number; // sale price at transfer time, for the printed ticket's total — only set on transfer_out/transfer_in entries created after this field existed
 }
 
 interface TransferLineItem {
@@ -261,6 +264,7 @@ interface CompletedTransferItem {
   productId: string;
   productName: string;
   quantity: number;
+  salePrice: number; // frozen at transfer time, same idea as SaleItem.salePrice
 }
 
 // Snapshot of a just-completed transfer, used to render the success modal and the printed
@@ -1243,30 +1247,6 @@ export default function App() {
       handleFirestoreError(error, OperationType.LIST, `companies/${compId}/members`);
     });
 
-    const unsubSales = onSnapshot(collection(db, 'companies', compId, 'sales'), (snapshot) => {
-      const list: Sale[] = [];
-      snapshot.forEach(d => {
-        list.push(d.data() as Sale);
-      });
-      // `timestamp` is a locale display string (e.g. "30/6/2026, 4:55 p.m.") and isn't
-      // reliably parseable by `new Date()` — sort by the numeric `createdAt` instead.
-      // Older sales recorded before this field existed fall back to 0 (oldest last).
-      const saleSortKey = (s: Sale) => s.createdAt ?? 0;
-      list.sort((a, b) => saleSortKey(b) - saleSortKey(a));
-      setSales(list);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `companies/${compId}/sales`);
-    });
-
-    const unsubStockMovements = onSnapshot(collection(db, 'companies', compId, 'stockMovements'), (snapshot) => {
-      const list: StockMovement[] = [];
-      snapshot.forEach(d => list.push(d.data() as StockMovement));
-      list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-      setStockMovements(list);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `companies/${compId}/stockMovements`);
-    });
-
     const unsubBranding = onSnapshot(doc(db, 'companies', compId, 'settings', 'branding'), (snapshot) => {
       if (snapshot.exists()) {
         setBranding(snapshot.data() as Branding);
@@ -1297,8 +1277,6 @@ export default function App() {
       unsubBranches();
       unsubSuppliers();
       unsubMembers();
-      unsubSales();
-      unsubStockMovements();
       unsubBranding();
       unsubPrintConfig();
     };
@@ -1329,6 +1307,53 @@ export default function App() {
     });
 
     return () => unsubCash();
+  }, [user, activeCompanyId, selectedBranchId]);
+
+  // Sales and stock movements are the two largest, fastest-growing collections in the
+  // company, so — like cashRegister above — they're scoped to the active branch's own
+  // `branchId` instead of loading every branch's full history into every session (that used
+  // to be the single biggest driver of Firestore read-quota consumption). New sales/movements
+  // always carry a real branchId (see handleCheckout/logStockMovements); the few screens that
+  // genuinely need every branch at once (Sucursales revenue cards, the CSV dashboard export,
+  // Facturación, and reprinting a transfer from the receiving branch) fetch those separately
+  // with a one-off getDocs query instead of depending on this live, branch-scoped stream.
+  useEffect(() => {
+    if (!user || !activeCompanyId || !selectedBranchId) return;
+    const compId = activeCompanyId;
+    const branchId = selectedBranchId;
+
+    const unsubSales = onSnapshot(
+      query(collection(db, 'companies', compId, 'sales'), where('branchId', '==', branchId)),
+      (snapshot) => {
+        const list: Sale[] = [];
+        snapshot.forEach(d => list.push(d.data() as Sale));
+        // `timestamp` is a locale display string (e.g. "30/6/2026, 4:55 p.m.") and isn't
+        // reliably parseable by `new Date()` — sort by the numeric `createdAt` instead.
+        // Older sales recorded before this field existed fall back to 0 (oldest last).
+        const saleSortKey = (s: Sale) => s.createdAt ?? 0;
+        list.sort((a, b) => saleSortKey(b) - saleSortKey(a));
+        setSales(list);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, `companies/${compId}/sales`);
+      }
+    );
+
+    const unsubStockMovements = onSnapshot(
+      query(collection(db, 'companies', compId, 'stockMovements'), where('branchId', '==', branchId)),
+      (snapshot) => {
+        const list: StockMovement[] = [];
+        snapshot.forEach(d => list.push(d.data() as StockMovement));
+        list.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+        setStockMovements(list);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, `companies/${compId}/stockMovements`);
+      }
+    );
+
+    return () => {
+      unsubSales();
+      unsubStockMovements();
+    };
   }, [user, activeCompanyId, selectedBranchId]);
 
   const getTodayDateString = () => {
@@ -2186,8 +2211,12 @@ export default function App() {
           <hr class="sep">
           <p class="bold">PRODUCTOS:</p>
           ${transfer.items.map(it => `
-            <div class="row"><span>${it.quantity}x ${it.productName}</span></div>
+            <div class="row">
+              <span>${it.quantity}x ${it.productName}</span>
+              <span>${formatMXN(it.salePrice * it.quantity)}</span>
+            </div>
           `).join('')}
+          <div class="row total-row"><span>TOTAL:</span><span>${formatMXN(transfer.items.reduce((acc, it) => acc + it.salePrice * it.quantity, 0))}</span></div>
           <hr class="sep">
           ${signatures.map((sig, idx) => `
             <div class="sig-block">
@@ -2210,6 +2239,7 @@ export default function App() {
             ${scope} p { margin: 0 0 4px; }
             ${scope} .sep { border: none; border-top: 1px dashed #555; margin: 6px 0; }
             ${scope} .row { display: flex; justify-content: space-between; margin-bottom: 2px; }
+            ${scope} .total-row { font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; border-top: 2px solid #000; padding-top: 4px; margin-top: 4px; }
             ${scope} .bold { font-weight: bold; }
             ${scope} .sig-block { margin-top: 16px; text-align: center; }
             ${scope} .sig-label { font-weight: 900; font-size: ${isA4 ? '13px' : '11px'}; margin-bottom: 0; }
@@ -2235,8 +2265,9 @@ export default function App() {
         targetBranchName: transfer.targetBranchName,
         targetBranchAddress: transfer.targetBranchAddress,
         initiatedByName: transfer.initiatedByName,
-        items: transfer.items.map(it => ({ productName: it.productName, quantity: it.quantity })),
+        items: transfer.items.map(it => ({ productName: it.productName, quantity: it.quantity, unitPrice: it.salePrice })),
         columns: columnsForPaperWidth(printConfig.paperWidth),
+        formatMXN,
       }),
     });
   };
@@ -2247,8 +2278,26 @@ export default function App() {
   // both branch names, who initiated it), since each product's out/in pair carries identical
   // quantity/productName info from the two branches' perspectives. Only works for transfers made
   // after transferId started being recorded — older movements won't have one.
-  const handleReprintTransfer = (transferId: string) => {
-    const outEntries = stockMovements.filter(mv => mv.transferId === transferId && mv.type === 'transfer_out');
+  const handleReprintTransfer = async (transferId: string) => {
+    // Fast path: the active branch's own (branch-scoped) stockMovements already has the
+    // 'transfer_out' entry when reprinting from the SENDING branch's Historial.
+    let outEntries = stockMovements.filter(mv => mv.transferId === transferId && mv.type === 'transfer_out');
+    if (outEntries.length === 0 && user && activeCompanyId) {
+      // Reprinting from the RECEIVING branch instead — its own scoped stockMovements only has
+      // the 'transfer_in' side, so fetch the sending branch's 'transfer_out' entries on demand.
+      try {
+        const snap = await getDocs(query(
+          collection(db, 'companies', activeCompanyId, 'stockMovements'),
+          where('transferId', '==', transferId),
+          where('type', '==', 'transfer_out')
+        ));
+        const fetched: StockMovement[] = [];
+        snap.forEach(d => fetched.push(d.data() as StockMovement));
+        outEntries = fetched;
+      } catch (err) {
+        handleFirestoreError(err, OperationType.LIST, `companies/${activeCompanyId}/stockMovements (reprint transfer)`);
+      }
+    }
     if (outEntries.length === 0) {
       alert('No se encontró la información completa de este traspaso para reimprimir.');
       return;
@@ -2267,7 +2316,7 @@ export default function App() {
       targetBranchName: first.counterpartBranchName || targetBranch?.name || 'Sucursal',
       targetBranchAddress: targetBranch?.address || undefined,
       initiatedByName: first.userName || undefined,
-      items: outEntries.map(mv => ({ productId: mv.productId, productName: mv.productName, quantity: mv.quantity })),
+      items: outEntries.map(mv => ({ productId: mv.productId, productName: mv.productName, quantity: mv.quantity, salePrice: mv.unitPrice ?? 0 })),
     });
   };
 
@@ -2325,6 +2374,10 @@ export default function App() {
 
 
   const handleOpenProductModal = (product?: Product) => {
+    if (activeCompanyRole !== 'owner') {
+      alert('Solo el Dueño puede crear o editar productos.');
+      return;
+    }
     if (product) {
       setEditingProduct(product);
       setProdForm({
@@ -2407,6 +2460,10 @@ export default function App() {
   };
 
   const handleDeleteProduct = async (prodId: string) => {
+    if (activeCompanyRole !== 'owner') {
+      alert('Solo el Dueño puede eliminar productos.');
+      return;
+    }
     if (confirm('¿Está seguro de que desea eliminar este producto del catálogo?')) {
       const updated = products.filter(p => p.id !== prodId);
       if (user && activeCompanyId) {
@@ -2441,15 +2498,29 @@ export default function App() {
 
     csvContent += "RESUMEN DE SUCURSALES\n";
     csvContent += "Sucursal,Ventas Totales del periodo\n";
-    branches.forEach(b => {
-      const bSales = sales.filter(s =>
-        s.status === 'Completed' &&
-        (s.branchId === b.id || (!s.branchId && !!b.isMatriz)) &&
-        (statsMonth === 'all' || getSaleMonthKey(s) === statsMonth)
-      );
-      const bTotal = bSales.reduce((acc, curr) => acc + curr.total, 0);
-      csvContent += `${b.name.replace(/,/g, ' ')},${bTotal.toFixed(2)} MXN\n`;
-    });
+    // `sales` in memory is now scoped to only the active branch (see the branch-scoped
+    // listener), so the other branches' totals for this cross-branch summary are fetched
+    // fresh here, once, only when this export is actually clicked. Fetched in parallel but
+    // appended in `branches` order afterward, since Promise.all resolves out of order.
+    if (user && activeCompanyId) {
+      const compId = activeCompanyId;
+      const branchTotals = await Promise.all(branches.map(async (b) => {
+        const snap = await getDocs(query(
+          collection(db, 'companies', compId, 'sales'),
+          where('branchId', '==', b.id),
+          where('status', '==', 'Completed')
+        ));
+        let bTotal = 0;
+        snap.forEach(d => {
+          const s = d.data() as Sale;
+          if (statsMonth === 'all' || getSaleMonthKey(s) === statsMonth) bTotal += s.total;
+        });
+        return bTotal;
+      }));
+      branches.forEach((b, i) => {
+        csvContent += `${b.name.replace(/,/g, ' ')},${branchTotals[i].toFixed(2)} MXN\n`;
+      });
+    }
 
     await saveFileOnDevice(`informe_dashboard_${new Date().toISOString().split('T')[0]}.csv`, utf8ToBase64(csvContent), 'text/csv');
   };
@@ -2959,7 +3030,7 @@ export default function App() {
       targetBranchName,
       targetBranchAddress: targetBranch?.address || undefined,
       initiatedByName: currentUserMember?.name || user?.displayName || undefined,
-      items: lines.map(l => ({ productId: l.productId, productName: l.prod!.name, quantity: l.quantity })),
+      items: lines.map(l => ({ productId: l.productId, productName: l.prod!.name, quantity: l.quantity, salePrice: l.prod!.salePrice })),
     };
 
     if (user && activeCompanyId) {
@@ -2985,6 +3056,7 @@ export default function App() {
             counterpartBranchId: transferTargetBranchId,
             counterpartBranchName: targetBranchName,
             transferId,
+            unitPrice: l.prod!.salePrice,
           },
           {
             type: 'transfer_in' as const,
@@ -2996,6 +3068,7 @@ export default function App() {
             counterpartBranchId: transferSourceBranchId,
             counterpartBranchName: sourceBranchName,
             transferId,
+            unitPrice: l.prod!.salePrice,
           },
         ]);
         await logStockMovements(movements);
@@ -3102,6 +3175,71 @@ export default function App() {
         }
       }
       saveAllData(products, customers, sales, cashRegister, updated, suppliers);
+    }
+  };
+
+  // Revenue shown on each branch's card in the Sucursales tab — the only screen that needs
+  // every branch's totals at once. `sales` itself is now scoped to just the active branch
+  // (see the branch-scoped listener above), so this fetches each other branch's completed
+  // sales on demand, once, only while this tab is open, instead of keeping a live company-wide
+  // sales listener running at all times.
+  const [branchRevenueStats, setBranchRevenueStats] = useState<Record<string, { revenue: number; count: number }>>({});
+  useEffect(() => {
+    if (activeTab !== 'branches' || !user || !activeCompanyId || branches.length === 0) return;
+    let cancelled = false;
+    const compId = activeCompanyId;
+    (async () => {
+      try {
+        const entries = await Promise.all(branches.map(async (branch) => {
+          const snap = await getDocs(query(
+            collection(db, 'companies', compId, 'sales'),
+            where('branchId', '==', branch.id),
+            where('status', '==', 'Completed')
+          ));
+          let revenue = 0;
+          snap.forEach(d => { revenue += (d.data() as Sale).total; });
+          return [branch.id, { revenue, count: snap.size }] as const;
+        }));
+        if (!cancelled) setBranchRevenueStats(Object.fromEntries(entries));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.LIST, `companies/${compId}/sales (branch revenue summary)`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, user, activeCompanyId, branches]);
+
+  // Facturación (CFDI) lists invoices from every branch at once, so — same reasoning as
+  // branchRevenueStats above — it keeps its own state fetched on demand instead of reading
+  // the now branch-scoped `sales`. Kept deliberately separate from `sales` so marking an
+  // invoice as facturado/pendiente here can never overwrite the active branch's live sales
+  // state via saveAllData.
+  const [invoiceSales, setInvoiceSales] = useState<Sale[]>([]);
+  useEffect(() => {
+    if (activeTab !== 'invoicing' || !user || !activeCompanyId) return;
+    let cancelled = false;
+    const compId = activeCompanyId;
+    (async () => {
+      try {
+        const snap = await getDocs(query(collection(db, 'companies', compId, 'sales'), where('requiresInvoice', '==', true)));
+        const list: Sale[] = [];
+        snap.forEach(d => list.push(d.data() as Sale));
+        if (!cancelled) setInvoiceSales(list);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.LIST, `companies/${compId}/sales (facturacion)`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, user, activeCompanyId]);
+
+  // Updates one sale's invoiceStatus directly (not via saveAllData, which would replace the
+  // branch-scoped `sales` state) and reflects it in the locally-fetched invoiceSales list.
+  const handleSetInvoiceStatus = async (saleId: string, status: 'completed' | 'pending') => {
+    if (!user || !activeCompanyId) return;
+    try {
+      await updateDoc(doc(db, 'companies', activeCompanyId, 'sales', saleId), { invoiceStatus: status });
+      setInvoiceSales(prev => prev.map(s => s.id === saleId ? { ...s, invoiceStatus: status } : s));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/sales/${saleId}`);
     }
   };
 
@@ -4595,13 +4733,15 @@ export default function App() {
                       <Layers className="w-4 h-4 text-slate-500" />
                       Editar Categorías
                     </button>
-                    <button
-                      onClick={() => handleOpenProductModal()}
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
-                    >
-                      <Plus className="w-4 h-4" />
-                      + Nuevo Producto
-                    </button>
+                    {activeCompanyRole === 'owner' && (
+                      <button
+                        onClick={() => handleOpenProductModal()}
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                      >
+                        <Plus className="w-4 h-4" />
+                        + Nuevo Producto
+                      </button>
+                    )}
                   </div>
                 )}
                 </div>
@@ -4717,20 +4857,26 @@ export default function App() {
                         >
                           <Plus className="w-3.5 h-3.5 inline mr-1" /><span>Surtir Stock</span>
                         </button>
-                        <div className="flex space-x-2">
-                          <button
-                            onClick={() => handleOpenProductModal(prod)}
-                            className="w-1/2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer transition text-center"
-                          >
-                            Editar Art.
-                          </button>
-                          <button
-                            onClick={() => handleDeleteProduct(prod.id)}
-                            className="w-1/2 py-2 hover:bg-purple-50 text-purple-605 text-xs font-bold rounded-xl border border-transparent hover:border-purple-200 cursor-pointer transition text-center"
-                          >
-                            Eliminar
-                          </button>
-                        </div>
+                        {activeCompanyRole === 'owner' ? (
+                          <div className="flex space-x-2">
+                            <button
+                              onClick={() => handleOpenProductModal(prod)}
+                              className="w-1/2 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer transition text-center"
+                            >
+                              Editar Art.
+                            </button>
+                            <button
+                              onClick={() => handleDeleteProduct(prod.id)}
+                              className="w-1/2 py-2 hover:bg-purple-50 text-purple-605 text-xs font-bold rounded-xl border border-transparent hover:border-purple-200 cursor-pointer transition text-center"
+                            >
+                              Eliminar
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="text-center text-[10px] text-slate-400 font-semibold select-none py-1">
+                            🔒 Solo el Dueño puede editar o eliminar artículos
+                          </p>
+                        )}
                       </div>
                     ) : (
                       <div className="mt-4 pt-3 border-t border-slate-50 text-center text-[10px] text-slate-400 font-semibold select-none">
@@ -4787,21 +4933,29 @@ export default function App() {
                               <Package className="w-3.5 h-3.5" />
                             </button>
                           )}
-                          <button
-                            type="button"
-                            onClick={() => handleOpenProductModal(prod)}
-                            className="px-2.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold rounded-lg cursor-pointer transition shrink-0"
-                          >
-                            Editar
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteProduct(prod.id)}
-                            className="p-2 hover:bg-rose-50 text-rose-500 rounded-lg cursor-pointer transition"
-                            title="Eliminar"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {activeCompanyRole === 'owner' ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => handleOpenProductModal(prod)}
+                                className="px-2.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold rounded-lg cursor-pointer transition shrink-0"
+                              >
+                                Editar
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteProduct(prod.id)}
+                                className="p-2 hover:bg-rose-50 text-rose-500 rounded-lg cursor-pointer transition"
+                                title="Eliminar"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          ) : (
+                            <span className="text-[9px] text-slate-400 font-bold select-none px-1" title="Solo el Dueño puede editar o eliminar artículos">
+                              🔒
+                            </span>
+                          )}
                         </div>
                       )}
                     </div>
@@ -5608,8 +5762,8 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {branches.map(branch => {
                   const isActive = selectedBranchId === branch.id;
-                  const branchSales = sales.filter(s => s.status === 'Completed' && (s.branchId === branch.id || (!s.branchId && branch.id === 'b1')));
-                  const totalBranchRevenue = branchSales.reduce((sum, s) => sum + s.total, 0);
+                  const totalBranchRevenue = branchRevenueStats[branch.id]?.revenue ?? 0;
+                  const branchSalesCount = branchRevenueStats[branch.id]?.count ?? 0;
 
                   return (
                     <div 
@@ -5662,7 +5816,7 @@ export default function App() {
                               style={{ width: `${Math.min(100, (totalBranchRevenue / (stats.grossRevenue || 1)) * 100)}%` }}
                             ></div>
                           </div>
-                          <p className="text-[9px] text-slate-400 text-right mt-1 font-semibold">{branchSales.length} transacciones exitosas</p>
+                          <p className="text-[9px] text-slate-400 text-right mt-1 font-semibold">{branchSalesCount} transacciones exitosas</p>
                         </div>
                       </div>
 
@@ -5878,9 +6032,9 @@ export default function App() {
               </div>
 
               {/* Rendering list of sales that require invoice */}
-              {sales.filter(s => s.requiresInvoice && (invoiceStatusFilter === 'all' || s.invoiceStatus === invoiceStatusFilter)).length > 0 ? (
+              {invoiceSales.filter(s => invoiceStatusFilter === 'all' || s.invoiceStatus === invoiceStatusFilter).length > 0 ? (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
-                  {sales.filter(s => s.requiresInvoice && (invoiceStatusFilter === 'all' || s.invoiceStatus === invoiceStatusFilter)).map(sale => (
+                  {invoiceSales.filter(s => invoiceStatusFilter === 'all' || s.invoiceStatus === invoiceStatusFilter).map(sale => (
                     <div key={sale.id} className="border border-slate-200 rounded-xl p-4 shadow-sm bg-white hover:border-indigo-200 transition">
                       <div className="flex justify-between items-start mb-2">
                         <span className="font-bold text-slate-700 text-sm">{sale.id}</span>
@@ -5902,10 +6056,7 @@ export default function App() {
                         <span className="text-xs font-black text-slate-800">Total: {formatMXN(sale.total)}</span>
                         {sale.invoiceStatus !== 'completed' && (
                           <button
-                            onClick={() => {
-                              const updatedSales = sales.map(s => s.id === sale.id ? { ...s, invoiceStatus: 'completed' as const } : s);
-                              saveAllData(products, customers, updatedSales, cashRegister);
-                            }}
+                            onClick={() => handleSetInvoiceStatus(sale.id, 'completed')}
                             className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm"
                           >
                             Marcar Facturado
@@ -5913,10 +6064,7 @@ export default function App() {
                         )}
                         {sale.invoiceStatus === 'completed' && (
                           <button
-                            onClick={() => {
-                              const updatedSales = sales.map(s => s.id === sale.id ? { ...s, invoiceStatus: 'pending' as const } : s);
-                              saveAllData(products, customers, updatedSales, cashRegister);
-                            }}
+                            onClick={() => handleSetInvoiceStatus(sale.id, 'pending')}
                             className="text-slate-400 hover:text-slate-600 underline text-[10px] font-bold p-1"
                           >
                             Revertir
