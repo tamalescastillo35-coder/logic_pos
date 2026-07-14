@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, FormEvent } from 'react';
+import React, { useState, useEffect, useMemo, useRef, FormEvent } from 'react';
 import { 
   ShoppingCart,
   Package,
@@ -3181,11 +3181,19 @@ export default function App() {
   // Revenue shown on each branch's card in the Sucursales tab — the only screen that needs
   // every branch's totals at once. `sales` itself is now scoped to just the active branch
   // (see the branch-scoped listener above), so this fetches each other branch's completed
-  // sales on demand, once, only while this tab is open, instead of keeping a live company-wide
+  // sales on demand, only while this tab is open, instead of keeping a live company-wide
   // sales listener running at all times.
   const [branchRevenueStats, setBranchRevenueStats] = useState<Record<string, { revenue: number; count: number }>>({});
+  // Throttle: `branches` (a dependency below) gets a new array reference every time its
+  // onSnapshot listener reconnects — common on phones that get backgrounded during a busy
+  // shift — which would otherwise silently re-run this all-branches query every reconnect
+  // while this tab happens to be open, on top of whoever re-opens the tab to check revenue.
+  // Skip refetching if the last successful fetch was less than 10 minutes ago.
+  const branchRevenueFetchedAtRef = useRef(0);
   useEffect(() => {
     if (activeTab !== 'branches' || !user || !activeCompanyId || branches.length === 0) return;
+    if (Date.now() - branchRevenueFetchedAtRef.current < 10 * 60 * 1000) return;
+    branchRevenueFetchedAtRef.current = Date.now(); // set before the fetch, not after, so two rapid re-fires can't both slip past the throttle check
     let cancelled = false;
     const compId = activeCompanyId;
     (async () => {
