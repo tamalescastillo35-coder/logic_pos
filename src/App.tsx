@@ -594,6 +594,15 @@ export default function App() {
   // forever with no visible error, even though the code already knew exactly what went wrong.
   const [authError, setAuthError] = useState('');
 
+  // Credential-employee bootstrap ("Conectando al sistema..." waiting screen, see the
+  // users/{uid} sync effect below): true once every automatic retry has been exhausted
+  // without successfully rebuilding the profile, so the waiting screen can show a real
+  // error + "Reintentar" button instead of spinning forever. bootstrapRetryTrigger lets that
+  // button re-run the whole sync effect (it's in the effect's dependency array) without
+  // needing the user to sign out and back in.
+  const [credentialBootstrapFailed, setCredentialBootstrapFailed] = useState(false);
+  const [bootstrapRetryTrigger, setBootstrapRetryTrigger] = useState(0);
+
   const handleCredentialSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
@@ -1004,110 +1013,112 @@ export default function App() {
     const quickRestore = localStorage.getItem(`logic_active_company_${user.uid}`);
     if (quickRestore) setActiveCompanyId(quickRestore);
 
+    const isVirtualEmployee = !!(user.email && user.email.includes('_') && user.email.endsWith('@logicpos.com'));
+    let parsedCompanyId: string | null = null;
+    if (isVirtualEmployee) {
+      const emailLocal = user.email!.split('@')[0];
+      const firstUnderscore = emailLocal.indexOf('_');
+      const secondUnderscore = emailLocal.indexOf('_', firstUnderscore + 1);
+      parsedCompanyId = secondUnderscore !== -1 ? emailLocal.substring(0, secondUnderscore) : null;
+    }
+
+    // Bootstraps (or rebuilds) a credential (virtual-email) employee's users/{uid} doc from
+    // their company member record. Called both when the doc doesn't exist yet (first login)
+    // and when it exists but was left with an empty `companies` map (a stuck/"poisoned"
+    // profile from before this self-heal existed, or any other transient failure) — that
+    // second case used to be a permanent dead end, since a doc that already exists never
+    // re-triggers the "doesn't exist" branch again, not even after signing out and back in.
+    // Retries several times over ~10s to ride out brief connectivity/propagation hiccups
+    // (e.g. right after an Owner creates the account) before finally giving up and letting
+    // the waiting screen show a real error + "Reintentar" button instead of spinning forever.
+    const bootstrapCredentialEmployee = async (attempt: number) => {
+      if (!parsedCompanyId) { setCredentialBootstrapFailed(true); return; }
+      if (attempt === 0) setCredentialBootstrapFailed(false);
+      try {
+        const memberSnap = await getDoc(doc(db, 'companies', parsedCompanyId, 'members', user.uid));
+        if (!memberSnap.exists()) throw new Error('member-not-visible-yet');
+        const mData = memberSnap.data();
+
+        let compName = 'Mi Empresa';
+        try {
+          const compSnap = await getDoc(doc(db, 'companies', parsedCompanyId));
+          if (compSnap.exists()) compName = compSnap.data().name || compName;
+        } catch {
+          // Company name lookup failing isn't fatal — fall back to the generic label.
+        }
+
+        await setDoc(doc(db, 'users', user.uid), {
+          uid: user.uid,
+          email: user.email || '',
+          name: mData.name || 'Empleado',
+          createdAt: new Date().toISOString(),
+          companies: {
+            [parsedCompanyId]: {
+              id: parsedCompanyId,
+              name: compName,
+              role: mData.role || 'employee'
+            }
+          },
+          activeCompanyId: parsedCompanyId
+        });
+      } catch (err) {
+        if (attempt < 4) {
+          setTimeout(() => bootstrapCredentialEmployee(attempt + 1), 2500);
+        } else {
+          setCredentialBootstrapFailed(true);
+        }
+      }
+    };
+
     const unsubUser = onSnapshot(doc(db, 'users', user.uid), (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
-        if (data.companies) {
-          setUserCompanies(data.companies);
-        } else {
-          setUserCompanies({});
+        const companies = data.companies || {};
+        const keys = Object.keys(companies);
+
+        if (keys.length === 0 && isVirtualEmployee) {
+          // Stuck/poisoned credential-employee profile — self-heal instead of leaving it
+          // stranded (see comment on bootstrapCredentialEmployee above).
+          bootstrapCredentialEmployee(0);
+          return;
         }
+
+        setUserCompanies(companies);
 
         const savedActiveCompanyId = localStorage.getItem(`logic_active_company_${user.uid}`);
         const cloudActiveCompanyId = data.activeCompanyId;
-        const keys = Object.keys(data.companies || {});
 
-        if (cloudActiveCompanyId && data.companies?.[cloudActiveCompanyId]) {
+        if (cloudActiveCompanyId && companies[cloudActiveCompanyId]) {
           setActiveCompanyId(cloudActiveCompanyId);
-        } else if (savedActiveCompanyId && data.companies?.[savedActiveCompanyId]) {
+        } else if (savedActiveCompanyId && companies[savedActiveCompanyId]) {
           setActiveCompanyId(savedActiveCompanyId);
         } else if (keys.length > 0) {
           setActiveCompanyId(keys[0]);
         } else {
           setActiveCompanyId(null);
         }
+      } else if (isVirtualEmployee) {
+        bootstrapCredentialEmployee(0);
       } else {
-        // Initialize user document
-        const isVirtualEmployee = user.email && user.email.includes('_') && user.email.endsWith('@logicpos.com');
-        if (isVirtualEmployee) {
-          const emailLocal = user.email!.split('@')[0];
-          const firstUnderscore = emailLocal.indexOf('_');
-          const secondUnderscore = emailLocal.indexOf('_', firstUnderscore + 1);
-          const parsedCompanyId = secondUnderscore !== -1 ? emailLocal.substring(0, secondUnderscore) : null;
-
-          if (parsedCompanyId) {
-            // Bootstraps a credential (virtual-email) employee's users/{uid} doc from their
-            // company member record, the first time they ever log in. Deliberately does NOT
-            // write anything on failure (just leaves activeCompanyId unset for this attempt):
-            // firestore.rules' isMemberOfCompany() gates the member-doc read on that exact
-            // doc's own existence, so reading it in the moment right after an Owner creates
-            // the account (before it's visible) throws permission-denied rather than a clean
-            // "not found". Writing a companies:{} fallback here used to PERMANENTLY strand the
-            // employee — every later login re-reads that same empty doc and never retries the
-            // lookup again. Leaving no doc behind means the next login attempt (or the "Salir
-            // e intentar de nuevo" button on the waiting screen) re-runs this whole bootstrap
-            // fresh, and one short built-in retry covers the common case without even needing
-            // the user to do that manually.
-            const bootstrapCredentialEmployee = async (attempt: number) => {
-              try {
-                const memberSnap = await getDoc(doc(db, 'companies', parsedCompanyId, 'members', user.uid));
-                if (!memberSnap.exists()) throw new Error('member-not-visible-yet');
-                const mData = memberSnap.data();
-
-                let compName = 'Mi Empresa';
-                try {
-                  const compSnap = await getDoc(doc(db, 'companies', parsedCompanyId));
-                  if (compSnap.exists()) compName = compSnap.data().name || compName;
-                } catch {
-                  // Company name lookup failing isn't fatal — fall back to the generic label.
-                }
-
-                await setDoc(doc(db, 'users', user.uid), {
-                  uid: user.uid,
-                  email: user.email || '',
-                  name: mData.name || 'Empleado',
-                  createdAt: new Date().toISOString(),
-                  companies: {
-                    [parsedCompanyId]: {
-                      id: parsedCompanyId,
-                      name: compName,
-                      role: mData.role || 'employee'
-                    }
-                  },
-                  activeCompanyId: parsedCompanyId
-                });
-              } catch (err) {
-                if (attempt < 1) {
-                  setTimeout(() => bootstrapCredentialEmployee(attempt + 1), 1500);
-                }
-                // Otherwise give up silently for this attempt — see comment above.
-              }
-            };
-            bootstrapCredentialEmployee(0);
-          }
-          // parsedCompanyId null (malformed virtual email): nothing to bootstrap; stays on
-          // the waiting screen until "Salir e intentar de nuevo".
-        } else {
-          // Genuine new signup (Google account that's never created/joined a company) — this
-          // IS the correct steady state, not a failure: seeds an empty companies map so they
-          // land on "create your first company" instead of the employee waiting screen.
-          setDoc(doc(db, 'users', user.uid), {
-            uid: user.uid,
-            email: user.email || '',
-            name: user.displayName || 'Comerciante',
-            createdAt: new Date().toISOString(),
-            companies: {}
-          }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-          setActiveCompanyId(null);
-          setUserCompanies({});
-        }
+        // Genuine new signup (Google account that's never created/joined a company) — this
+        // IS the correct steady state, not a failure: seeds an empty companies map so they
+        // land on "create your first company" instead of the employee waiting screen.
+        setDoc(doc(db, 'users', user.uid), {
+          uid: user.uid,
+          email: user.email || '',
+          name: user.displayName || 'Comerciante',
+          createdAt: new Date().toISOString(),
+          companies: {}
+        }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
+        setActiveCompanyId(null);
+        setUserCompanies({});
       }
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
     });
 
     return () => unsubUser();
-  }, [user]);
+  }, [user, bootstrapRetryTrigger]);
 
   // Self-healing role sync to preserve security and sync changes automatically across active teams
   useEffect(() => {
@@ -7547,18 +7558,38 @@ export default function App() {
       {/* Waiting screen for credential employees while Firestore resolves their company */}
       {user && !isAuthLoading && !activeCompanyId && isCredentialEmployee && (
         <div className="fixed inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
-          <div className="w-16 h-16 rounded-2xl bg-indigo-900/40 border border-indigo-700/30 flex items-center justify-center mb-5">
-            <ShoppingCart className="w-8 h-8 text-indigo-400 animate-pulse" />
-          </div>
-          <h2 className="text-xl font-black text-slate-100 mb-2">Conectando al sistema...</h2>
-          <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
-            Estamos verificando tus credenciales y cargando tu sucursal asignada.
-          </p>
-          <div className="flex gap-1.5 mb-8">
-            <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-            <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-            <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-          </div>
+          {credentialBootstrapFailed ? (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-rose-900/40 border border-rose-700/30 flex items-center justify-center mb-5">
+                <AlertCircle className="w-8 h-8 text-rose-400" />
+              </div>
+              <h2 className="text-xl font-black text-slate-100 mb-2">No pudimos verificar tu cuenta</h2>
+              <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+                Revisa tu conexión a internet e intenta de nuevo. Si el problema sigue, avisa a tu encargado.
+              </p>
+              <button
+                onClick={() => { setCredentialBootstrapFailed(false); setBootstrapRetryTrigger(n => n + 1); }}
+                className="px-6 py-2.5 mb-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-xl shadow cursor-pointer transition"
+              >
+                Reintentar
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-indigo-900/40 border border-indigo-700/30 flex items-center justify-center mb-5">
+                <ShoppingCart className="w-8 h-8 text-indigo-400 animate-pulse" />
+              </div>
+              <h2 className="text-xl font-black text-slate-100 mb-2">Conectando al sistema...</h2>
+              <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+                Estamos verificando tus credenciales y cargando tu sucursal asignada.
+              </p>
+              <div className="flex gap-1.5 mb-8">
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+            </>
+          )}
           <button
             onClick={() => signOut(auth)}
             className="text-xs text-slate-500 hover:text-slate-300 underline cursor-pointer transition"
