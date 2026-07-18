@@ -1993,41 +1993,61 @@ export default function App() {
     // Web Bluetooth at all, so it always falls through to window.print() below — which on
     // iOS always opens AirPrint directly, with no way for the page to route it anywhere
     // else. Bixolon's "mPrint" app (and similar thermal-printer companion apps) bridge this
-    // by accepting a file through iOS's native Share Sheet instead: build the ticket as a
-    // PDF and hand it to navigator.share(), so the user can pick mPrint there (AirPrint and
-    // "Guardar en Archivos" are still available from that same sheet — nothing is lost for
-    // people who don't use mPrint). Falls through to window.print() if Share isn't usable.
+    // by accepting an image through iOS's native Share Sheet instead: build the ticket as a
+    // plain Canvas 2D image (no html2canvas/jsPDF.html() — those rasterize a live DOM tree
+    // and are slow/async enough that by the time they finish, Safari has already forgotten
+    // this was triggered by a user tap, so navigator.share() silently does nothing — that's
+    // what caused the frozen-screen report) and hand it to navigator.share() synchronously,
+    // right in the click's own call stack. AirPrint/"Guardar en Archivos" stay available from
+    // that same sheet. Falls through to window.print() if Share isn't usable or anything here
+    // throws.
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     if (isIOS && typeof navigator.share === 'function') {
-      const pw = printConfig.paperWidth;
-      const pdfWidthMm = pw === 'A4' ? 210 : pw === '80mm' ? 80 : 58;
-      const pdfHeightMm = pw === 'A4' ? 297 : 200; // generous fixed height for receipts; may need tuning once tested on a real device
+      try {
+        // .innerText needs layout, which only computes on elements actually in the DOM —
+        // attach briefly just to read it back out, synchronously, no rendering/rasterizing.
+        const textContainer = document.createElement('div');
+        textContainer.style.cssText = 'position:fixed; left:-10000px; top:0; white-space:pre-wrap;';
+        textContainer.innerHTML = ticketBodyHtml;
+        document.body.appendChild(textContainer);
+        const lines = (textContainer.innerText || textContainer.textContent || '')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(Boolean);
+        textContainer.remove();
 
-      const container = document.createElement('div');
-      container.style.cssText = 'position:fixed; left:-10000px; top:0;';
-      container.innerHTML = `<style>${ticketStylesFn('#logicpos-share-ticket')}</style><div id="logicpos-share-ticket">${ticketBodyHtml}</div>`;
-      document.body.appendChild(container);
+        const pw = printConfig.paperWidth;
+        const canvasWidth = pw === 'A4' ? 800 : pw === '80mm' ? 380 : 280;
+        const lineHeight = 22;
+        const padding = 16;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvasWidth;
+        canvas.height = lines.length * lineHeight + padding * 2;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('no-canvas-context');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#000';
+        ctx.font = '16px monospace';
+        ctx.textBaseline = 'top';
+        lines.forEach((line, i) => ctx.fillText(line, padding, padding + i * lineHeight, canvasWidth - padding * 2));
 
-      const doc = new jsPDF({ unit: 'mm', format: [pdfWidthMm, pdfHeightMm] });
-      doc.html(container, {
-        x: 0,
-        y: 0,
-        width: pdfWidthMm,
-        windowWidth: container.scrollWidth || 302,
-        callback: async (finishedDoc) => {
-          container.remove();
-          try {
-            const pdfBlob = finishedDoc.output('blob');
-            const file = new File([pdfBlob], `${docTitle}.pdf`, { type: 'application/pdf' });
-            if (navigator.canShare && !navigator.canShare({ files: [file] })) throw new Error('share-files-unsupported');
-            await navigator.share({ files: [file], title: docTitle });
-          } catch (err) {
-            console.error('iOS share error:', err);
-            window.print();
-          }
-        }
-      });
-      return;
+        const base64 = canvas.toDataURL('image/png').split(',')[1];
+        const byteChars = atob(base64);
+        const bytes = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+        const file = new File([bytes], `${docTitle}.png`, { type: 'image/png' });
+
+        if (navigator.canShare && !navigator.canShare({ files: [file] })) throw new Error('share-files-unsupported');
+        navigator.share({ files: [file], title: docTitle }).catch(err => {
+          console.error('iOS share error:', err);
+          window.print();
+        });
+        return;
+      } catch (err) {
+        console.error('iOS ticket image error:', err);
+        // fall through to window.print() below
+      }
     }
 
     // Web: open the ticket in its own tab that prints itself on load. This is the only
