@@ -2383,7 +2383,7 @@ export default function App() {
     const baseFontSize = pw === '58mm' ? '11px' : '12px';
 
     const signatures: { title: string; subtitle: string }[] = [
-      { title: 'FIRMA DE RECOLECCIÓN', subtitle: '(Repartidor)' },
+      { title: 'FIRMA DE ENVÍO', subtitle: '(Encargado, sucursal origen)' },
       { title: 'FIRMA DE RECEPCIÓN', subtitle: '(Personal, sucursal destino)' },
       { title: 'FIRMA DE VALIDACIÓN', subtitle: '(Encargado, sucursal destino)' },
     ];
@@ -3114,7 +3114,7 @@ export default function App() {
   // Goods Transfer between Branches (Transferencia multisuccursal y de matriz)
   const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
   const [transferItems, setTransferItems] = useState<TransferLineItem[]>([]);
-  const [transferAddProductId, setTransferAddProductId] = useState(''); // pending selection in the "add product" row, before it's added to transferItems
+  const [transferProductSearch, setTransferProductSearch] = useState(''); // filter text for the checkbox picker below
   const [transferSourceBranchId, setTransferSourceBranchId] = useState('');
   const [transferTargetBranchId, setTransferTargetBranchId] = useState('');
   const [lastCompletedTransfer, setLastCompletedTransfer] = useState<CompletedTransfer | null>(null);
@@ -3144,10 +3144,23 @@ export default function App() {
     setTransferItems(prev => prev.filter(it => it.productId !== productId));
   };
 
+  // Checkbox picker list for the transfer modal: filtered by search text and by having
+  // stock at the chosen origin branch, so staff doing many transfers a day (often several
+  // items at once) can search instead of scrolling every catalog item.
+  const transferProductOptions = useMemo(() => {
+    const term = transferProductSearch.trim().toLowerCase();
+    return products.filter(p => {
+      if (transferSourceBranchId && getProductStock(p, transferSourceBranchId) <= 0) return false;
+      if (!term) return true;
+      return p.name.toLowerCase().includes(term) || (p.category && p.category.toLowerCase().includes(term));
+    });
+  }, [products, transferProductSearch, transferSourceBranchId]);
+
   const handleOpenTransferModal = (prodId?: string) => {
     // Always overwrites the cart (never merges with a leftover cart from a cancelled
     // session), same as the single-product version used to fully overwrite transferProductId.
     setTransferItems(prodId ? [{ productId: prodId, quantity: 1 }] : []);
+    setTransferProductSearch('');
     // Default source to whatever branch this session is currently operating out of (the
     // header branch selector) — not an arbitrary Matriz/first-branch guess — since that's
     // almost always where the goods being transferred actually are. Falls back to Matriz/
@@ -3392,14 +3405,35 @@ export default function App() {
     (async () => {
       try {
         const entries = await Promise.all(branches.map(async (branch) => {
+          // Only count sales since the branch's last "Apertura de Caja" so this resets at
+          // every corte instead of accumulating forever. The register doc's `transactions`
+          // array is reset to just the opening entry each time caja is opened (see
+          // handleOpenCaja) — closing does NOT clear it — so transactions[0].createdAt is
+          // exactly that boundary, whether the register is currently open or was just
+          // closed (shows the just-finished shift until the next apertura, then drops to
+          // 0). Filtered client-side rather than via a `where('createdAt', '>=', ...)`
+          // clause so this doesn't need a new Firestore composite index.
+          let since = 0;
+          try {
+            const cashSnap = await getDoc(doc(db, 'companies', compId, 'cashRegisters', branch.id));
+            const openTx = (cashSnap.data() as CashRegister | undefined)?.transactions?.[0];
+            if (openTx?.createdAt) since = openTx.createdAt;
+          } catch { /* no register doc yet (branch never opened caja) — falls back to all-time */ }
+
           const snap = await getDocs(query(
             collection(db, 'companies', compId, 'sales'),
             where('branchId', '==', branch.id),
             where('status', '==', 'Completed')
           ));
           let revenue = 0;
-          snap.forEach(d => { revenue += (d.data() as Sale).total; });
-          return [branch.id, { revenue, count: snap.size }] as const;
+          let count = 0;
+          snap.forEach(d => {
+            const sale = d.data() as Sale;
+            if (since && (sale.createdAt ?? 0) < since) return;
+            revenue += sale.total;
+            count++;
+          });
+          return [branch.id, { revenue, count }] as const;
         }));
         if (!cancelled) setBranchRevenueStats(Object.fromEntries(entries));
       } catch (err) {
@@ -6777,7 +6811,7 @@ export default function App() {
                 <Package className="w-3.5 h-3.5 inline mr-1" /><span>Transferencia e Inventario</span>
               </h3>
               <button
-                onClick={() => { setIsTransferModalOpen(false); setTransferAddProductId(''); }}
+                onClick={() => { setIsTransferModalOpen(false); setTransferProductSearch(''); }}
                 className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
@@ -6821,32 +6855,47 @@ export default function App() {
 
               <div className="text-left">
                 <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Agregar producto:</label>
-                <div className="flex gap-2 mt-1.5">
-                  <select
-                    value={transferAddProductId}
-                    onChange={(e) => setTransferAddProductId(e.target.value)}
-                    className="flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition"
-                  >
-                    <option value="">Selecciona un producto...</option>
-                    {products
-                      .filter(p => !transferSourceBranchId || getProductStock(p, transferSourceBranchId) > 0)
-                      .map(p => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({getProductStock(p, transferSourceBranchId)} u. disponibles | {p.category || 'Sin Cat'})
-                        </option>
-                      ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (!transferAddProductId) return;
-                      addTransferItem(transferAddProductId);
-                      setTransferAddProductId('');
-                    }}
-                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer shrink-0"
-                  >
-                    + Agregar
-                  </button>
+                <div className="relative mt-1.5">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={transferProductSearch}
+                    onChange={(e) => setTransferProductSearch(e.target.value)}
+                    placeholder="Buscar por nombre o categoría..."
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition"
+                  />
+                </div>
+                <div className="mt-2 space-y-1 max-h-48 overflow-y-auto pr-0.5">
+                  {transferProductOptions.length === 0 && (
+                    <p className="text-[10px] text-slate-400 font-semibold text-center py-3">Ningún producto coincide.</p>
+                  )}
+                  {transferProductOptions.map(p => {
+                    const inList = transferItems.find(it => it.productId === p.id);
+                    const available = getProductStock(p, transferSourceBranchId);
+                    return (
+                      <div
+                        key={p.id}
+                        onClick={() => inList ? removeTransferItem(p.id) : addTransferItem(p.id)}
+                        className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer transition ${inList ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-150 hover:bg-slate-50'}`}
+                      >
+                        <input type="checkbox" checked={!!inList} readOnly className="pointer-events-none accent-indigo-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-bold text-slate-700 truncate">{p.name}</p>
+                          <p className="text-[10px] text-slate-400">{available} u. disponibles | {p.category || 'Sin Cat'}</p>
+                        </div>
+                        {inList && (
+                          <input
+                            type="number"
+                            min="1"
+                            value={inList.quantity}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => updateTransferItemQty(p.id, parseInt(e.target.value) || 1)}
+                            className="w-14 bg-white border border-slate-200 rounded-lg px-2 py-1 text-slate-800 text-xs font-black outline-none focus:border-indigo-500 transition text-center shrink-0"
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -6891,7 +6940,7 @@ export default function App() {
             <div className="flex gap-2.5 pt-3">
               <button
                 type="button"
-                onClick={() => { setIsTransferModalOpen(false); setTransferAddProductId(''); }}
+                onClick={() => { setIsTransferModalOpen(false); setTransferProductSearch(''); }}
                 className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition text-center cursor-pointer"
               >
                 Cancelar

@@ -209,9 +209,9 @@ export function buildTransferEscPos(p: EscPosTransferParams): Uint8Array {
     if (n < 3) b.line(sep(w));
   };
 
-  signatureBlock(1, 'FIRMA DE RECOLECCION', '(Repartidor)');
-  signatureBlock(2, 'FIRMA DE RECEPCION', '(Personal sucursal destino)');
-  signatureBlock(3, 'FIRMA DE VALIDACION', '(Encargado sucursal destino)');
+  signatureBlock(1, 'FIRMA DE ENVIO', '(Encargado, sucursal origen)');
+  signatureBlock(2, 'FIRMA DE RECEPCION', '(Personal, sucursal destino)');
+  signatureBlock(3, 'FIRMA DE VALIDACION', '(Encargado, sucursal destino)');
 
   b.feed(3);
   b.cut();
