@@ -3156,6 +3156,38 @@ export default function App() {
     });
   }, [products, transferProductSearch, transferSourceBranchId]);
 
+  // The single branch flagged as Matriz, if exactly one is — deliberately undefined (not a
+  // best-guess fallback) when zero or more than one branch has isMatriz set, since nothing
+  // in handleSaveBranch enforces uniqueness and firestore.rules doesn't validate this field.
+  // "Mover Todo a Matriz" below treats undefined as "misconfigured, refuse and explain" rather
+  // than silently picking a branch.
+  const matrizBranchCandidates = branches.filter(b => b.isMatriz);
+  const matrizBranch = matrizBranchCandidates.length === 1 ? matrizBranchCandidates[0] : undefined;
+
+  // Bulk version of handleOpenTransferModal below: preloads the same transfer modal with every
+  // in-stock product at the active branch, at full quantity, targeting Matriz directly — instead
+  // of building the transfer one product at a time. Kept separate from handleOpenTransferModal
+  // (rather than adding flags to it) since the preload logic genuinely differs: every product at
+  // full stock vs. one optional product at qty 1, fixed Matriz target vs. "first other branch."
+  const handleOpenMoveAllToMatrizModal = () => {
+    if (!matrizBranch) {
+      alert('No se puede continuar: debe existir exactamente una sucursal marcada como "Matriz" en Sucursales. Revisa la configuración con el Dueño.');
+      return;
+    }
+    const itemsToMove = products
+      .map(p => ({ productId: p.id, quantity: getProductStock(p, selectedBranchId) }))
+      .filter(it => it.quantity > 0);
+    if (itemsToMove.length === 0) {
+      alert('No hay stock en esta sucursal para mover a Matriz.');
+      return;
+    }
+    setTransferItems(itemsToMove);
+    setTransferProductSearch('');
+    setTransferSourceBranchId(selectedBranchId);
+    setTransferTargetBranchId(matrizBranch.id);
+    setIsTransferModalOpen(true);
+  };
+
   const handleOpenTransferModal = (prodId?: string) => {
     // Always overwrites the cart (never merges with a leftover cart from a cancelled
     // session), same as the single-product version used to fully overwrite transferProductId.
@@ -4974,6 +5006,17 @@ export default function App() {
                       <Layers className="w-4 h-4 text-slate-500" />
                       Editar Categorías
                     </button>
+                    {selectedBranchId !== matrizBranch?.id && (
+                      <button
+                        type="button"
+                        onClick={handleOpenMoveAllToMatrizModal}
+                        className="bg-teal-600 hover:bg-teal-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                        title="Envía todo el stock actual de esta sucursal a la Matriz en un solo traspaso"
+                      >
+                        <Package className="w-4 h-4" />
+                        Mover Todo a Matriz
+                      </button>
+                    )}
                     {activeCompanyRole === 'owner' && (
                       <button
                         onClick={() => handleOpenProductModal()}
