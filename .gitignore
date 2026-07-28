@@ -64,6 +64,8 @@ node_modules/
 
 # dotenv environment variables file
 .env
+.env.local
+.env.*.local
 
 # dataconnect generated files
 .dataconnect
@@ -84,6 +86,11 @@ dist/
 
 # Credenciales generadas por scripts de carga (nunca commitear)
 scripts/output/
+
+# Scripts de siembra de la base de datos de pruebas (sandbox-pruebas) — solo para uso local,
+# nunca deben llegar al repo que se despliega automaticamente a produccion
+scripts/seed-sandbox.mjs
+scripts/seed-sandbox-stock.mjs
 
 # Documentacion interna / bitacora de desarrollo (no va en el repo del cliente)
 docs/PROGRESO_DEV.md
