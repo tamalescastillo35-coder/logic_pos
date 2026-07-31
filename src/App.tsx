@@ -38,7 +38,16 @@ import {
   Download,
   Printer,
   LayoutGrid,
-  List
+  List,
+  Rocket,
+  History,
+  User as UserIcon,
+  Lock,
+  Link2,
+  Upload,
+  TrendingDown,
+  MessageCircle,
+  Mail
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
@@ -168,6 +177,17 @@ interface Product {
   sku?: string;
   supplierId?: string; // Associated Suppplier
   branchStocks?: { [branchId: string]: number }; // Branch-specific stocks!
+  // Shared-stock link (e.g. "Atole Mediano"/"1 Litro" drawing from one "Atole" pool in liters):
+  // when set, this product has no stock of its own — getProductStock resolves it from the
+  // linked parent's stock divided by the factor. Both undefined means a normal, independent
+  // product (the vast majority).
+  linkedStockProductId?: string; // id of the "parent" pool product
+  stockConsumptionFactor?: number; // how much of the parent's stock one unit of this product consumes (0.5 = medio, 1 = litro)
+  // Marks a product as itself a shared-stock pool (e.g. "Atole de Chocolate" backing "...
+  // Mediano"/"...1 Litro"). Set explicitly at creation — NOT inferred from whether some other
+  // product currently links to it — so it's excluded from the sale catalog from the moment it's
+  // created, before any child has been linked yet.
+  isStockPool?: boolean;
 }
 
 interface Customer {
@@ -189,6 +209,11 @@ interface SaleItem {
   name: string;
   quantity: number;
   salePrice: number;
+  // Snapshot of the product's shared-stock link AT THE MOMENT OF SALE (not re-read from the
+  // live product later) — so a refund always restores the correct pool even if the product's
+  // link config changed or the product was deleted in between.
+  linkedStockProductId?: string;
+  stockConsumptionFactor?: number;
 }
 
 interface Sale {
@@ -293,7 +318,13 @@ interface Member {
   assignedBranchId?: string;
 }
 
-export const getProductStock = (prod: Product, branchId: string): number => {
+export const getProductStock = (prod: Product, branchId: string, products: Product[]): number => {
+  if (prod.linkedStockProductId && prod.stockConsumptionFactor) {
+    const parent = products.find(p => p.id === prod.linkedStockProductId);
+    if (!parent) return 0; // parent deleted/missing — no stock, rather than crashing
+    const parentStock = parent.branchStocks?.[branchId] !== undefined ? parent.branchStocks[branchId] : parent.stock;
+    return Math.floor(parentStock / prod.stockConsumptionFactor); // only whole units of the child can be sold
+  }
   if (!prod.branchStocks) return prod.stock;
   return prod.branchStocks[branchId] !== undefined ? prod.branchStocks[branchId] : prod.stock;
 };
@@ -1638,6 +1669,20 @@ export default function App() {
     }
   };
 
+  // A linked ("child") product has no stock of its own — selling/refunding one unit must move
+  // the PARENT's pool instead, scaled by the consumption factor. applyStockDeltas itself stays
+  // generic (just applies whatever {productId, branchId, qtyDelta} it's given); this resolves
+  // which product a given sale line should actually target before the delta is built.
+  const resolveStockTarget = (
+    productId: string, branchId: string, quantity: number,
+    linkedStockProductId?: string, stockConsumptionFactor?: number
+  ) => {
+    if (linkedStockProductId && stockConsumptionFactor) {
+      return { productId: linkedStockProductId, branchId, qtyDelta: quantity * stockConsumptionFactor };
+    }
+    return { productId, branchId, qtyDelta: quantity };
+  };
+
   // Writes append-only entries to the inventory audit log (surtidos / transfers). Each
   // caller passes the meaningful fields; id/user/timestamps are filled in here. Best-effort:
   // a logging failure must not block the actual stock change that already succeeded.
@@ -1720,18 +1765,30 @@ export default function App() {
     }
   };
 
+  // Ids of every product that's a shared-stock "parent" for at least one other product (e.g.
+  // "Atole de Chocolate" backing "...Mediano"/"...1 Litro") — a fallback for pools created
+  // before isStockPool existed, or where someone linked a child without checking the box.
+  const linkedParentIds = useMemo(() => {
+    return new Set(products.filter(p => p.linkedStockProductId).map(p => p.linkedStockProductId));
+  }, [products]);
+  // A pool holds stock but is never itself something a cashier rings up — hidden from the sale
+  // catalog from the moment isStockPool is checked (not only once something links to it, so
+  // there's no window where a freshly-created pool briefly shows up as sellable).
+  const isPoolProduct = (p: Product) => !!p.isStockPool || linkedParentIds.has(p.id);
+
   const filteredProducts = useMemo(() => {
     return products.filter(p => {
+      if (isPoolProduct(p)) return false;
       const matchesSearch = p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                             (p.category && p.category.toLowerCase().includes(searchTerm.toLowerCase()));
       const matchesCat = selectedCategory === 'Todos' || p.category === selectedCategory;
       // Terminal POS only sells what's physically in the active branch: products at 0
       // stock are hidden so a cashier can't oversell. They reappear automatically once
       // stock is added (surtido / transfer). This is per-branch, not global.
-      const hasStock = getProductStock(p, selectedBranchId) >= 1;
+      const hasStock = getProductStock(p, selectedBranchId, products) >= 1;
       return matchesSearch && matchesCat && hasStock;
     });
-  }, [products, searchTerm, selectedCategory, selectedBranchId]);
+  }, [products, searchTerm, selectedCategory, selectedBranchId, linkedParentIds]);
 
   // Inventario's own search — unlike the Terminal POS list above, this must surface every
   // catalog item (including 0-stock ones, since managing stock is the whole point of this
@@ -1746,16 +1803,34 @@ export default function App() {
     );
   }, [products, inventorySearchTerm]);
 
+  // Inventario shows one card/row per "top-level" product — a linked ("child") product never
+  // gets its own card, it's nested inside its parent's card instead (see getLinkedChildren
+  // below), so a shared-stock group like "Atole de Chocolate" + "...Mediano" + "...1 Litro"
+  // reads as one item, not three near-duplicates. A parent that doesn't itself match the search
+  // still shows up if the search matched one of ITS children, so searching "Mediano" doesn't
+  // produce a confusing empty result.
+  const topLevelInventoryProducts = useMemo(() => {
+    const matchedIds = new Set(inventoryFilteredProducts.map(p => p.id));
+    return products.filter(p => {
+      if (p.linkedStockProductId) return false;
+      if (matchedIds.has(p.id)) return true;
+      return products.some(child => child.linkedStockProductId === p.id && matchedIds.has(child.id));
+    });
+  }, [inventoryFilteredProducts, products]);
+
+  const getLinkedChildren = (parentId: string) => products.filter(p => p.linkedStockProductId === parentId);
+
   // Count of catalogue items hidden from the terminal purely because they're out of stock
   // in the active branch (used to explain an empty grid instead of implying "no products").
   const outOfStockHiddenCount = useMemo(() => {
     return products.filter(p => {
+      if (isPoolProduct(p)) return false; // hidden because it's a pool, not because of stock
       const matchesSearch = p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                             (p.category && p.category.toLowerCase().includes(searchTerm.toLowerCase()));
       const matchesCat = selectedCategory === 'Todos' || p.category === selectedCategory;
-      return matchesSearch && matchesCat && getProductStock(p, selectedBranchId) < 1;
+      return matchesSearch && matchesCat && getProductStock(p, selectedBranchId, products) < 1;
     }).length;
-  }, [products, searchTerm, selectedCategory, selectedBranchId]);
+  }, [products, searchTerm, selectedCategory, selectedBranchId, linkedParentIds]);
 
   // Cart helper functions.
   // Cart quantities are hard-capped at the active branch's available stock so a sale can
@@ -1769,7 +1844,7 @@ export default function App() {
   // of a single correctly-summed line. The functional form guarantees each update is
   // applied on top of the truly-latest state, in order.
   const addToCart = (product: Product) => {
-    const available = getProductStock(product, selectedBranchId);
+    const available = getProductStock(product, selectedBranchId, products);
     setCart(prevCart => {
       const idx = prevCart.findIndex(item => item.product.id === product.id);
       const currentQty = idx > -1 ? prevCart[idx].quantity : 0;
@@ -1796,7 +1871,7 @@ export default function App() {
       }
       if (val > 0) {
         const liveProduct = products.find(p => p.id === productId) || item.product;
-        const available = getProductStock(liveProduct, selectedBranchId);
+        const available = getProductStock(liveProduct, selectedBranchId, products);
         if (newQty > available) {
           alert(`No hay stock suficiente de "${item.product.name}" en esta sucursal.\nDisponible: ${available} u.`);
           return prevCart;
@@ -1844,7 +1919,7 @@ export default function App() {
     const insufficient = cart
       .map(item => {
         const liveProduct = products.find(p => p.id === item.product.id);
-        const available = liveProduct ? getProductStock(liveProduct, selectedBranchId) : 0;
+        const available = liveProduct ? getProductStock(liveProduct, selectedBranchId, products) : 0;
         return { name: item.product.name, requested: item.quantity, available };
       })
       .filter(x => x.requested > x.available);
@@ -1864,7 +1939,11 @@ export default function App() {
         productId: item.product.id,
         name: item.product.name,
         quantity: item.quantity,
-        salePrice: item.product.salePrice
+        salePrice: item.product.salePrice,
+        // Snapshotted now so a future refund restores the correct pool even if this product's
+        // link config changes or the product is deleted before the refund happens.
+        linkedStockProductId: item.product.linkedStockProductId,
+        stockConsumptionFactor: item.product.stockConsumptionFactor
       })),
       subtotal: cartValues.subtotal,
       discount: cartValues.calculatedDiscount,
@@ -1888,11 +1967,10 @@ export default function App() {
     // 2. Adjust Product Inventory atomically (per-product Firestore transaction — see
     // applyStockDeltas). Avoids two terminals selling concurrently from silently
     // clobbering each other's stock count.
-    applyStockDeltas(cart.map(item => ({
-      productId: item.product.id,
-      branchId: selectedBranchId,
-      qtyDelta: -item.quantity
-    })));
+    applyStockDeltas(cart.map(item => resolveStockTarget(
+      item.product.id, selectedBranchId, -item.quantity,
+      item.product.linkedStockProductId, item.product.stockConsumptionFactor
+    )));
 
     // 3. Adjust Customer credit balance if credit payment (atomic increment)
     if (selectedCustomer && paymentMethod === 'Credit') {
@@ -2524,8 +2602,100 @@ export default function App() {
     stock: '',
     minStock: '',
     sku: '',
-    supplierId: '' // Associated supplier link
+    supplierId: '', // Associated supplier link
+    linkedStockProductId: '', // '' = independent product, otherwise id of the shared-stock parent
+    stockConsumptionFactor: '', // how much of the parent's stock one unit consumes (0.5 = medio, 1 = litro)
+    isStockPool: false // true = this product is itself a shared-stock pool, never sold directly
   });
+
+  // "Producto con Presentaciones" wizard — creates a shared-stock pool product AND every one of
+  // its presentations (children) in a single save, instead of the multi-screen manual flow above
+  // (create the pool, then edit each presentation separately to link it). Deliberately generic:
+  // no product names, prices, or category are ever hardcoded — only the two starter factors
+  // (0.5/1, a generic half/whole split) are prefilled, everything else is blank with a
+  // placeholder. The manual flow (isStockPool checkbox + linkedStockProductId select above)
+  // stays available as-is for one-off/special cases; this is just a faster path for the common
+  // "one pool, several presentations" case.
+  const [isBulkProductModalOpen, setIsBulkProductModalOpen] = useState(false);
+  type BulkPresentationRow = { suffix: string; price: string; factor: string; costPrice: string; sku: string; minStock: string };
+  const blankBulkPresentations = (): BulkPresentationRow[] => [
+    { suffix: '', price: '', factor: '0.5', costPrice: '', sku: '', minStock: '' },
+    { suffix: '', price: '', factor: '1', costPrice: '', sku: '', minStock: '' },
+  ];
+  const [bulkForm, setBulkForm] = useState({
+    baseName: '', // e.g. "Atole de Mango" — becomes the pool product's name
+    category: '',
+    costPrice: '',   // pool's own cost, same field as the regular product form
+    minStock: '5',   // pool's low-stock alert threshold
+    sku: '',         // pool's SKU, optional — auto-generated if left blank, same as regular form
+    supplierId: '',  // pool's linked supplier for restocking (only the pool is ever restocked)
+    initialStock: '', // pool's starting stock, decimals allowed
+    presentations: blankBulkPresentations()
+  });
+
+  const handleOpenBulkProductModal = () => {
+    if (activeCompanyRole !== 'owner') {
+      alert('Solo el Dueño puede crear productos.');
+      return;
+    }
+    setBulkForm({
+      baseName: '',
+      category: '',
+      costPrice: '',
+      minStock: '5',
+      sku: '',
+      supplierId: '',
+      initialStock: '',
+      presentations: blankBulkPresentations()
+    });
+    setIsBulkProductModalOpen(true);
+  };
+
+  const handleSaveBulkProductGroup = (e: FormEvent) => {
+    e.preventDefault();
+    const presentations = bulkForm.presentations.filter(p => p.suffix.trim() && p.price !== '' && p.factor !== '');
+    if (!bulkForm.baseName.trim() || !bulkForm.category.trim() || presentations.length === 0) {
+      alert('Nombre base, categoría, y al menos una presentación completa (nombre, precio y factor) son obligatorios.');
+      return;
+    }
+    // A factor of 0 or negative would silently zero out (or invert) that presentation's derived
+    // stock forever with no visible error — reject the whole save instead of coercing it away.
+    const invalidFactorRow = presentations.find(p => isNaN(parseFloat(p.factor)) || parseFloat(p.factor) <= 0);
+    if (invalidFactorRow) {
+      alert(`El Factor de Consumo de "${invalidFactorRow.suffix}" debe ser un número mayor a 0.`);
+      return;
+    }
+    const initialStockNum = parseFloat(bulkForm.initialStock) || 0;
+    const poolId = 'P-' + Math.floor(Math.random() * 90000 + 10000);
+    const poolProduct: Product = {
+      id: poolId,
+      name: bulkForm.baseName.trim(),
+      category: bulkForm.category,
+      costPrice: parseFloat(bulkForm.costPrice) || 0,
+      salePrice: 0,
+      stock: initialStockNum,
+      minStock: parseInt(bulkForm.minStock) || 0,
+      sku: bulkForm.sku || 'SKU-' + Math.floor(Math.random() * 900000),
+      supplierId: bulkForm.supplierId || undefined,
+      branchStocks: { [selectedBranchId]: initialStockNum },
+      isStockPool: true
+    };
+    const childProducts: Product[] = presentations.map((p, idx) => ({
+      id: 'P-' + Math.floor(Math.random() * 90000 + 10000) + idx,
+      name: `${bulkForm.baseName.trim()} ${p.suffix.trim()}`.trim(),
+      category: bulkForm.category,
+      costPrice: parseFloat(p.costPrice) || 0,
+      salePrice: parseFloat(p.price) || 0,
+      stock: 0,
+      minStock: parseInt(p.minStock) || 0,
+      sku: p.sku || 'SKU-' + Math.floor(Math.random() * 900000 + idx),
+      branchStocks: {},
+      linkedStockProductId: poolId,
+      stockConsumptionFactor: parseFloat(p.factor)
+    }));
+    saveAllData([...products, poolProduct, ...childProducts], customers, sales, cashRegister);
+    setIsBulkProductModalOpen(false);
+  };
 
   // Quick add-stock ("Surtir") — adds units to the ACTIVE branch instead of overwriting
   // the total. Faster than editing the article (no need to read the current number and
@@ -2536,22 +2706,43 @@ export default function App() {
 
   const handleQuickAddStock = async () => {
     if (!quickStockProduct) return;
-    const qty = parseInt(quickStockAmount);
+    // parseFloat (not parseInt) so restocking a shared-stock "parent" pool in liters (e.g. 2.5)
+    // isn't silently truncated — doesn't change anything for products restocked in whole units.
+    const qty = parseFloat(quickStockAmount);
     if (isNaN(qty) || qty === 0) {
       alert('Ingresa una cantidad válida (mayor a 0 para sumar, negativa para restar).');
       return;
     }
+    // Centralized safety net: a linked ("child") product has no real stock of its own. The
+    // normal UI already keeps children out of every "Surtir" entry point, but this guards
+    // against any shortcut that bypasses those pickers (e.g. a dashboard alert's quick-action)
+    // by redirecting to the real pool instead of silently writing to the child's unused field —
+    // which would otherwise deduct real money from the register for zero actual stock gained.
+    let targetProduct = quickStockProduct;
+    let effectiveQty = qty;
+    if (quickStockProduct.linkedStockProductId && quickStockProduct.stockConsumptionFactor) {
+      const parent = products.find(p => p.id === quickStockProduct.linkedStockProductId);
+      if (!parent) {
+        alert('No se pudo encontrar el producto padre de este artículo. No se puede surtir.');
+        return;
+      }
+      if (!confirm(`"${quickStockProduct.name}" usa el stock de "${parent.name}". Esto agregará ${(qty * quickStockProduct.stockConsumptionFactor).toFixed(2)} unidades al fondo de "${parent.name}" en su lugar. ¿Continuar?`)) {
+        return;
+      }
+      targetProduct = parent;
+      effectiveQty = qty * quickStockProduct.stockConsumptionFactor;
+    }
     setIsSavingQuickStock(true);
     try {
       // Positive = surtido (entrada); negative = merma/ajuste. Per-branch + atomic.
-      await applyStockDeltas([{ productId: quickStockProduct.id, branchId: selectedBranchId, qtyDelta: qty }]);
+      await applyStockDeltas([{ productId: targetProduct.id, branchId: selectedBranchId, qtyDelta: effectiveQty }]);
       // Record it in the inventory audit log so it shows in Historial and the PDF.
       const branchName = branches.find(b => b.id === selectedBranchId)?.name;
       await logStockMovements([{
-        type: qty > 0 ? 'surtido' : 'merma',
-        productId: quickStockProduct.id,
-        productName: quickStockProduct.name,
-        quantity: Math.abs(qty),
+        type: effectiveQty > 0 ? 'surtido' : 'merma',
+        productId: targetProduct.id,
+        productName: targetProduct.name,
+        quantity: Math.abs(effectiveQty),
         branchId: selectedBranchId,
         branchName,
       }]);
@@ -2578,10 +2769,13 @@ export default function App() {
         category: product.category,
         costPrice: product.costPrice.toString(),
         salePrice: product.salePrice.toString(),
-        stock: getProductStock(product, selectedBranchId).toString(),
+        stock: getProductStock(product, selectedBranchId, products).toString(),
         minStock: product.minStock.toString(),
         sku: product.sku || '',
-        supplierId: product.supplierId || ''
+        supplierId: product.supplierId || '',
+        linkedStockProductId: product.linkedStockProductId || '',
+        stockConsumptionFactor: product.stockConsumptionFactor?.toString() || '',
+        isStockPool: product.isStockPool || false
       });
     } else {
       setEditingProduct(null);
@@ -2593,7 +2787,10 @@ export default function App() {
         stock: '',
         minStock: '5',
         sku: '',
-        supplierId: ''
+        supplierId: '',
+        linkedStockProductId: '',
+        stockConsumptionFactor: '',
+        isStockPool: false
       });
     }
     setIsProductModalOpen(true);
@@ -2608,26 +2805,45 @@ export default function App() {
 
     const salePriceNum = parseFloat(prodForm.salePrice);
     const costPriceNum = parseFloat(prodForm.costPrice) || 0;
-    const stockNum = parseInt(prodForm.stock) || 0;
+    // parseFloat (not parseInt) so a shared-stock "parent" pool can hold liters like 3.5 —
+    // doesn't change anything for products where the field is just entered as a whole number.
+    const stockNum = parseFloat(prodForm.stock) || 0;
     const minStockNum = parseInt(prodForm.minStock) || 0;
+    const linkedStockProductId = prodForm.linkedStockProductId || undefined;
+    // A factor of 0 or negative would silently zero out (or invert) this product's derived
+    // stock forever with no visible error — reject it explicitly instead of coercing it away.
+    if (linkedStockProductId) {
+      const parsedFactor = parseFloat(prodForm.stockConsumptionFactor);
+      if (isNaN(parsedFactor) || parsedFactor <= 0) {
+        alert('El Factor de Consumo debe ser un número mayor a 0.');
+        return;
+      }
+    }
+    const stockConsumptionFactor = linkedStockProductId ? parseFloat(prodForm.stockConsumptionFactor) : undefined;
+    // A "child" product's own stock isn't real (it's derived from the parent) — never overwrite
+    // it here, so whatever was last stored just sits unused instead of drifting from reality.
+    const isChild = !!linkedStockProductId;
 
     let updatedProducts: Product[];
     if (editingProduct) {
       updatedProducts = products.map(p => {
         if (p.id === editingProduct.id) {
           const branchStocks = { ...(p.branchStocks || {}) };
-          branchStocks[selectedBranchId] = stockNum;
+          if (!isChild) branchStocks[selectedBranchId] = stockNum;
           return {
             ...p,
             name: prodForm.name,
             category: prodForm.category || 'Varios',
             costPrice: costPriceNum,
             salePrice: salePriceNum,
-            stock: stockNum,
+            stock: isChild ? p.stock : stockNum,
             minStock: minStockNum,
             sku: prodForm.sku,
             supplierId: prodForm.supplierId || undefined,
-            branchStocks
+            branchStocks,
+            linkedStockProductId,
+            stockConsumptionFactor,
+            isStockPool: prodForm.isStockPool || undefined
           };
         }
         return p;
@@ -2639,11 +2855,14 @@ export default function App() {
         category: prodForm.category || 'Varios',
         costPrice: costPriceNum,
         salePrice: salePriceNum,
-        stock: stockNum,
+        stock: isChild ? 0 : stockNum,
         minStock: minStockNum,
         sku: prodForm.sku || 'SKU-' + Math.floor(Math.random() * 900000),
         supplierId: prodForm.supplierId || undefined,
-        branchStocks: { [selectedBranchId]: stockNum }
+        branchStocks: isChild ? {} : { [selectedBranchId]: stockNum },
+        linkedStockProductId,
+        stockConsumptionFactor,
+        isStockPool: prodForm.isStockPool || undefined
       };
       updatedProducts = [...products, newProd];
     }
@@ -2657,7 +2876,13 @@ export default function App() {
       alert('Solo el Dueño puede eliminar productos.');
       return;
     }
-    if (confirm('¿Está seguro de que desea eliminar este producto del catálogo?')) {
+    // Deleting a shared-stock "parent" leaves its children pointing at nothing — getProductStock
+    // treats that as 0 available rather than crashing, but it's silent, so warn explicitly here.
+    const dependentChildren = products.filter(p => p.linkedStockProductId === prodId);
+    const warning = dependentChildren.length > 0
+      ? `Este producto es el fondo de stock de ${dependentChildren.map(p => p.name).join(', ')}. Si lo eliminas, esos productos quedarán sin stock disponible hasta que los vincules a otro padre.\n\n¿Eliminar de todas formas?`
+      : '¿Está seguro de que desea eliminar este producto del catálogo?';
+    if (confirm(warning)) {
       const updated = products.filter(p => p.id !== prodId);
       if (user && activeCompanyId) {
         try {
@@ -2725,20 +2950,30 @@ export default function App() {
     csvContent += `Comercio: ${userCompanies[activeCompanyId || '']?.name || 'Empresa'}\n\n`;
 
     // Headers with specific Branch stocks
-    let headers = "ID,Nombre,Categoria,PRECIO COMPRA (Costo),PRECIO VENTA,STOCK TOTAL,ALERTA MINIMA,SKU";
+    let headers = "ID,Nombre,Categoria,PRECIO COMPRA (Costo),PRECIO VENTA,STOCK TOTAL,ALERTA MINIMA,SKU,FONDO COMPARTIDO (VINCULADO A)";
     branches.forEach(b => {
       headers += `,Stock - ${b.name.replace(/,/g, ' ')}`;
     });
     csvContent += headers + "\n";
 
     products.forEach(p => {
+      // getProductStock (not p.stock/p.branchStocks directly) so a linked "child" product shows
+      // its real derived availability instead of its own unused/stale stock field.
+      const branchVals = branches.map(b => getProductStock(p, b.id, products));
+      const totalStock = branchVals.reduce((sum, v) => sum + v, 0);
+      // A linked product's STOCK TOTAL is the SAME underlying pool viewed at a different scale
+      // as its parent's — this column makes that explicit so nobody sums this row's total
+      // together with its parent's (or a sibling presentation's) and double/triple-counts stock
+      // that's physically the same inventory.
+      const linkedParentName = p.linkedStockProductId
+        ? products.find(parent => parent.id === p.linkedStockProductId)?.name || p.linkedStockProductId
+        : '';
       let row = `"${p.id}","${p.name.replace(/"/g, '""')}",` +
                 `"${(p.category || 'General').replace(/"/g, '""')}",` +
-                `${p.costPrice || 0},${p.salePrice || 0},${p.stock || 0},${p.minStock || 0},` +
-                `"${p.sku || ''}"`;
-      
-      branches.forEach(b => {
-        const val = p.branchStocks && p.branchStocks[b.id] !== undefined ? p.branchStocks[b.id] : p.stock;
+                `${p.costPrice || 0},${p.salePrice || 0},${totalStock},${p.minStock || 0},` +
+                `"${p.sku || ''}","${linkedParentName.replace(/"/g, '""')}"`;
+
+      branchVals.forEach(val => {
         row += `,${val}`;
       });
       csvContent += row + "\n";
@@ -3150,7 +3385,9 @@ export default function App() {
   const transferProductOptions = useMemo(() => {
     const term = transferProductSearch.trim().toLowerCase();
     return products.filter(p => {
-      if (transferSourceBranchId && getProductStock(p, transferSourceBranchId) <= 0) return false;
+      // Linked ("child") products have no stock of their own to transfer — only their parent pool does.
+      if (p.linkedStockProductId) return false;
+      if (transferSourceBranchId && getProductStock(p, transferSourceBranchId, products) <= 0) return false;
       if (!term) return true;
       return p.name.toLowerCase().includes(term) || (p.category && p.category.toLowerCase().includes(term));
     });
@@ -3175,7 +3412,8 @@ export default function App() {
       return;
     }
     const itemsToMove = products
-      .map(p => ({ productId: p.id, quantity: getProductStock(p, selectedBranchId) }))
+      .filter(p => !p.linkedStockProductId) // linked ("child") products have no stock of their own to move
+      .map(p => ({ productId: p.id, quantity: getProductStock(p, selectedBranchId, products) }))
       .filter(it => it.quantity > 0);
     if (itemsToMove.length === 0) {
       alert('No hay stock en esta sucursal para mover a Matriz.');
@@ -3241,7 +3479,7 @@ export default function App() {
     }
 
     const insufficient = lines
-      .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, transferSourceBranchId) }))
+      .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, transferSourceBranchId, products) }))
       .filter(l => l.requested > l.available);
     if (insufficient.length > 0) {
       alert(
@@ -3653,6 +3891,26 @@ export default function App() {
     const supp = suppliers.find(s => s.id === supplierId);
     if (!prod || !supp) return;
 
+    // Same centralized safety net as handleQuickAddStock: a linked ("child") product has no
+    // real stock of its own. The Reabastecimiento product picker already excludes children, but
+    // a couple of shortcuts (dashboard low-stock alerts, the supplier tab's "Surtir Productos"
+    // button) can still pass one in directly — redirect to the real pool instead of spending
+    // real money on a restock that would leave actual sellable stock unchanged.
+    let targetProd = prod;
+    let effectiveQ = q;
+    if (prod.linkedStockProductId && prod.stockConsumptionFactor) {
+      const parent = products.find(p => p.id === prod.linkedStockProductId);
+      if (!parent) {
+        alert('No se pudo encontrar el producto padre de este artículo. No se puede reabastecer.');
+        return;
+      }
+      if (!confirm(`"${prod.name}" usa el stock de "${parent.name}". Esto agregará ${(q * prod.stockConsumptionFactor).toFixed(2)} unidades al fondo de "${parent.name}" en su lugar. ¿Continuar?`)) {
+        return;
+      }
+      targetProd = parent;
+      effectiveQ = q * prod.stockConsumptionFactor;
+    }
+
     const totalExpense = q * c;
 
     // Optional confirmation if register is low on cash
@@ -3663,12 +3921,12 @@ export default function App() {
     }
 
     // Stock increment is atomic (transaction); cost/supplier metadata is a plain field set
-    applyStockDeltas([{ productId, branchId: selectedBranchId, qtyDelta: q }]);
+    applyStockDeltas([{ productId: targetProd.id, branchId: selectedBranchId, qtyDelta: effectiveQ }]);
     if (user && activeCompanyId) {
-      updateDoc(doc(db, 'companies', activeCompanyId, 'products', productId), {
+      updateDoc(doc(db, 'companies', activeCompanyId, 'products', targetProd.id), {
         costPrice: c, // Record new supplier cost price automatically!
         supplierId
-      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/products/${productId}`));
+      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/products/${targetProd.id}`));
     }
 
     // Outflow Egreso in Register (atomic — see applyCashDelta)
@@ -3681,7 +3939,10 @@ export default function App() {
     }]);
 
     setIsRestockOpen(false);
-    alert(`¡Reabastecimiento procesado! Se añadieron ${q} unidades de ${prod.name} y se generó un egreso de ${formatMXN(totalExpense)} en Caja.`);
+    const stockMsg = targetProd.id === prod.id
+      ? `Se añadieron ${q} unidades de ${prod.name}`
+      : `Se añadieron ${effectiveQ.toFixed(2)} unidades al fondo de ${targetProd.name} (por ${q}x ${prod.name})`;
+    alert(`¡Reabastecimiento procesado! ${stockMsg} y se generó un egreso de ${formatMXN(totalExpense)} en Caja.`);
   };
 
 
@@ -3761,12 +4022,13 @@ export default function App() {
       const sale = sales.find(s => s.id === saleId);
       if (!sale) return;
 
-      // Restore inventories atomically (per-product Firestore transaction)
-      applyStockDeltas(sale.items.map(item => ({
-        productId: item.productId,
-        branchId: sale.branchId || selectedBranchId,
-        qtyDelta: item.quantity
-      })));
+      // Restore inventories atomically (per-product Firestore transaction). Uses the link
+      // snapshotted on each SaleItem at sale time (not the current live product) so this stays
+      // correct even if the product's link config changed or it was deleted since the sale.
+      applyStockDeltas(sale.items.map(item => resolveStockTarget(
+        item.productId, sale.branchId || selectedBranchId, item.quantity,
+        item.linkedStockProductId, item.stockConsumptionFactor
+      )));
 
       // Adjust customer balance if it was Credit (atomic)
       if (sale.customerId && sale.paymentMethod === 'Credit') {
@@ -3887,7 +4149,11 @@ export default function App() {
     const averageTicket = activeSales.length > 0 ? grossRevenue / activeSales.length : 0;
     
     // Low stocks counts
-    const lowStockItems = products.filter(p => getProductStock(p, selectedBranchId) <= p.minStock);
+    // Linked ("child") products are excluded here — their derived stock is just the same pool
+    // viewed at a different scale, so counting the pool AND every child as separate "low stock"
+    // alerts would inflate this number for one real shortage. The pool itself still shows up
+    // when it crosses its own threshold, which is the actionable signal.
+    const lowStockItems = products.filter(p => !p.linkedStockProductId && getProductStock(p, selectedBranchId, products) <= p.minStock);
 
     // Group sales by Category
     const categoryPopularity: { [key: string]: number } = {};
@@ -4013,9 +4279,9 @@ export default function App() {
               <button
                 type="submit"
                 disabled={isSignInLoading}
-                className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition select-none tracking-wide text-center disabled:opacity-50 mt-1"
+                className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition select-none tracking-wide text-center disabled:opacity-50 mt-1 flex items-center justify-center gap-1.5"
               >
-                {isSignInLoading ? 'Verificando...' : 'Entrar al Sistema 🔑'}
+                {isSignInLoading ? 'Verificando...' : <>Entrar al Sistema <Key className="w-3.5 h-3.5" /></>}
               </button>
             </form>
 
@@ -4167,7 +4433,7 @@ export default function App() {
           <div className="flex items-center space-x-3 text-xs leading-relaxed">
             <AlertCircle className="w-5 h-5 flex-shrink-0 animate-bounce text-white" />
             <div>
-              <span className="font-black text-xs block tracking-wider uppercase opacity-90">⚠️ Alerta Contable</span>
+              <span className="font-black text-xs block tracking-wider uppercase opacity-90">Alerta Contable</span>
               El sistema detectó que <strong className="underline">no se realizó el corte de caja</strong> el día anterior (<span className="font-mono">{warningOperationalDate || 'ayer'}</span>). Por favor, realiza el corte antes de registrar ventas hoy para mantener la contabilidad exacta y organizada.
             </div>
           </div>
@@ -4177,9 +4443,9 @@ export default function App() {
                 setRealCashInput(cashRegister.currentCash.toString());
                 setIsCorteModalOpen(true);
               }}
-              className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider"
+              className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
             >
-              Hacer Corte Ahora 📝
+              Hacer Corte Ahora <FileText className="w-3 h-3" />
             </button>
             <button
               onClick={() => setShowOvernightWarning(false)}
@@ -4197,7 +4463,7 @@ export default function App() {
           <div className="flex items-center space-x-3 text-xs leading-relaxed">
             <AlertCircle className="w-5 h-5 flex-shrink-0 animate-bounce text-white" />
             <div>
-              <span className="font-black text-xs block tracking-wider uppercase opacity-90">⚠️ Caja Cerrada</span>
+              <span className="font-black text-xs block tracking-wider uppercase opacity-90">Caja Cerrada</span>
               La caja registradora está <strong className="underline">cerrada</strong>. Por favor, realiza la apertura de caja antes de registrar ventas.
             </div>
           </div>
@@ -4207,9 +4473,9 @@ export default function App() {
                 setOpeningCashInput('500');
                 setIsOpeningCajaModalOpen(true);
               }}
-              className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider"
+              className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
             >
-              Abrir Caja Ahora 🚀
+              Abrir Caja Ahora <Rocket className="w-3 h-3" />
             </button>
             <button
               onClick={() => setShowClosedCajaBanner(false)}
@@ -4309,7 +4575,7 @@ export default function App() {
                         : 'text-slate-500 hover:text-slate-800'
                     }`}
                   >
-                    <span>📜 Historial ({branchScopedSales.length})</span>
+                    <History className="w-3.5 h-3.5" /><span>Historial ({branchScopedSales.length})</span>
                   </button>
                   <button
                     type="button"
@@ -4422,11 +4688,11 @@ export default function App() {
                                   {prod.category}
                                 </span>
                                 <span className={`text-[9px] sm:text-[10px] font-bold px-1.5 sm:px-2 py-0.5 rounded-full shrink-0 ${
-                                  getProductStock(prod, selectedBranchId) <= prod.minStock
+                                  getProductStock(prod, selectedBranchId, products) <= prod.minStock
                                     ? 'bg-amber-100 text-amber-700 font-extrabold animate-pulse'
                                     : 'bg-slate-50 text-slate-600'
                                 }`}>
-                                  Stock: {getProductStock(prod, selectedBranchId)}
+                                  Stock: {getProductStock(prod, selectedBranchId, products)}
                                 </span>
                               </div>
 
@@ -4461,7 +4727,7 @@ export default function App() {
                       <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100 overflow-hidden">
                         {filteredProducts.map(prod => {
                           const inCartItem = cart.find(ci => ci.product.id === prod.id);
-                          const low = getProductStock(prod, selectedBranchId) <= prod.minStock;
+                          const low = getProductStock(prod, selectedBranchId, products) <= prod.minStock;
                           return (
                             <div
                               key={prod.id}
@@ -4476,7 +4742,7 @@ export default function App() {
                                 <div className="flex items-center gap-3 text-[11px] mt-0.5">
                                   <span className="font-extrabold" style={{ color: 'var(--brand-primary)' }}>{formatMXN(prod.salePrice)}</span>
                                   <span className={`font-bold ${low ? 'text-amber-600' : 'text-slate-500'}`}>
-                                    {low && <AlertCircle className="w-3 h-3 inline mr-0.5" />}Stock: {getProductStock(prod, selectedBranchId)}
+                                    {low && <AlertCircle className="w-3 h-3 inline mr-0.5" />}Stock: {getProductStock(prod, selectedBranchId, products)}
                                   </span>
                                 </div>
                               </div>
@@ -4528,10 +4794,10 @@ export default function App() {
                                   {sale.items.map(it => `${it.quantity}x ${it.name}`).join(', ')}
                                 </p>
                                 {sale.customerName && (
-                                  <p className="text-[10px] text-indigo-600 font-semibold mt-1 truncate">🏷️ Cliente: {sale.customerName}</p>
+                                  <p className="text-[10px] text-indigo-600 font-semibold mt-1 truncate flex items-center gap-1"><Tag className="w-2.5 h-2.5 shrink-0" /> Cliente: {sale.customerName}</p>
                                 )}
                                 {sale.employeeName && (
-                                  <p className="text-[10px] text-slate-500 font-semibold mt-0.5 truncate">👤 Atendido por: {sale.employeeName}</p>
+                                  <p className="text-[10px] text-slate-500 font-semibold mt-0.5 truncate flex items-center gap-1"><UserIcon className="w-2.5 h-2.5 shrink-0" /> Atendido por: {sale.employeeName}</p>
                                 )}
                               </div>
                               <div className="text-right shrink-0">
@@ -4568,9 +4834,9 @@ export default function App() {
                                   setLastCompletedSale(sale);
                                   setLastReceivedAmount(0); // non-cash popup
                                 }}
-                                className="text-[9px] font-black bg-indigo-50 border border-indigo-150 hover:bg-indigo-600 hover:text-white px-2.5 py-1 rounded text-indigo-600 transition cursor-pointer"
+                                className="text-[9px] font-black bg-indigo-50 border border-indigo-150 hover:bg-indigo-600 hover:text-white px-2.5 py-1 rounded text-indigo-600 transition cursor-pointer inline-flex items-center gap-1"
                               >
-                                📥 Compartir / Recibo
+                                <Download className="w-2.5 h-2.5" /> Compartir / Recibo
                               </button>
                             </div>
                           </div>
@@ -4587,10 +4853,10 @@ export default function App() {
                         <h3 className="font-extrabold text-slate-800 text-sm">Control Administrativo de Caja</h3>
                         <p className="text-[10px] text-slate-400">Verifica montos físicos, realiza entradas y egresos, y haz cortes.</p>
                       </div>
-                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                      <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider inline-flex items-center gap-1 ${
                         cashRegister.isOpen ? 'bg-emerald-100 text-emerald-850 border border-emerald-250' : 'bg-rose-105 text-rose-800 border border-rose-250 animate-pulse'
                       }`}>
-                        Estado: {cashRegister.isOpen ? 'Caja Abierta ✓' : 'Caja Cerrada ✗'}
+                        Estado: {cashRegister.isOpen ? <>Caja Abierta <Check className="w-3 h-3" /></> : <>Caja Cerrada <X className="w-3 h-3" /></>}
                       </span>
                     </div>
 
@@ -4613,9 +4879,9 @@ export default function App() {
                             setRealCashInput(cashRegister.currentCash.toString());
                             setIsCorteModalOpen(true);
                           }}
-                          className="w-full py-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider"
+                          className="w-full py-3 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider inline-flex items-center justify-center gap-1.5"
                         >
-                          Corte de Caja (Cierre de Turno) 📝
+                          Corte de Caja (Cierre de Turno) <FileText className="w-3.5 h-3.5" />
                         </button>
                       ) : (
                         <button
@@ -4624,16 +4890,16 @@ export default function App() {
                             setOpeningCashInput('500');
                             setIsOpeningCajaModalOpen(true);
                           }}
-                          className="w-full py-3 bg-gradient-to-r from-indigo-600 to-indigo-750 hover:from-indigo-700 hover:to-indigo-800 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider animate-pulse"
+                          className="w-full py-3 bg-gradient-to-r from-indigo-600 to-indigo-750 hover:from-indigo-700 hover:to-indigo-800 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider animate-pulse inline-flex items-center justify-center gap-1.5"
                         >
-                          Realizar Apertura de Caja 🚀
+                          Realizar Apertura de Caja <Rocket className="w-3.5 h-3.5" />
                         </button>
                       )}
                     </div>
 
                     {cashRegister.isOpen && (
                       <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl space-y-4 text-left">
-                        <h4 className="font-extrabold text-slate-700 text-xs">💵 Movimiento de Caja Manual</h4>
+                        <h4 className="font-extrabold text-slate-700 text-xs flex items-center gap-1"><DollarSign className="w-3.5 h-3.5" /> Movimiento de Caja Manual</h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                           <div className="space-y-1/2">
                             <label className="text-[10px] text-slate-400 font-bold block">Concepto o Descripción *</label>
@@ -4676,7 +4942,7 @@ export default function App() {
                     )}
 
                     <div className="space-y-2 text-left">
-                      <h4 className="font-extrabold text-xs text-slate-600">📜 Transacciones del Turno</h4>
+                      <h4 className="font-extrabold text-xs text-slate-600 flex items-center gap-1"><History className="w-3.5 h-3.5" /> Transacciones del Turno</h4>
                       <div className="border border-slate-150 rounded-2xl bg-white divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
                         {cashRegister.transactions.slice().reverse().map((tx, idx) => (
                           <div key={idx} className="p-3 flex justify-between items-center text-xs">
@@ -4997,7 +5263,7 @@ export default function App() {
                       className="bg-emerald-600 hover:bg-emerald-705 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
                       title="Exportar catálogo completo con existencias multisuccursal a CSV"
                     >
-                      📥 Exportar Inventario (CSV)
+                      <Download className="w-4 h-4" /> Exportar Inventario (CSV)
                     </button>
                     <button
                       onClick={() => setIsCategoryModalOpen(true)}
@@ -5023,7 +5289,17 @@ export default function App() {
                         className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
                       >
                         <Plus className="w-4 h-4" />
-                        + Nuevo Producto
+                        Nuevo Producto
+                      </button>
+                    )}
+                    {activeCompanyRole === 'owner' && (
+                      <button
+                        onClick={handleOpenBulkProductModal}
+                        className="bg-violet-600 hover:bg-violet-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                        title="Crea un producto que funciona como fondo de stock compartido y sus presentaciones (las variantes que sí se venden) en un solo paso"
+                      >
+                        <Plus className="w-4 h-4" />
+                        Producto con Presentaciones
                       </button>
                     )}
                   </div>
@@ -5047,19 +5323,19 @@ export default function App() {
               {/* Inventory: card grid or compact list depending on the user's toggle */}
               {inventoryView === 'grid' ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {inventoryFilteredProducts.length === 0 && (
+                {topLevelInventoryProducts.length === 0 && (
                   <p className="col-span-full text-center text-sm text-slate-400 py-10">
                     {products.length === 0 ? 'No hay productos en el catálogo.' : 'Ningún producto coincide con la búsqueda.'}
                   </p>
                 )}
-                {inventoryFilteredProducts.map(prod => (
+                {topLevelInventoryProducts.map(prod => (
                   <div key={prod.id} className="border border-slate-200/80 rounded-2xl p-4 flex flex-col justify-between hover:border-indigo-30 shadow-sm duration-150">
                     <div className="space-y-2.5">
                       <div className="flex justify-between items-start">
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
                           {prod.category}
                         </span>
-                        {getProductStock(prod, selectedBranchId) <= prod.minStock && (
+                        {getProductStock(prod, selectedBranchId, products) <= prod.minStock && (
                           <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200 flex items-center animate-pulse">
                             <AlertCircle className="w-3 h-3 mr-1" />
                             Stock en Alerta
@@ -5087,7 +5363,9 @@ export default function App() {
                         <div className="text-center bg-slate-50 p-1.5 rounded">
                           <p className="text-slate-400 font-medium">Margen</p>
                           <p className="font-bold text-slate-800">
-                            {prod.costPrice > 0 ? `${(((prod.salePrice - prod.costPrice) / prod.salePrice) * 100).toFixed(0)}%` : '100%'}
+                            {prod.salePrice > 0
+                              ? (prod.costPrice > 0 ? `${(((prod.salePrice - prod.costPrice) / prod.salePrice) * 100).toFixed(0)}%` : '100%')
+                              : '—'}
                           </p>
                         </div>
                         <div className="text-center bg-slate-50 p-1.5 rounded">
@@ -5102,7 +5380,7 @@ export default function App() {
 
                       <div className="flex justify-between text-xs font-semibold text-slate-600 pt-1">
                         <span>Cant. en Inventario:</span>
-                        <span className={`font-bold ${getProductStock(prod, selectedBranchId) <= prod.minStock ? 'text-purple-650' : 'text-slate-800'}`}>{getProductStock(prod, selectedBranchId)} u.</span>
+                        <span className={`font-bold ${getProductStock(prod, selectedBranchId, products) <= prod.minStock ? 'text-purple-650' : 'text-slate-800'}`}>{getProductStock(prod, selectedBranchId, products)} u.</span>
                       </div>
 
                       {activeCompanyRole !== 'employee' && branches.length > 1 && (
@@ -5112,9 +5390,23 @@ export default function App() {
                             {branches.map(b => (
                               <div key={b.id} className="flex justify-between items-center text-slate-600 font-bold">
                                 <span className="truncate">{b.name}:</span>
-                                <span className={getProductStock(prod, b.id) <= prod.minStock ? 'text-amber-600' : 'text-slate-800'}>
-                                  {getProductStock(prod, b.id)} u.
+                                <span className={getProductStock(prod, b.id, products) <= prod.minStock ? 'text-amber-600' : 'text-slate-800'}>
+                                  {getProductStock(prod, b.id, products)} u.
                                 </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {getLinkedChildren(prod.id).length > 0 && (
+                        <div className="mt-2 bg-violet-50 p-2 rounded-lg border border-violet-100 text-[10px] space-y-1 text-left">
+                          <p className="font-extrabold text-violet-400 uppercase tracking-wider">Presentaciones Vinculadas:</p>
+                          <div className="space-y-0.5">
+                            {getLinkedChildren(prod.id).map(child => (
+                              <div key={child.id} className="flex justify-between items-center text-violet-700 font-bold">
+                                <span className="truncate">{child.name.replace(prod.name, '').trim() || child.name}:</span>
+                                <span>{getProductStock(child, selectedBranchId, products)} u.</span>
                               </div>
                             ))}
                           </div>
@@ -5157,14 +5449,14 @@ export default function App() {
                             </button>
                           </div>
                         ) : (
-                          <p className="text-center text-[10px] text-slate-400 font-semibold select-none py-1">
-                            🔒 Solo el Dueño puede editar o eliminar artículos
+                          <p className="text-center text-[10px] text-slate-400 font-semibold select-none py-1 flex items-center justify-center gap-1">
+                            <Lock className="w-2.5 h-2.5" /> Solo el Dueño puede editar o eliminar artículos
                           </p>
                         )}
                       </div>
                     ) : (
-                      <div className="mt-4 pt-3 border-t border-slate-50 text-center text-[10px] text-slate-400 font-semibold select-none">
-                        ⚙️ Solo Administradores pueden gestionar stock
+                      <div className="mt-4 pt-3 border-t border-slate-50 text-center text-[10px] text-slate-400 font-semibold select-none flex items-center justify-center gap-1">
+                        <Settings className="w-2.5 h-2.5" /> Solo Administradores pueden gestionar stock
                       </div>
                     )}
                   </div>
@@ -5172,14 +5464,15 @@ export default function App() {
               </div>
               ) : (
               <div className="border border-slate-200 rounded-2xl overflow-hidden divide-y divide-slate-100">
-                {inventoryFilteredProducts.length === 0 && (
+                {topLevelInventoryProducts.length === 0 && (
                   <p className="text-center text-sm text-slate-400 py-10">
                     {products.length === 0 ? 'No hay productos en el catálogo.' : 'Ningún producto coincide con la búsqueda.'}
                   </p>
                 )}
-                {inventoryFilteredProducts.map(prod => {
-                  const branchStock = getProductStock(prod, selectedBranchId);
+                {topLevelInventoryProducts.map(prod => {
+                  const branchStock = getProductStock(prod, selectedBranchId, products);
                   const low = branchStock <= prod.minStock;
+                  const linkedChildren = getLinkedChildren(prod.id);
                   return (
                     <div key={prod.id} className="flex items-center gap-3 p-3 hover:bg-slate-50/70 transition">
                       <span className="p-2 rounded-lg shrink-0 hidden sm:flex items-center justify-center" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-primary) 10%, white)' }}>
@@ -5196,6 +5489,11 @@ export default function App() {
                             {low && <AlertCircle className="w-3 h-3 inline mr-0.5" />}Stock: {branchStock} u.
                           </span>
                         </div>
+                        {linkedChildren.length > 0 && (
+                          <p className="text-[10px] text-violet-600 font-bold mt-0.5 truncate flex items-center gap-1">
+                            <Link2 className="w-2.5 h-2.5 shrink-0" /> {linkedChildren.map(child => `${child.name.replace(prod.name, '').trim() || child.name}: ${getProductStock(child, selectedBranchId, products)} u.`).join(' · ')}
+                          </p>
+                        )}
                       </div>
                       {activeCompanyRole !== 'employee' && (
                         <div className="flex items-center gap-1.5 shrink-0">
@@ -5236,8 +5534,8 @@ export default function App() {
                               </button>
                             </>
                           ) : (
-                            <span className="text-[9px] text-slate-400 font-bold select-none px-1" title="Solo el Dueño puede editar o eliminar artículos">
-                              🔒
+                            <span className="text-slate-400 select-none px-1" title="Solo el Dueño puede editar o eliminar artículos">
+                              <Lock className="w-3 h-3" />
                             </span>
                           )}
                         </div>
@@ -5326,9 +5624,9 @@ export default function App() {
                                     setPaymentPrompt(null);
                                   }
                                 }}
-                                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3 py-1 rounded transition"
+                                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3 py-1 rounded transition inline-flex items-center justify-center"
                               >
-                                ✓
+                                <Check className="w-3.5 h-3.5" />
                               </button>
                               <button
                                 onClick={() => setPaymentPrompt(null)}
@@ -5350,8 +5648,8 @@ export default function App() {
                           )}
                         </div>
                       ) : (
-                        <span className="text-[10px] text-center bg-emerald-50 text-emerald-700 font-semibold p-1.5 rounded block">
-                          ✓ Cuenta al día
+                        <span className="text-[10px] text-center bg-emerald-50 text-emerald-700 font-semibold p-1.5 rounded flex items-center justify-center gap-1">
+                          <Check className="w-3 h-3" /> Cuenta al día
                         </span>
                       )}
 
@@ -5404,8 +5702,8 @@ export default function App() {
                              setEditInitialCashPrompt(false);
                            }
                          }}
-                         className="bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-0.5 text-[10px] rounded font-bold transition shadow-sm"
-                       >✓ Guardar
+                         className="bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-0.5 text-[10px] rounded font-bold transition shadow-sm inline-flex items-center gap-1"
+                       ><Check className="w-3 h-3" /> Guardar
                        </button>
                        <button
                          onClick={() => setEditInitialCashPrompt(false)}
@@ -5671,7 +5969,7 @@ export default function App() {
                                     ? 'bg-sky-50 text-sky-600'
                                     : 'bg-rose-50 text-rose-600'
                                 }`}>
-                                  {tx.type === 'Venta' ? '🧾' : tx.type === 'Ingreso' ? '📥' : isTransfer ? '🔄' : '📤'}
+                                  {tx.type === 'Venta' ? <Receipt className="w-4 h-4" /> : tx.type === 'Ingreso' ? <Download className="w-4 h-4" /> : isTransfer ? <RotateCcw className="w-4 h-4" /> : <Upload className="w-4 h-4" />}
                                 </span>
                                 <div>
                                   <p className="text-xs font-bold text-slate-805">{tx.description}</p>
@@ -5707,14 +6005,14 @@ export default function App() {
                       {branchScopedStockMovements.map(mv => {
                         const isIn = mv.type === 'surtido' || mv.type === 'transfer_in';
                         const typeLabel = mv.type === 'surtido' ? 'Surtido' : mv.type === 'merma' ? 'Merma / Ajuste' : mv.type === 'transfer_in' ? 'Traspaso (entrada)' : 'Traspaso (salida)';
-                        const icon = mv.type === 'surtido' ? '📥' : mv.type === 'merma' ? '📉' : '🔄';
+                        const MovementIcon = mv.type === 'surtido' ? Download : mv.type === 'merma' ? TrendingDown : RotateCcw;
                         return (
                           <div key={mv.id} className="flex justify-between items-center border border-slate-100 rounded-xl p-3 bg-white hover:bg-slate-50/50 transition duration-150">
                             <div className="flex items-center space-x-3 text-left min-w-0">
                               <span className={`p-2 rounded-lg font-black text-sm flex items-center justify-center shrink-0 ${
                                 mv.type === 'surtido' ? 'bg-emerald-50 text-emerald-600' : mv.type === 'merma' ? 'bg-rose-50 text-rose-600' : 'bg-sky-50 text-sky-600'
                               }`}>
-                                {icon}
+                                <MovementIcon className="w-4 h-4" />
                               </span>
                               <div className="min-w-0">
                                 <p className="text-xs font-bold text-slate-800 truncate">{mv.productName}</p>
@@ -5766,8 +6064,8 @@ export default function App() {
                 </div>
 
                 <div className="p-4 bg-slate-50 rounded-2xl border text-left max-w-md mx-auto">
-                  <p className="text-xs text-slate-500 leading-relaxed text-center font-medium">
-                    ⚙️ Si necesitas acceso para reabastecimientos, reportajes o auditorías, por favor solicita a tu Administrador o Propietario que actualice tus privilegios de acceso desde la pestaña de <strong>Mi Empresa / Equipo</strong>.
+                  <p className="text-xs text-slate-500 leading-relaxed text-center font-medium flex items-start justify-center gap-1.5">
+                    <Settings className="w-3.5 h-3.5 shrink-0 mt-0.5" /> <span>Si necesitas acceso para reabastecimientos, reportajes o auditorías, por favor solicita a tu Administrador o Propietario que actualice tus privilegios de acceso desde la pestaña de <strong>Mi Empresa / Equipo</strong>.</span>
                   </p>
                 </div>
               </div>
@@ -5973,7 +6271,7 @@ export default function App() {
                   </div>
 
                   {stats.lowStockItems.length === 0 ? (
-                    <p className="text-xs text-slate-500 font-semibold py-8 text-center">✓ El almacén está perfectamente abastecido de mercancías.</p>
+                    <p className="text-xs text-slate-500 font-semibold py-8 text-center flex items-center justify-center gap-1"><Check className="w-3.5 h-3.5" /> El almacén está perfectamente abastecido de mercancías.</p>
                   ) : (
                     <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
                       {stats.lowStockItems.map(p => (
@@ -5984,7 +6282,7 @@ export default function App() {
                           </div>
                           <div className="text-right">
                             <span className="px-2 py-0.5 font-extrabold text-[10px] rounded-full text-white" style={{ backgroundColor: 'var(--brand-primary)' }}>
-                              Stock: {getProductStock(p, selectedBranchId)}
+                              Stock: {getProductStock(p, selectedBranchId, products)}
                             </span>
                             <button
                               onClick={() => handleOpenRestock(undefined, p.id)}
@@ -6113,8 +6411,8 @@ export default function App() {
                             Hacer Activa
                           </button>
                         ) : !isActive ? (
-                          <span className="text-[9px] text-slate-400 font-bold select-none py-1">
-                            🔒 Solo el Dueño
+                          <span className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1">
+                            <Lock className="w-2.5 h-2.5" /> Solo el Dueño
                           </span>
                         ) : (
                           <span className="text-teal-600 font-bold text-[10px] flex items-center">
@@ -6139,8 +6437,8 @@ export default function App() {
                             </button>
                           </div>
                         ) : (
-                          <span className="text-[9px] text-slate-400 font-bold select-none py-1">
-                            🔒 Solo el Dueño
+                          <span className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1">
+                            <Lock className="w-2.5 h-2.5" /> Solo el Dueño
                           </span>
                         )}
                       </div>
@@ -6232,12 +6530,14 @@ export default function App() {
                           {linkedProducts.length > 0 && (
                             <div className="mt-2 text-[10px] text-slate-500 leading-tight space-y-1">
                               <p className="font-bold border-b border-amber-100 pb-1 uppercase text-[8px] text-slate-400">Existencias Actuales:</p>
-                              {linkedProducts.slice(0, 3).map(p => (
+                              {linkedProducts.slice(0, 3).map(p => {
+                                const displayStock = getProductStock(p, selectedBranchId, products);
+                                return (
                                 <div key={p.id} className="flex justify-between font-medium">
                                   <span>{p.name}</span>
-                                  <span className={`font-mono font-bold ${p.stock <= p.minStock ? 'text-orange-500' : 'text-slate-700'}`}>Stock: {p.stock}</span>
+                                  <span className={`font-mono font-bold ${displayStock <= p.minStock ? 'text-orange-500' : 'text-slate-700'}`}>Stock: {displayStock}</span>
                                 </div>
-                              ))}
+                              );})}
                               {linkedProducts.length > 3 && (
                                 <p className="text-[9px] text-indigo-500 font-bold select-none cursor-pointer hover:underline" onClick={() => setActiveTab('products')}>+ {linkedProducts.length - 3} artículos más...</p>
                               )}
@@ -6277,8 +6577,8 @@ export default function App() {
                             </button>
                           </div>
                         ) : (
-                          <span className="text-[9px] text-slate-400 font-bold select-none py-1">
-                            🛡️ Solo Admins
+                          <span className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1">
+                            <ShieldCheck className="w-2.5 h-2.5" /> Solo Admins
                           </span>
                         )}
                       </div>
@@ -6310,7 +6610,7 @@ export default function App() {
                   >
                     <option value="all">Ver Todas</option>
                     <option value="pending">Solo Pendientes</option>
-                    <option value="completed">Realizadas ✓</option>
+                    <option value="completed">Realizadas</option>
                   </select>
                 </div>
               </div>
@@ -6366,8 +6666,8 @@ export default function App() {
                     No hay facturas que coincidan con tu búsqueda.<br/>
                     Aquí aparecerán las ventas marcadas para facturar.
                   </p>
-                  <div className="text-[11px] bg-amber-50 text-amber-700 px-4 py-3 rounded-xl border border-amber-200 mt-4 font-bold max-w-md shadow-sm">
-                    🚧 El proceso de timbrado CFDI (facturación) requerirá registrar las credenciales y certificados (CSD) del SAT en la configuración avanzada. Esta es la pre-vista del módulo de control interno.
+                  <div className="text-[11px] bg-amber-50 text-amber-700 px-4 py-3 rounded-xl border border-amber-200 mt-4 font-bold max-w-md shadow-sm flex items-start gap-1.5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" /> <span>El proceso de timbrado CFDI (facturación) requerirá registrar las credenciales y certificados (CSD) del SAT en la configuración avanzada. Esta es la pre-vista del módulo de control interno.</span>
                   </div>
                 </div>
               )}
@@ -6396,15 +6696,15 @@ export default function App() {
                   </h4>
                   <ul className="text-[11px] sm:text-xs text-slate-600 space-y-2.5 pl-1">
                     <li className="flex items-start gap-1.5">
-                      <span className="text-indigo-600 font-bold">✓</span>
+                      <span className="text-indigo-600 font-bold"><Check className="w-3.5 h-3.5" /></span>
                       <span><strong>Multi-Sucursal</strong>: Configura sucursales físicas y asigna inventario de catálogo independiente de sucursales.</span>
                     </li>
                     <li className="flex items-start gap-1.5">
-                      <span className="text-indigo-600 font-bold">✓</span>
+                      <span className="text-indigo-600 font-bold"><Check className="w-3.5 h-3.5" /></span>
                       <span><strong>Control de Roles</strong>: Propietario (dueño general), Administrador (edición/inventario), Empleado (ventas POS únicamente).</span>
                     </li>
                     <li className="flex items-start gap-1.5">
-                      <span className="text-indigo-600 font-bold">✓</span>
+                      <span className="text-indigo-600 font-bold"><Check className="w-3.5 h-3.5" /></span>
                       <span><strong>Acceso con Código</strong>: Genera códigos únicos estilo invitación para que tus colaboradores entren con un clic.</span>
                     </li>
                   </ul>
@@ -6413,8 +6713,8 @@ export default function App() {
                 <div className="flex flex-col sm:flex-row justify-center gap-3 pt-2">
                   {/* `user` is always set here — the login gate already returned early otherwise. */}
                   <div className="space-y-4 w-full">
-                    <p className="text-xs text-amber-600 font-semibold bg-amber-50 rounded-lg p-2.5 inline-block">
-                      ⚠️ Estás conectado como {user.email} pero no tienes ninguna Empresa activa.
+                    <p className="text-xs text-amber-600 font-semibold bg-amber-50 rounded-lg p-2.5 inline-flex items-center gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" /> Estás conectado como {user.email} pero no tienes ninguna Empresa activa.
                     </p>
                     <button
                       onClick={() => {
@@ -6551,7 +6851,7 @@ export default function App() {
                 Sucursal: <span className="font-bold text-slate-700">{branches.find(b => b.id === selectedBranchId)?.name || 'Actual'}</span>
               </p>
               <p className="text-xs text-slate-500">
-                Stock actual: <span className="font-bold text-slate-700">{getProductStock(quickStockProduct, selectedBranchId)} u.</span>
+                Stock actual: <span className="font-bold text-slate-700">{getProductStock(quickStockProduct, selectedBranchId, products)} u.</span>
               </p>
             </div>
 
@@ -6559,6 +6859,7 @@ export default function App() {
               <label className="text-xs font-bold text-slate-500 block">Unidades a agregar</label>
               <input
                 type="number"
+                step="0.01"
                 autoFocus
                 placeholder="Ej: 20"
                 value={quickStockAmount}
@@ -6569,9 +6870,9 @@ export default function App() {
               <p className="text-[10px] text-slate-400 text-center">Se suma al stock existente (usa negativo para descontar una merma).</p>
             </div>
 
-            {quickStockAmount && !isNaN(parseInt(quickStockAmount)) && parseInt(quickStockAmount) !== 0 && (
+            {quickStockAmount && !isNaN(parseFloat(quickStockAmount)) && parseFloat(quickStockAmount) !== 0 && (
               <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-2.5 text-center text-xs font-bold text-emerald-800">
-                Nuevo stock: {getProductStock(quickStockProduct, selectedBranchId)} → {Math.max(0, getProductStock(quickStockProduct, selectedBranchId) + parseInt(quickStockAmount))} u.
+                Nuevo stock: {getProductStock(quickStockProduct, selectedBranchId, products)} → {Math.max(0, getProductStock(quickStockProduct, selectedBranchId, products) + parseFloat(quickStockAmount))} u.
               </div>
             )}
 
@@ -6646,9 +6947,9 @@ export default function App() {
                            }
                            setNewCatPrompt(false);
                          }}
-                         className="bg-indigo-600 text-white px-3 py-2 rounded-lg font-bold text-xs hover:bg-indigo-700"
+                         className="bg-indigo-600 text-white px-3 py-2 rounded-lg font-bold text-xs hover:bg-indigo-700 inline-flex items-center justify-center"
                        >
-                         ✓
+                         <Check className="w-4 h-4" />
                        </button>
                        <button
                          type="button"
@@ -6706,14 +7007,27 @@ export default function App() {
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-xs font-bold text-slate-500 block">Stock Inicial en Almacén</label>
-                  <input 
-                    type="number"
-                    placeholder="Ej: 20"
-                    value={prodForm.stock}
-                    onChange={e => setProdForm({ ...prodForm, stock: e.target.value })}
-                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500"
-                  />
+                  {prodForm.linkedStockProductId ? (
+                    <>
+                      <label className="text-xs font-bold text-slate-500 block">Stock Inicial en Almacén</label>
+                      <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-2.5">
+                        Este producto usa el stock de{' '}
+                        <strong>{products.find(p => p.id === prodForm.linkedStockProductId)?.name || '—'}</strong>.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <label className="text-xs font-bold text-slate-500 block">Stock Inicial en Almacén</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="Ej: 20"
+                        value={prodForm.stock}
+                        onChange={e => setProdForm({ ...prodForm, stock: e.target.value })}
+                        className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500"
+                      />
+                    </>
+                  )}
                 </div>
 
                 <div className="space-y-1">
@@ -6752,6 +7066,52 @@ export default function App() {
                   </select>
                 </div>
 
+                {!prodForm.isStockPool && (
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 block">Vincular Stock a Producto Padre</label>
+                    <select
+                      value={prodForm.linkedStockProductId}
+                      onChange={e => setProdForm({ ...prodForm, linkedStockProductId: e.target.value })}
+                      className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-semibold text-slate-700"
+                    >
+                      <option value="">-- Sin Vincular (Stock Propio) --</option>
+                      {products
+                        .filter(p => p.id !== editingProduct?.id && !p.linkedStockProductId)
+                        .map(p => (
+                          <option key={p.id} value={p.id}>{p.name}</option>
+                        ))}
+                    </select>
+                  </div>
+                )}
+
+                {prodForm.linkedStockProductId && (
+                  <div className="space-y-1">
+                    <label className="text-xs font-bold text-slate-500 block">Factor de Consumo (cuánto del fondo consume 1 unidad, ej. 0.5 = mitad, 1 = completo)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      required
+                      placeholder="Ej: 0.5"
+                      value={prodForm.stockConsumptionFactor}
+                      onChange={e => setProdForm({ ...prodForm, stockConsumptionFactor: e.target.value })}
+                      className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                )}
+
+                {!prodForm.linkedStockProductId && (
+                  <div className="space-y-1 md:col-span-2">
+                    <label className="flex items-center gap-2 text-xs font-bold text-slate-500 cursor-pointer bg-slate-50 border border-slate-200 rounded-lg p-2.5">
+                      <input
+                        type="checkbox"
+                        checked={prodForm.isStockPool}
+                        onChange={e => setProdForm({ ...prodForm, isStockPool: e.target.checked })}
+                      />
+                      Es un fondo de stock compartido — nunca se vende directo, pero otros productos pueden vincularse a su stock
+                    </label>
+                  </div>
+                )}
+
               </div>
 
               <div className="flex justify-end space-x-3 pt-4 border-t">
@@ -6767,6 +7127,240 @@ export default function App() {
                   className="px-5 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white text-xs font-bold rounded-xl cursor-pointer shadow"
                 >
                   Guardar Artículo
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL WINDOW: PRODUCTO CON PRESENTACIONES (asistente de alta rapida para stock compartido) */}
+      {isBulkProductModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 space-y-4">
+            <div className="flex justify-between items-center pb-2 border-b">
+              <div>
+                <h3 className="font-extrabold text-xl text-slate-800">Producto con Presentaciones</h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  Crea un producto que funciona como fondo de stock compartido, junto con todas sus
+                  presentaciones (las variantes que sí se venden por separado), en un solo paso.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsBulkProductModalOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveBulkProductGroup} className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Nombre Base *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Nombre del producto principal"
+                    value={bulkForm.baseName}
+                    onChange={e => setBulkForm({ ...bulkForm, baseName: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Categoría *</label>
+                  <input
+                    type="text"
+                    required
+                    list="bulk-category-options"
+                    placeholder="Categoría del producto"
+                    value={bulkForm.category}
+                    onChange={e => setBulkForm({ ...bulkForm, category: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                  <datalist id="bulk-category-options">
+                    {selectCategoriesList.map(cat => <option key={cat} value={cat} />)}
+                  </datalist>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Stock Inicial (unidades del fondo compartido)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    placeholder="Ej: 5"
+                    value={bulkForm.initialStock}
+                    onChange={e => setBulkForm({ ...bulkForm, initialStock: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Costo del Fondo ($)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    placeholder="Ej: 1.50"
+                    value={bulkForm.costPrice}
+                    onChange={e => setBulkForm({ ...bulkForm, costPrice: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Alerta de Stock Mínimo del Fondo</label>
+                  <input
+                    type="number"
+                    placeholder="Ej: 5"
+                    value={bulkForm.minStock}
+                    onChange={e => setBulkForm({ ...bulkForm, minStock: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-bold text-slate-500 block">Código SKU del Fondo (Opcional)</label>
+                  <input
+                    type="text"
+                    placeholder="Ej: SKU-92813"
+                    value={bulkForm.sku}
+                    onChange={e => setBulkForm({ ...bulkForm, sku: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                  />
+                </div>
+
+                <div className="space-y-1 md:col-span-2">
+                  <label className="text-xs font-bold text-slate-500 block">Proveedor Vinculado del Fondo (Surtido)</label>
+                  <select
+                    value={bulkForm.supplierId}
+                    onChange={e => setBulkForm({ ...bulkForm, supplierId: e.target.value })}
+                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500 font-semibold text-slate-700"
+                  >
+                    <option value="">-- Sin Proveedor (Ninguno) --</option>
+                    {suppliers.map(s => (
+                      <option key={s.id} value={s.id}>{s.name} ({s.category})</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <label className="text-xs font-bold text-slate-500 block">Presentaciones (lo que se vende) *</label>
+                {bulkForm.presentations.map((pres, idx) => (
+                  <div key={idx} className="border border-slate-200 rounded-xl p-3 space-y-2">
+                    <div className="grid grid-cols-[1fr_1fr_70px_auto] gap-2 items-center">
+                      <input
+                        type="text"
+                        placeholder="Nombre de esta presentación"
+                        value={pres.suffix}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], suffix: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="Precio de venta"
+                        value={pres.price}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], price: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                      />
+                      <input
+                        type="number"
+                        step="0.01"
+                        title="Factor de consumo del fondo compartido"
+                        placeholder="Factor"
+                        value={pres.factor}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], factor: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                      />
+                      <button
+                        type="button"
+                        disabled={bulkForm.presentations.length <= 1}
+                        onClick={() => setBulkForm({ ...bulkForm, presentations: bulkForm.presentations.filter((_, i) => i !== idx) })}
+                        className="p-2 text-red-500 hover:bg-red-50 rounded-lg cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 items-center">
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="Costo ($)"
+                        value={pres.costPrice}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], costPrice: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 outline-none focus:border-violet-500"
+                      />
+                      <input
+                        type="number"
+                        placeholder="Alerta mínima"
+                        value={pres.minStock}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], minStock: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 outline-none focus:border-violet-500"
+                      />
+                      <input
+                        type="text"
+                        placeholder="SKU (opcional)"
+                        value={pres.sku}
+                        onChange={e => {
+                          const next = [...bulkForm.presentations];
+                          next[idx] = { ...next[idx], sku: e.target.value };
+                          setBulkForm({ ...bulkForm, presentations: next });
+                        }}
+                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 outline-none focus:border-violet-500"
+                      />
+                    </div>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setBulkForm({ ...bulkForm, presentations: [...bulkForm.presentations, { suffix: '', price: '', factor: '1', costPrice: '', sku: '', minStock: '' }] })}
+                  className="text-xs font-bold text-violet-600 hover:text-violet-700 cursor-pointer"
+                >
+                  + Agregar presentación
+                </button>
+                <p className="text-[10px] text-slate-400">
+                  El "Factor" es cuánto del fondo compartido consume una unidad de esa presentación
+                  (ej. 0.5 si media unidad de la presentación equivale a medio del fondo, 1 si equivale
+                  a una unidad completa). Costo, Alerta mínima y SKU son opcionales por presentación.
+                </p>
+              </div>
+
+              <div className="flex justify-end space-x-3 pt-4 border-t">
+                <button
+                  type="button"
+                  onClick={() => setIsBulkProductModalOpen(false)}
+                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-bold rounded-xl cursor-pointer shadow"
+                >
+                  Crear Producto y Presentaciones
                 </button>
               </div>
             </form>
@@ -6914,7 +7508,7 @@ export default function App() {
                   )}
                   {transferProductOptions.map(p => {
                     const inList = transferItems.find(it => it.productId === p.id);
-                    const available = getProductStock(p, transferSourceBranchId);
+                    const available = getProductStock(p, transferSourceBranchId, products);
                     return (
                       <div
                         key={p.id}
@@ -6947,7 +7541,7 @@ export default function App() {
                   <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Productos a transferir ({transferItems.length}):</label>
                   {transferItems.map(item => {
                     const prod = products.find(p => p.id === item.productId);
-                    const available = prod && transferSourceBranchId ? getProductStock(prod, transferSourceBranchId) : 0;
+                    const available = prod && transferSourceBranchId ? getProductStock(prod, transferSourceBranchId, products) : 0;
                     const exceeds = transferSourceBranchId ? item.quantity > available : false;
                     return (
                       <div key={item.productId} className={`flex items-center gap-2 p-2.5 rounded-xl border ${exceeds ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}`}>
@@ -7083,7 +7677,7 @@ export default function App() {
                       className="w-4 h-4 text-teal-600 focus:ring-teal-500 border-slate-300 rounded cursor-pointer mt-0.5"
                     />
                     <div>
-                      <label htmlFor="branch-is-matriz" className="text-slate-800 font-extrabold cursor-pointer block text-xs">Definir como Matriz Principal 🏢</label>
+                      <label htmlFor="branch-is-matriz" className="text-slate-800 font-extrabold cursor-pointer flex items-center gap-1 text-xs">Definir como Matriz Principal <Building2 className="w-3.5 h-3.5" /></label>
                       <span className="text-[10px] text-slate-500 leading-tight block font-normal">Fabrica materia prima, almacena el inventario central y permite repartir stock a otras sucursales.</span>
                     </div>
                   </div>
@@ -7225,7 +7819,7 @@ export default function App() {
                               }}
                               className="rounded border-slate-305 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
                             />
-                            <span>{prod.name} (Stock: {getProductStock(prod, selectedBranchId)})</span>
+                            <span>{prod.name} (Stock: {getProductStock(prod, selectedBranchId, products)})</span>
                           </label>
                         );
                       })}
@@ -7316,12 +7910,12 @@ export default function App() {
                     className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 text-slate-700 font-bold"
                   >
                     <option value="">-- Seleccione el artículo --</option>
-                    {(restockForm.supplierId 
+                    {(restockForm.supplierId
                       ? products.filter(p => p.supplierId === restockForm.supplierId)
                       : products
-                    ).map(p => (
+                    ).filter(p => !p.linkedStockProductId).map(p => (
                       <option key={p.id} value={p.id}>
-                        {p.name} (Stock Actual: {p.stock})
+                        {p.name} (Stock Actual: {getProductStock(p, selectedBranchId, products)})
                       </option>
                     ))}
                   </select>
@@ -7414,7 +8008,7 @@ export default function App() {
             <div className="space-y-4 text-xs">
               {/* Form to add a new category */}
               <div className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-xl space-y-2">
-                <label className="text-indigo-800 font-extrabold block">Crear Nueva Categoría 🏷️</label>
+                <label className="text-indigo-800 font-extrabold flex items-center gap-1">Crear Nueva Categoría <Tag className="w-3.5 h-3.5" /></label>
                 <div className="flex gap-2">
                   <input
                     type="text"
@@ -7478,7 +8072,7 @@ export default function App() {
               <X className="w-4 h-4" />
             </button>
             <div className="text-center space-y-1">
-              <span className="inline-block p-3 bg-indigo-50 border border-indigo-100 rounded-full text-indigo-600 text-2xl animate-bounce">🎉</span>
+              <span className="inline-flex items-center justify-center p-3 bg-indigo-50 border border-indigo-100 rounded-full text-indigo-600 animate-bounce"><Sparkles className="w-6 h-6" /></span>
               <h3 className="font-extrabold text-xl text-slate-800">¡Venta Registrada!</h3>
               <p className="text-[11px] text-slate-400 font-bold uppercase tracking-wider">Ticket {lastCompletedSale.id}</p>
               {lastCompletedSale.employeeName && (
@@ -7564,14 +8158,14 @@ export default function App() {
                     text += `*Impuestos:* ${formatMXN(lastCompletedSale.tax)}\n`;
                     text += `*Total Neto:* *${formatMXN(lastCompletedSale.total)}*\n`;
                     text += `=========================\n`;
-                    text += `¡Gracias por su compra! 😃\n`;
+                    text += `¡Gracias por su compra!\n`;
                     return `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
                   })()}
                   target="_blank"
                   rel="noreferrer"
                   className="p-2.5 bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-155"
                 >
-                  💬 WhatsApp
+                  <MessageCircle className="w-3.5 h-3.5" /> WhatsApp
                 </a>
 
                 <a
@@ -7590,7 +8184,7 @@ export default function App() {
                   })()}
                   className="p-2.5 bg-sky-50 hover:bg-sky-100/80 border border-sky-200 text-sky-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-155"
                 >
-                  ✉️ Correo
+                  <Mail className="w-3.5 h-3.5" /> Correo
                 </a>
               </div>
 
@@ -7627,7 +8221,7 @@ export default function App() {
               <X className="w-4 h-4" />
             </button>
             <div className="text-center space-y-1">
-              <span className="inline-block p-3 bg-indigo-50 border border-indigo-100 rounded-full text-indigo-600 text-2xl animate-bounce">📦</span>
+              <span className="inline-flex items-center justify-center p-3 bg-indigo-50 border border-indigo-100 rounded-full text-indigo-600 animate-bounce"><Package className="w-6 h-6" /></span>
               <h3 className="font-extrabold text-xl text-slate-800">¡Traspaso Registrado!</h3>
               <p className="text-[11px] text-slate-400 font-bold uppercase tracking-wider">Folio {lastCompletedTransfer.id}</p>
               {lastCompletedTransfer.initiatedByName && (
@@ -7748,9 +8342,9 @@ export default function App() {
                   }
                   handleCloseCaja(val);
                 }}
-                className="px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl shadow cursor-pointer transition"
+                className="px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl shadow cursor-pointer transition inline-flex items-center gap-1.5"
               >
-                Proceder y Cerrar Caja 📝
+                Proceder y Cerrar Caja <FileText className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
@@ -7803,9 +8397,9 @@ export default function App() {
                   }
                   handleOpenCaja(val);
                 }}
-                className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow cursor-pointer transition text-center"
+                className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow cursor-pointer transition inline-flex items-center justify-center gap-1.5"
               >
-                Abrir Caja Registradora 🚀
+                Abrir Caja Registradora <Rocket className="w-4 h-4" />
               </button>
             </div>
           </div>

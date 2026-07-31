@@ -91,6 +91,7 @@ scripts/output/
 # nunca deben llegar al repo que se despliega automaticamente a produccion
 scripts/seed-sandbox.mjs
 scripts/seed-sandbox-stock.mjs
+scripts/migrate-atoles-sandbox.mjs
 
 # Documentacion interna / bitacora de desarrollo (no va en el repo del cliente)
 docs/PROGRESO_DEV.md

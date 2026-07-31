@@ -93,11 +93,14 @@ service cloud.firestore {
           && data.category is string && data.category.size() <= 100
           && data.costPrice is number && data.costPrice >= 0.0
           && data.salePrice is number && data.salePrice >= 0.0
-          && data.stock is int && data.stock >= -1000 && data.stock <= 1000000
+          && data.stock is number && data.stock >= -1000 && data.stock <= 1000000
           && data.minStock is int && data.minStock >= 0
           && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 1000))
           && (!('sku' in data) || (data.sku is string && data.sku.size() <= 100))
-          && (!('supplierId' in data) || (data.supplierId is string && data.supplierId.size() <= 128));
+          && (!('supplierId' in data) || (data.supplierId is string && data.supplierId.size() <= 128))
+          && (!('linkedStockProductId' in data) || (data.linkedStockProductId is string && data.linkedStockProductId.size() <= 128))
+          && (!('stockConsumptionFactor' in data) || (data.stockConsumptionFactor is number && data.stockConsumptionFactor > 0.0 && data.stockConsumptionFactor <= 1000.0))
+          && (!('isStockPool' in data) || data.isStockPool is bool);
     }
 
     function isValidCustomer(data) {
