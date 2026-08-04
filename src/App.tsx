@@ -660,6 +660,13 @@ export default function App() {
   const [activeCompanyId, setActiveCompanyId] = useState<string | null>(null);
   const [userCompanies, setUserCompanies] = useState<{ [id: string]: { id: string; name: string; role: 'owner' | 'master_admin' | 'admin' | 'employee' } }>({});
   const [currentUserMember, setCurrentUserMember] = useState<any | null>(null);
+  // Branch-sync gate ("Cargando tu sucursal..." screen, see the branch-lock effect below):
+  // true once ~8s have passed while a branch-locked employee/admin is still waiting for
+  // their assigned branch to be confirmed, so the gate can show a real error + "Reintentar"
+  // instead of blocking the POS forever. branchSyncRetryTrigger lets that button re-run the
+  // members/{uid} listener (it's in that effect's dependency array).
+  const [branchSyncTimedOut, setBranchSyncTimedOut] = useState(false);
+  const [branchSyncRetryTrigger, setBranchSyncRetryTrigger] = useState(0);
   const [folioNumber, setFolioNumber] = useState('');
 
   // Hard States
@@ -727,6 +734,11 @@ export default function App() {
   // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
   // that change takes effect here automatically since currentUserMember is a live listener.
   const isBranchLocked = activeCompanyRole === 'employee' || activeCompanyRole === 'admin';
+  // True while a branch-locked employee/admin's real assigned branch hasn't been confirmed
+  // yet from companies/{id}/members/{uid} — gates the whole POS (see the waiting screen near
+  // the bottom of this component) so a sale/stock/cash entry can never be filed under a stale
+  // or placeholder branchId while this is still settling right after login.
+  const branchSyncPending = !!activeCompanyId && isBranchLocked && (!currentUserMember || selectedBranchId !== currentUserMember.assignedBranchId);
 
   // True when the logged-in user authenticated with an employee code (virtual email), not Google
   const isCredentialEmployee = Boolean(user?.email?.includes('_') && user?.email?.endsWith('@logicpos.com'));
@@ -1177,7 +1189,7 @@ export default function App() {
     });
 
     return () => unsubMemberSelf();
-  }, [user, activeCompanyId, userCompanies]);
+  }, [user, activeCompanyId, userCompanies, branchSyncRetryTrigger]);
 
   // Lock the branch selector for employees and encargados (admin) — both manage a single
   // sucursal; only owner/master_admin can roam across all of them. Re-runs whenever
@@ -1188,10 +1200,24 @@ export default function App() {
     if (isBranchLocked && currentUserMember?.assignedBranchId) {
       if (selectedBranchId !== currentUserMember.assignedBranchId) {
         setSelectedBranchId(currentUserMember.assignedBranchId);
-        localStorage.setItem('logic_active_branch', currentUserMember.assignedBranchId);
+        localStorage.setItem(`logic_active_branch_${user.uid}`, currentUserMember.assignedBranchId);
       }
     }
   }, [currentUserMember, isBranchLocked, selectedBranchId, activeCompanyId, user]);
+
+  // Safety valve for the branch-sync gate above: if companies/{id}/members/{uid} never
+  // resolves (permission error, offline, etc. — see the onSnapshot error handler above,
+  // which today just logs a warning and never retries), branchSyncPending would otherwise
+  // stay true forever with no way out. After ~8s, surface a real error + "Reintentar"/"Salir"
+  // instead of leaving the employee stuck on a spinner.
+  useEffect(() => {
+    if (!branchSyncPending) {
+      setBranchSyncTimedOut(false);
+      return;
+    }
+    const timer = setTimeout(() => setBranchSyncTimedOut(true), 8000);
+    return () => clearTimeout(timer);
+  }, [branchSyncPending, branchSyncRetryTrigger]);
 
   // Sync state from Firestore
   useEffect(() => {
@@ -1298,7 +1324,10 @@ export default function App() {
       console.error('[PrintConfig] onSnapshot error:', err.code, err.message);
     });
 
-    const savedActiveBranch = localStorage.getItem('logic_active_branch');
+    // Per-user key first (keeps each employee's own remembered branch on a shared device);
+    // falls back to the old shared key so nobody has to re-pick their branch after this
+    // migration — the old key just stops being written to going forward.
+    const savedActiveBranch = localStorage.getItem(`logic_active_branch_${user.uid}`) || localStorage.getItem('logic_active_branch');
     if (savedActiveBranch) setSelectedBranchId(savedActiveBranch);
 
     return () => {
@@ -1924,7 +1953,7 @@ export default function App() {
 
   const handleSelectBranch = (branchId: string) => {
     setSelectedBranchId(branchId);
-    localStorage.setItem('logic_active_branch', branchId);
+    if (user) localStorage.setItem(`logic_active_branch_${user.uid}`, branchId);
   };
 
   // Prints a receipt via a hidden iframe instead of window.open(). The old approach opened
@@ -3350,7 +3379,7 @@ export default function App() {
       const updated = branches.filter(b => b.id !== bId);
       const nextActive = selectedBranchId === bId ? updated[0].id : selectedBranchId;
       setSelectedBranchId(nextActive);
-      localStorage.setItem('logic_active_branch', nextActive);
+      if (user) localStorage.setItem(`logic_active_branch_${user.uid}`, nextActive);
       if (user && activeCompanyId) {
         try {
           await deleteDoc(doc(db, 'companies', activeCompanyId, 'branches', bId));
@@ -7755,6 +7784,53 @@ export default function App() {
               <h2 className="text-xl font-black text-slate-100 mb-2">Conectando al sistema...</h2>
               <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
                 Estamos verificando tus credenciales y cargando tu sucursal asignada.
+              </p>
+              <div className="flex gap-1.5 mb-8">
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+            </>
+          )}
+          <button
+            onClick={() => signOut(auth)}
+            className="text-xs text-slate-500 hover:text-slate-300 underline cursor-pointer transition"
+          >
+            Salir e intentar de nuevo
+          </button>
+        </div>
+      )}
+
+      {/* Branch-sync gate: blocks the POS for branch-locked employees/admins until their real
+          assigned branch is confirmed from companies/{id}/members/{uid} — prevents a sale/
+          stock/cash entry from ever being filed under a stale or placeholder branchId while
+          that document is still loading right after login (see branchSyncPending above). */}
+      {user && !isAuthLoading && branchSyncPending && (
+        <div className="fixed inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
+          {branchSyncTimedOut ? (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-rose-900/40 border border-rose-700/30 flex items-center justify-center mb-5">
+                <AlertCircle className="w-8 h-8 text-rose-400" />
+              </div>
+              <h2 className="text-xl font-black text-slate-100 mb-2">No pudimos confirmar tu sucursal</h2>
+              <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+                Revisa tu conexión a internet e intenta de nuevo. Si el problema sigue, avisa a tu encargado.
+              </p>
+              <button
+                onClick={() => { setBranchSyncTimedOut(false); setBranchSyncRetryTrigger(n => n + 1); }}
+                className="px-6 py-2.5 mb-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-xl shadow cursor-pointer transition"
+              >
+                Reintentar
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="w-16 h-16 rounded-2xl bg-indigo-900/40 border border-indigo-700/30 flex items-center justify-center mb-5">
+                <MapPin className="w-8 h-8 text-indigo-400 animate-pulse" />
+              </div>
+              <h2 className="text-xl font-black text-slate-100 mb-2">Cargando tu sucursal...</h2>
+              <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+                Estamos confirmando la sucursal asignada a tu cuenta antes de abrir el punto de venta.
               </p>
               <div className="flex gap-1.5 mb-8">
                 <span className="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
