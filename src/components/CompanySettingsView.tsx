@@ -21,7 +21,15 @@ import {
   Palette,
   Printer,
   ClipboardList,
-  MapPin as MapPinIcon
+  MapPin as MapPinIcon,
+  Cloud,
+  Globe,
+  Crown,
+  Infinity as InfinityIcon,
+  X,
+  MessageCircle,
+  ThumbsUp,
+  Lock
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType, createCredentialUser } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch } from 'firebase/firestore';
@@ -633,7 +641,7 @@ export default function CompanySettingsView({
     } catch (err: any) {
       console.error(err);
       if (err.code === 'auth/operation-not-allowed' || (err.message && err.message.includes('operation-not-allowed'))) {
-        alert("⚠️ ATENCIÓN: El proveedor de Correo/Contraseña está deshabilitado en Firebase.\n\nPara habilitarlo y poder crear cuentas de empleados sin cuenta de Google, sigue estos pasos sencillos:\n1. Ve a console.firebase.google.com y selecciona tu proyecto.\n2. Haz clic en 'Authentication' en el menú lateral de la izquierda.\n3. Abre la pestaña 'Sign-in method' (Método de inicio de sesión).\n4. Haz clic en 'Agregar un proveedor nuevo' (O editar el existente) y activa 'Correo electrónico/contraseña'.\n5. Guarda los cambios.");
+        alert("ATENCIÓN: El proveedor de Correo/Contraseña está deshabilitado en Firebase.\n\nPara habilitarlo y poder crear cuentas de empleados sin cuenta de Google, sigue estos pasos sencillos:\n1. Ve a console.firebase.google.com y selecciona tu proyecto.\n2. Haz clic en 'Authentication' en el menú lateral de la izquierda.\n3. Abre la pestaña 'Sign-in method' (Método de inicio de sesión).\n4. Haz clic en 'Agregar un proveedor nuevo' (O editar el existente) y activa 'Correo electrónico/contraseña'.\n5. Guarda los cambios.");
       } else {
         alert("No se pudo crear la cuenta de empleado. Código error de nube: " + (err.message || String(err)));
       }
@@ -907,7 +915,7 @@ export default function CompanySettingsView({
     }
 
     const firstConfirm = confirm(
-      `⚠️ ¡ALERTA DE SEGURIDAD MÁXIMA!\n\n¿Estás seguro de que deseas transferir la propiedad del comercio "${companyName}" a ${targetMember.name} (${targetMember.email})?\n\nAl hacer esto:\n- Perderás el control absoluto de la empresa.\n- Pasarás a ser un Administrador Master.\n- No podrás revertir esta acción ni eliminar este comercio.\n\n¿Deseas continuar?`
+      `¡ALERTA DE SEGURIDAD MÁXIMA!\n\n¿Estás seguro de que deseas transferir la propiedad del comercio "${companyName}" a ${targetMember.name} (${targetMember.email})?\n\nAl hacer esto:\n- Perderás el control absoluto de la empresa.\n- Pasarás a ser un Administrador Master.\n- No podrás revertir esta acción ni eliminar este comercio.\n\n¿Deseas continuar?`
     );
     if (!firstConfirm) return;
 
@@ -1158,7 +1166,7 @@ export default function CompanySettingsView({
                 : 'text-slate-500 hover:text-slate-800'
             }`}
           >
-            <span className="text-blue-500 text-sm shrink-0">☁️</span>
+            <Cloud className="w-3.5 h-3.5 text-blue-500 shrink-0" />
             Respaldo
           </button>
         </div>
@@ -1183,7 +1191,7 @@ export default function CompanySettingsView({
                       className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-extrabold text-[11px] rounded-lg tracking-wide shadow flex items-center space-x-1 cursor-pointer transition select-none"
                     >
                       <UserCheck className="w-3.5 h-3.5" />
-                      <span>Registrar Empleado Sin Google 🔑</span>
+                      <span>Registrar Empleado Sin Google</span>
                     </button>
                     <button
                       onClick={() => setActiveSubTab('code')}
@@ -1216,12 +1224,12 @@ export default function CompanySettingsView({
                           <p className="font-black text-slate-800 text-sm flex flex-wrap items-center gap-1.5">
                             <span className="truncate">{member.name}</span>
                             {member.isCredentialAccount ? (
-                              <span className="text-[10px] bg-teal-50 border border-teal-200 text-teal-700 px-1.5 py-0.5 rounded font-black select-none shrink-0">
-                                🔐 Clave Dir
+                              <span className="text-[10px] bg-teal-50 border border-teal-200 text-teal-700 px-1.5 py-0.5 rounded font-black select-none shrink-0 inline-flex items-center gap-0.5">
+                                <Lock className="w-2.5 h-2.5" /> Clave Dir
                               </span>
                             ) : member.role !== 'owner' ? (
-                              <span className="text-[10px] bg-indigo-50 border border-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded font-black select-none shrink-0">
-                                🌐 Google
+                              <span className="text-[10px] bg-indigo-50 border border-indigo-100 text-indigo-600 px-1.5 py-0.5 rounded font-black select-none shrink-0 inline-flex items-center gap-0.5">
+                                <Globe className="w-2.5 h-2.5" /> Google
                               </span>
                             ) : null}
                           </p>
@@ -1270,18 +1278,18 @@ export default function CompanySettingsView({
 
                       <div className="flex flex-wrap items-center justify-start lg:justify-end gap-2 w-full lg:w-auto mt-2 lg:mt-0 pt-3 lg:pt-0 border-t border-slate-100 lg:border-0 pl-12 lg:pl-0">
                         {member.role === 'owner' ? (
-                          <span className="text-[11px] font-black uppercase py-1.5 px-3 rounded-full border bg-indigo-50 border-indigo-200 text-indigo-700 shrink-0 shadow-sm">
-                            👑 Dueño
+                          <span className="text-[11px] font-black uppercase py-1.5 px-3 rounded-full border bg-indigo-50 border-indigo-200 text-indigo-700 shrink-0 shadow-sm inline-flex items-center gap-1">
+                            <Crown className="w-3 h-3" /> Dueño
                           </span>
                         ) : currentUserRole === 'owner' ? (
                           <div className="flex flex-wrap items-center gap-2">
                             {/* Role badge (read-only) */}
-                            <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shrink-0 ${
+                            <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shrink-0 inline-flex items-center gap-1 ${
                               member.role === 'admin'
                                 ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
                                 : 'bg-slate-100 border-slate-200 text-slate-600'
                             }`}>
-                              {member.role === 'admin' ? '🛡️ Encargado' : '💼 Cajero'}
+                              {member.role === 'admin' ? <><ShieldCheck className="w-3 h-3" /> Encargado</> : <><Briefcase className="w-3 h-3" /> Cajero</>}
                             </span>
 
                             {/* Assign extra tasks */}
@@ -1301,20 +1309,20 @@ export default function CompanySettingsView({
                                 className="px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300 rounded-lg font-black text-[11px] cursor-pointer transition flex items-center shrink-0 space-x-1.5 shadow-sm"
                                 title="Transferir la propiedad completa de esta empresa"
                               >
-                                <span>👑 Transf. Propiedad</span>
+                                <Crown className="w-3 h-3" /><span>Transf. Propiedad</span>
                               </button>
                             )}
                           </div>
                         ) : (
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shadow-sm shrink-0 ${
+                            <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shadow-sm shrink-0 inline-flex items-center gap-1 ${
                               member.role === 'master_admin'
                                 ? 'bg-purple-50 border-purple-200 text-purple-700'
                                 : member.role === 'admin'
                                 ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
                                 : 'bg-slate-50 border-slate-300 text-slate-700'
                             }`}>
-                              {member.role === 'master_admin' ? '🧙 Master Admin' : member.role === 'admin' ? '🛡️ Admin' : '💼 Empleado'}
+                              {member.role === 'master_admin' ? <><Sparkle className="w-3 h-3" /> Master Admin</> : member.role === 'admin' ? <><ShieldCheck className="w-3 h-3" /> Admin</> : <><Briefcase className="w-3 h-3" /> Empleado</>}
                             </span>
                           </div>
                         )}
@@ -1400,8 +1408,8 @@ export default function CompanySettingsView({
                           onChange={(e) => setSelectedUsageType(e.target.value as 'single' | 'multiple')}
                           className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
                         >
-                          <option value="multiple">♾️ Varios Usos (Ideal para registrar a todo tu personal con un solo código)</option>
-                          <option value="single">🔑 Un Solo Uso (Expira y se auto-destruye automáticamente tras el primer ingreso exitoso)</option>
+                          <option value="multiple">Varios Usos (Ideal para registrar a todo tu personal con un solo código)</option>
+                          <option value="single">Un Solo Uso (Expira y se auto-destruye automáticamente tras el primer ingreso exitoso)</option>
                         </select>
                       </div>
                     </div>
@@ -1413,11 +1421,11 @@ export default function CompanySettingsView({
                       <div className="flex justify-center">
                         {activeCodeUsageType === 'single' ? (
                           <span className="bg-amber-100/85 border border-amber-200 text-amber-800 font-black text-[10px] px-3.5 py-1.5 rounded-full uppercase flex items-center gap-1">
-                            🔑 Invitación para UN SOLO USO (Temporal)
+                            <Key className="w-3 h-3" /> Invitación para UN SOLO USO (Temporal)
                           </span>
                         ) : (
                           <span className="bg-indigo-100/85 border border-indigo-200 text-indigo-800 font-black text-[10px] px-3.5 py-1.5 rounded-full uppercase flex items-center gap-1">
-                            ♾️ Invitación para VARIOS USOS (Persistente)
+                            <InfinityIcon className="w-3 h-3" /> Invitación para VARIOS USOS (Persistente)
                           </span>
                         )}
                       </div>
@@ -1638,8 +1646,8 @@ export default function CompanySettingsView({
                 <div className="flex items-center justify-between">
                   <label className="text-[11px] font-bold text-slate-600 block">Paleta de Colores de Marca</label>
                   {colorAutoExtracted && (
-                    <span className="text-[10px] text-violet-600 font-bold bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-full">
-                      ✨ Extraída del logo
+                    <span className="text-[10px] text-violet-600 font-bold bg-violet-50 border border-violet-200 px-2 py-0.5 rounded-full inline-flex items-center gap-1">
+                      <Sparkle className="w-2.5 h-2.5" /> Extraída del logo
                     </span>
                   )}
                 </div>
@@ -1955,7 +1963,7 @@ export default function CompanySettingsView({
                   {/* Backup Card */}
                   <div className="bg-slate-50 border border-slate-200 p-5 rounded-2xl flex flex-col items-center text-center space-y-3 shadow-sm">
                     <div className="w-12 h-12 bg-blue-100 text-blue-600 flex items-center justify-center rounded-xl shadow-inner border border-blue-200">
-                      <span className="text-xl">☁️</span>
+                      <Cloud className="w-6 h-6" />
                     </div>
                     <div>
                       <h5 className="font-black text-xs text-slate-800">Generar Respaldo</h5>
@@ -1975,7 +1983,7 @@ export default function CompanySettingsView({
                   {/* Restore Card */}
                   <div className="bg-slate-50 border border-slate-200 p-5 rounded-2xl flex flex-col items-center text-center space-y-3 shadow-sm">
                     <div className="w-12 h-12 bg-emerald-100 text-emerald-600 flex items-center justify-center rounded-xl shadow-inner border border-emerald-200">
-                      <span className="text-xl">🔄</span>
+                      <RefreshCw className="w-6 h-6" />
                     </div>
                     <div>
                       <h5 className="font-black text-xs text-slate-800">Restaurar Sucursal</h5>
@@ -2011,7 +2019,7 @@ export default function CompanySettingsView({
                 <div>
                   <h3 className="text-base font-black text-slate-800">Tareas Adicionales</h3>
                   <p className="text-[11px] text-slate-500 font-medium">
-                    {selectedRoleMember.name} · <span className={`font-black ${selectedRoleMember.role === 'admin' ? 'text-emerald-600' : 'text-indigo-600'}`}>{selectedRoleMember.role === 'admin' ? '🛡️ Encargado' : '💼 Cajero'}</span>
+                    {selectedRoleMember.name} · <span className={`font-black inline-flex items-center gap-1 ${selectedRoleMember.role === 'admin' ? 'text-emerald-600' : 'text-indigo-600'}`}>{selectedRoleMember.role === 'admin' ? <><ShieldCheck className="w-3 h-3" /> Encargado</> : <><Briefcase className="w-3 h-3" /> Cajero</>}</span>
                   </p>
                 </div>
                 <button
@@ -2019,7 +2027,7 @@ export default function CompanySettingsView({
                   onClick={() => setIsRoleModalOpen(false)}
                   className="text-slate-400 hover:text-slate-600 font-extrabold text-sm"
                 >
-                  ✕
+                  <X className="w-4 h-4" />
                 </button>
               </div>
 
@@ -2090,8 +2098,8 @@ export default function CompanySettingsView({
                 // SUCCESS STATE: Show created credentials to copy safely
                 <div className="space-y-4">
                   <div className="text-center space-y-2">
-                    <div className="w-12 h-12 bg-emerald-100 border border-emerald-200 text-emerald-600 rounded-full flex items-center justify-center mx-auto text-xl font-bold animate-bounce">
-                      ✓
+                    <div className="w-12 h-12 bg-emerald-100 border border-emerald-200 text-emerald-600 rounded-full flex items-center justify-center mx-auto animate-bounce">
+                      <Check className="w-6 h-6" />
                     </div>
                     <h3 className="text-base font-black text-slate-805">¡Cuenta Creada Con Éxito!</h3>
                     <p className="text-[11px] text-slate-500 font-medium">Guarda estos datos y envíaselos a tu colaborador <strong>{createdCredentialsShow.name}</strong> para que pueda iniciar sesión.</p>
@@ -2166,7 +2174,7 @@ export default function CompanySettingsView({
                       <button
                         type="button"
                         onClick={() => {
-                          const msg = `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n🔑 *ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n🔢 *Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`;
+                          const msg = `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`;
                           navigator.clipboard.writeText(msg);
                           setCopiedCredNotify(true);
                           setTimeout(() => setCopiedCredNotify(false), 2000);
@@ -2179,14 +2187,14 @@ export default function CompanySettingsView({
 
                       <a
                         href={`https://api.whatsapp.com/send?text=${encodeURIComponent(
-                          `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n🔑 *ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n🔢 *Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`
+                          `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`
                         )}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="p-2.5 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-xl text-teal-800 font-extrabold text-[11px] flex items-center justify-center space-x-1.5 cursor-pointer transition select-none text-center"
                       >
                         <Share2 className="w-3.5 h-3.5 text-teal-600" />
-                        <span>Enviar por WhatsApp 💬</span>
+                        <span>Enviar por WhatsApp</span>
                       </a>
                     </div>
                   </div>
@@ -2198,9 +2206,9 @@ export default function CompanySettingsView({
                         setCreatedCredentialsShow(null);
                         setIsCredModalOpen(false);
                       }}
-                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-xl shadow cursor-pointer transition text-center"
+                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-xl shadow cursor-pointer transition inline-flex items-center justify-center gap-1.5"
                     >
-                      Listo, Entendido 👍
+                      Listo, Entendido <ThumbsUp className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
@@ -2209,7 +2217,7 @@ export default function CompanySettingsView({
                 <form onSubmit={handleCreateCredentialEmployee} className="space-y-4">
                   <div className="flex justify-between items-center pb-2 border-b border-slate-150">
                     <div>
-                      <h3 className="text-base font-black text-slate-800">Registrar Cuenta Sin Google 🔑</h3>
+                      <h3 className="text-base font-black text-slate-800 flex items-center gap-1.5">Registrar Cuenta Sin Google <Key className="w-3.5 h-3.5" /></h3>
                       <p className="text-[11px] text-slate-500 font-medium">Crea cuentas de acceso directo (usuario + contraseña) para tus colaboradores.</p>
                     </div>
                     <button
@@ -2217,7 +2225,7 @@ export default function CompanySettingsView({
                       onClick={() => setIsCredModalOpen(false)}
                       className="text-slate-400 hover:text-slate-600 font-extrabold text-sm"
                     >
-                      ✕
+                      <X className="w-4 h-4" />
                     </button>
                   </div>
 
@@ -2265,8 +2273,8 @@ export default function CompanySettingsView({
                           onChange={(e) => setCredRole(e.target.value as 'master_admin' | 'admin' | 'employee')}
                           className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         >
-                          <option value="employee">💼 Cajero / Empleado</option>
-                          {currentUserRole === 'owner' && <option value="admin">🛡️ Encargado / Gerente</option>}
+                          <option value="employee">Cajero / Empleado</option>
+                          {currentUserRole === 'owner' && <option value="admin">Encargado / Gerente</option>}
                         </select>
                         {currentUserRole !== 'owner' && (
                           <p className="text-[9px] text-slate-400 leading-tight">Solo el Dueño puede crear cuentas de Encargado.</p>
@@ -2300,9 +2308,9 @@ export default function CompanySettingsView({
                     <button
                       type="submit"
                       disabled={isCreatingCred}
-                      className="flex-1 py-2.5 bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs rounded-xl cursor-pointer transition text-center tracking-wide shadow-md disabled:opacity-50"
+                      className="flex-1 py-2.5 bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs rounded-xl cursor-pointer transition text-center tracking-wide shadow-md disabled:opacity-50 inline-flex items-center justify-center gap-1.5"
                     >
-                      {isCreatingCred ? 'Registrando...' : 'Registrar Colaborador 🔑'}
+                      {isCreatingCred ? 'Registrando...' : <>Registrar Colaborador <Key className="w-3.5 h-3.5" /></>}
                     </button>
                   </div>
                 </form>
