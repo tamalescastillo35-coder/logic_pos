@@ -53,7 +53,7 @@ import { jsPDF } from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
 
 // Firebase integrations
-import { auth, db, googleProvider, driveGoogleProvider, OperationType, handleFirestoreError, getCachedAccessToken, setCachedAccessToken } from './firebase';
+import { auth, db, googleProvider, driveGoogleProvider, OperationType, handleFirestoreError, getCachedAccessToken, setCachedAccessToken, SessionInvalidError, isSessionInvalidError } from './firebase';
 import { onAuthStateChanged, signInWithPopup, signInWithCredential, signOut, User, signInWithEmailAndPassword, GoogleAuthProvider } from 'firebase/auth';
 import { Capacitor, registerPlugin } from '@capacitor/core';
 
@@ -318,16 +318,30 @@ interface Member {
   assignedBranchId?: string;
 }
 
+// Stock is per-branch: `branchStocks[branchId]` is the only real source of truth. The
+// top-level `stock` field is just the consolidated total across every branch (kept for
+// reports) and must NEVER be used as a stand-in for a branch that has no entry of its own —
+// doing that made every branch "inherit" whatever another branch last did, which is why
+// restocking one sucursal appeared to raise stock everywhere. A branch with no entry has
+// simply never received that product: that's 0, not somebody else's number.
 export const getProductStock = (prod: Product, branchId: string, products: Product[]): number => {
   if (prod.linkedStockProductId && prod.stockConsumptionFactor) {
     const parent = products.find(p => p.id === prod.linkedStockProductId);
     if (!parent) return 0; // parent deleted/missing — no stock, rather than crashing
-    const parentStock = parent.branchStocks?.[branchId] !== undefined ? parent.branchStocks[branchId] : parent.stock;
+    const parentStock = parent.branchStocks?.[branchId] ?? 0;
     return Math.floor(parentStock / prod.stockConsumptionFactor); // only whole units of the child can be sold
   }
+  // Legacy products predating per-branch tracking have no branchStocks map at all; those
+  // still read the single global number until their first per-branch movement.
   if (!prod.branchStocks) return prod.stock;
-  return prod.branchStocks[branchId] !== undefined ? prod.branchStocks[branchId] : prod.stock;
+  return prod.branchStocks[branchId] ?? 0;
 };
+
+// Consolidated total across branches, for the `stock` field / reports. Rounded because
+// shared-pool presentations use fractional factors (e.g. 0.5 L) and repeated adding would
+// otherwise drift into values like 12.000000000000002.
+const sumBranchStocks = (branchStocks: { [branchId: string]: number }): number =>
+  Math.round(Object.values(branchStocks).reduce((acc, v) => acc + (v || 0), 0) * 1000) / 1000;
 
 interface Supplier {
   id: string;
@@ -698,6 +712,12 @@ export default function App() {
   // members/{uid} listener (it's in that effect's dependency array).
   const [branchSyncTimedOut, setBranchSyncTimedOut] = useState(false);
   const [branchSyncRetryTrigger, setBranchSyncRetryTrigger] = useState(0);
+  // Firebase keeps a session alive indefinitely by refreshing its token in the background, so
+  // the app can look logged in long after the session actually stopped being valid server-side
+  // (revoked, password changed, account disabled). Revalidating in the background — never on
+  // the checkout path, which would add a network round trip to every single sale — catches
+  // that before the next sale is rung up instead of after it silently fails to save.
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [folioNumber, setFolioNumber] = useState('');
 
   // Hard States
@@ -1032,6 +1052,79 @@ export default function App() {
       setIsAuthLoading(false);
     });
     return () => unsub();
+  }, []);
+
+  // Background session revalidation (see `sessionExpired` above). Runs when the app regains
+  // focus — the realistic moment for a shift change on a shared terminal — plus a slow
+  // interval as a fallback. Being offline is NOT an expired session: that error code is
+  // ignored so a weak signal never locks a cashier out of the register.
+  useEffect(() => {
+    if (!user) return;
+
+    const revalidate = async () => {
+      try {
+        await user.getIdToken(true);
+        setSessionExpired(false);
+      } catch (err: any) {
+        if (err?.code === 'auth/network-request-failed') return;
+        console.error('Session revalidation failed:', err);
+        setSessionExpired(true);
+      }
+    };
+
+    const onVisibilityChange = () => { if (!document.hidden) revalidate(); };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const interval = setInterval(revalidate, 10 * 60 * 1000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      clearInterval(interval);
+    };
+  }, [user]);
+
+  // Global safety net for writes that nobody is awaiting. Most of the app's save paths
+  // (product/branch/supplier/customer edits, restocks, refunds, credit payments...) call the
+  // shared helpers fire-and-forget, so a failure — including the SessionInvalidError those
+  // helpers now throw — would otherwise surface only as an "Uncaught (in promise)" line in
+  // devtools that no cashier will ever see. Bursts are coalesced into ONE alert (a refund
+  // alone fires four writes back to back) instead of stacking dialogs to dismiss one by one.
+  useEffect(() => {
+    let pendingReasons: unknown[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = () => {
+      const reasons = pendingReasons;
+      pendingReasons = [];
+      flushTimer = null;
+      if (reasons.length === 0) return;
+
+      if (reasons.some(isSessionInvalidError)) {
+        alert(
+          'Tu sesión no está activa o no se pudo confirmar tu empresa.\n\n' +
+          'Uno o más cambios NO se guardaron en la nube (solo quedaron en este dispositivo). ' +
+          'Cierra sesión y vuelve a entrar antes de seguir vendiendo.'
+        );
+      } else if (reasons.length === 1) {
+        alert('Ocurrió un problema al comunicarse con la nube. Verifica tu conexión e inténtalo de nuevo.');
+      } else {
+        alert(`Ocurrieron ${reasons.length} problemas al comunicarse con la nube. Verifica tu conexión e inténtalo de nuevo.`);
+      }
+    };
+
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      // Deliberately not calling preventDefault(): the browser's own console warning stays,
+      // this only ADDS a user-visible signal on top of it.
+      console.error('Unhandled promise rejection:', event.reason);
+      pendingReasons.push(event.reason);
+      if (flushTimer) clearTimeout(flushTimer);
+      flushTimer = setTimeout(flush, 300);
+    };
+
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+    return () => {
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+      if (flushTimer) clearTimeout(flushTimer);
+    };
   }, []);
 
   // Listen for direct URL invitation links (e.g. ?invite=INV-XXXXX)
@@ -1613,6 +1706,13 @@ export default function App() {
       } catch (err) {
         handleFirestoreError(err, OperationType.WRITE, `companies/${compId}/batch_sync`);
       }
+    } else {
+      // Steps 1-2 above already ran unconditionally, so a caller that genuinely wants a
+      // local-only save still gets one (see handleExecuteTransfer's else branch, which
+      // catches this specific error and moves on). Everyone else needs to LEARN that the
+      // change never left the device — this used to be a silent no-op, which is how sales
+      // could "complete" on screen and never exist in the cloud.
+      throw new SessionInvalidError('saveAllData: sesión o empresa activa inválida — los cambios NO se guardaron en la nube');
     }
   };
 
@@ -1624,7 +1724,11 @@ export default function App() {
   // totals. Uses setDoc+merge (not updateDoc) so it also works as an upsert — a branch
   // that has never had its register opened yet still gets a doc instead of erroring.
   const applyCashDelta = async (branchId: string, amountDelta: number, txEntries: CashRegister['transactions']) => {
-    if (!user || !activeCompanyId || !branchId) return;
+    // No branch selected is a caller-side "nothing to do", not a broken session.
+    if (!branchId) return;
+    if (!user || !activeCompanyId) {
+      throw new SessionInvalidError('applyCashDelta: sesión o empresa activa inválida');
+    }
 
     // Optimistic local update, mirroring writeCashRegisterForBranch's pattern (abrir/cerrar
     // caja already feels instant because of this) — only when the delta is for the branch
@@ -1652,7 +1756,9 @@ export default function App() {
 
   // Atomically applies a balance delta to a single customer (credit sales / "fiado" payments)
   const applyCustomerBalanceDelta = async (customerId: string, balanceDelta: number) => {
-    if (!user || !activeCompanyId) return;
+    if (!user || !activeCompanyId) {
+      throw new SessionInvalidError('applyCustomerBalanceDelta: sesión o empresa activa inválida');
+    }
     try {
       await updateDoc(doc(db, 'companies', activeCompanyId, 'customers', customerId), {
         unpaidBalance: increment(balanceDelta)
@@ -1669,7 +1775,11 @@ export default function App() {
   // each other's stock count (the failure mode of the old computed-from-stale-local-state
   // overwrite approach).
   const applyStockDeltas = async (deltas: { productId: string; branchId: string; qtyDelta: number }[]) => {
-    if (!user || !activeCompanyId || deltas.length === 0) return;
+    // An empty delta list is a caller-side "nothing to do", not a broken session.
+    if (deltas.length === 0) return;
+    if (!user || !activeCompanyId) {
+      throw new SessionInvalidError('applyStockDeltas: sesión o empresa activa inválida');
+    }
     const compId = activeCompanyId;
     try {
       await runTransaction(db, async (tx) => {
@@ -1682,15 +1792,16 @@ export default function App() {
           const data = snap.data() as Product;
           const productId = productIds[idx];
           const branchStocks = { ...(data.branchStocks || {}) };
-          let stockTotal = data.stock;
-
           deltas.filter(d => d.productId === productId).forEach(d => {
-            const currentBranchStock = branchStocks[d.branchId] !== undefined ? branchStocks[d.branchId] : data.stock;
-            branchStocks[d.branchId] = Math.max(0, currentBranchStock + d.qtyDelta);
-            stockTotal = Math.max(0, stockTotal + d.qtyDelta);
+            // A branch with no entry starts from 0, never from the shared total — otherwise
+            // it silently adopts another branch's count as its own starting point.
+            const currentBranchStock = branchStocks[d.branchId] ?? 0;
+            branchStocks[d.branchId] = Math.max(0, Math.round((currentBranchStock + d.qtyDelta) * 1000) / 1000);
           });
 
-          tx.update(refs[idx], { stock: stockTotal, branchStocks });
+          // `stock` is only ever the consolidated total now — recomputed from the branches
+          // instead of being nudged by whichever branch happened to make this change.
+          tx.update(refs[idx], { stock: sumBranchStocks(branchStocks), branchStocks });
         });
       });
     } catch (err) {
@@ -1742,6 +1853,15 @@ export default function App() {
   const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Card' | 'Transfer' | 'Credit'>('Cash');
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [receivedCashAmount, setReceivedCashAmount] = useState<string>('');
+  // Checkout now awaits the sale write, so it needs a lock: the state drives the button/cart
+  // UI, the ref blocks a second click landing before React re-renders the disabled button.
+  const [isProcessingSale, setIsProcessingSale] = useState(false);
+  const isProcessingSaleRef = useRef(false);
+  // Sales whose cloud write hasn't been confirmed yet (typically the device is offline —
+  // Firestore keeps the write queued and retries by itself when the signal comes back).
+  // Tracked in local state only, never written to the sale document: it describes THIS
+  // device's sync state, and the sales listener would overwrite such a field anyway.
+  const [pendingSaleIds, setPendingSaleIds] = useState<string[]>([]);
 
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [lastCompletedSale, setLastCompletedSale] = useState<Sale | null>(null);
@@ -1927,9 +2047,10 @@ export default function App() {
   }, [cart, discountType, discountVal, taxPct]);
 
   // Execute Checkout Payment
-  const completeTransaction = () => {
+  const completeTransaction = async () => {
+    if (isProcessingSaleRef.current) return;
     if (cart.length === 0) return;
-    
+
     // Validate Credit payment requires customer
     if (paymentMethod === 'Credit' && !selectedCustomer) {
       alert('Debe seleccionar o registrar un cliente para realizar una venta al crédito ("Fiado").');
@@ -1961,9 +2082,30 @@ export default function App() {
       return;
     }
 
+    // Session guard: the shared write helpers no-op'd silently when these were falsy, so a
+    // sale could "complete" on screen and never reach the cloud. Checking auth.currentUser
+    // alongside the React `user` state costs nothing and catches state lagging a tick behind
+    // reality (e.g. a shift handoff on a shared terminal). Unlike being offline — handled
+    // further down — waiting doesn't fix this, so it blocks the sale outright.
+    // Deliberately does NOT require currentUserMember: it only supplies employeeName (which
+    // falls back to the Auth display name), branch-locked staff are already held by the
+    // branch-sync gate, and demanding it here would stop an Owner from selling over a
+    // transient read error on their member doc — blocking a valid sale for no gain.
+    if (!user || !auth.currentUser || auth.currentUser.uid !== user.uid || !activeCompanyId) {
+      alert(
+        'No se pudo confirmar tu sesión o tu empresa activa.\n\n' +
+        'La venta NO se registró. Cierra sesión y vuelve a iniciar sesión antes de cobrar.'
+      );
+      return;
+    }
+
     // 1. New Sale structure
     const newSale: Sale = {
-      id: 'S-' + Math.floor(Math.random() * 900000 + 100000),
+      // Timestamp + random suffix. The old 6-digit random id drew from only 900k values for a
+      // single flat collection already holding 11k+ sales; a comparison against the last 7
+      // days of point-in-time history found no sale actually lost to a repeat, but a repeat
+      // would silently overwrite an existing sale for good, so the risk isn't worth keeping.
+      id: 'S-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
       items: cart.map(item => ({
         productId: item.product.id,
         name: item.product.name,
@@ -1993,49 +2135,116 @@ export default function App() {
       employeeName: currentUserMember?.name || user?.displayName || undefined
     };
 
-    // 2. Adjust Product Inventory atomically (per-product Firestore transaction — see
-    // applyStockDeltas). Avoids two terminals selling concurrently from silently
-    // clobbering each other's stock count.
-    applyStockDeltas(cart.map(item => resolveStockTarget(
-      item.product.id, selectedBranchId, -item.quantity,
-      item.product.linkedStockProductId, item.product.stockConsumptionFactor
-    )));
+    isProcessingSaleRef.current = true;
+    setIsProcessingSale(true);
+    try {
+      // 2. Save the sale record FIRST and wait for it. The sale document is the source of
+      // truth for "this sale happened"; stock/cash/credit are consequences of it. Firing all
+      // four at once (the old behaviour) meant a failed sale write could leave stock and cash
+      // already moved with no sale to explain them, and nothing on screen said so.
+      const newSales = [newSale, ...sales];
+      let saveRejection: unknown = null;
+      let saveSettled = false;
+      const trackedSave = saveAllData(products, customers, newSales, cashRegister)
+        .then(() => { saveSettled = true; })
+        .catch((err) => { saveSettled = true; saveRejection = err; });
 
-    // 3. Adjust Customer credit balance if credit payment (atomic increment)
-    if (selectedCustomer && paymentMethod === 'Credit') {
-      applyCustomerBalanceDelta(selectedCustomer.id, cartValues.total);
+      // Offline is NOT a failure here: Firestore parks the write and replays it once the
+      // signal returns, so its promise simply stays pending rather than rejecting. Waiting
+      // forever would strand a cashier with a customer in front of them, so cap the wait —
+      // whatever hasn't settled by then is treated as "queued", not "lost".
+      await Promise.race([trackedSave, new Promise(resolve => setTimeout(resolve, 4000))]);
+
+      if (saveSettled && saveRejection) {
+        // Rejected quickly = a real error (invalid session, permissions, bad data), not a
+        // connectivity hiccup. Undo the optimistic local write and keep the cart intact so
+        // the sale can simply be charged again once the cause is fixed.
+        console.error('Error guardando la venta:', saveRejection);
+        setSales(prev => {
+          const reverted = prev.filter(s => s.id !== newSale.id);
+          localStorage.setItem('logic_sales', JSON.stringify(reverted));
+          return reverted;
+        });
+        alert(
+          isSessionInvalidError(saveRejection)
+            ? 'Tu sesión expiró o no se pudo confirmar tu empresa activa.\n\nLa venta NO se registró y no se descontó inventario ni caja. Cierra sesión, vuelve a entrar e intenta cobrar de nuevo.'
+            : 'No se pudo guardar la venta.\n\nNo se descontó inventario ni caja y el carrito quedó intacto. Verifica tu conexión e intenta cobrar de nuevo.'
+        );
+        return;
+      }
+
+      if (!saveSettled) {
+        // Still queued after the wait — almost always "no signal right now".
+        setPendingSaleIds(prev => [...prev, newSale.id]);
+        alert(
+          'Sin conexión en este momento.\n\n' +
+          `La venta ${newSale.id} quedó guardada en este dispositivo y se subirá sola en cuanto vuelva la señal. ` +
+          'No cierres la aplicación hasta que el contador de "ventas pendientes" llegue a 0.'
+        );
+        trackedSave.then(() => {
+          setPendingSaleIds(prev => prev.filter(id => id !== newSale.id));
+          if (saveRejection) {
+            console.error('La venta pendiente terminó fallando:', saveRejection);
+            alert(`La venta ${newSale.id} no se pudo subir a la nube. Anótala y repórtala a tu encargado.`);
+          }
+        });
+      }
+
+      // 3. Sale is safe (either confirmed or reliably queued) — now apply its consequences.
+      // These don't block the receipt, but they're tracked so a failure still gets reported
+      // instead of vanishing the way it used to.
+      const secondaryEffects: Promise<unknown>[] = [
+        applyStockDeltas(cart.map(item => resolveStockTarget(
+          item.product.id, selectedBranchId, -item.quantity,
+          item.product.linkedStockProductId, item.product.stockConsumptionFactor
+        )))
+      ];
+
+      if (selectedCustomer && paymentMethod === 'Credit') {
+        secondaryEffects.push(applyCustomerBalanceDelta(selectedCustomer.id, cartValues.total));
+      }
+
+      const activeBranch = branches.find(b => b.id === selectedBranchId);
+      const branchNameSuffix = activeBranch ? ` (${activeBranch.name})` : '';
+      const paymentLabel = paymentMethod === 'Cash' ? 'Efectivo' : paymentMethod === 'Card' ? 'Tarjeta' : paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito';
+      const descFolio = (paymentMethod === 'Card' || paymentMethod === 'Transfer') && folioNumber.trim() ? ` [Folio: ${folioNumber.trim()}]` : '';
+
+      secondaryEffects.push(applyCashDelta(selectedBranchId, paymentMethod === 'Cash' ? cartValues.total : 0, [{
+        type: 'Venta',
+        amount: cartValues.total,
+        description: `Venta ${newSale.id} - ${paymentLabel}${descFolio}${branchNameSuffix}`,
+        time: new Date().toLocaleTimeString(),
+        createdAt: Date.now(),
+        branchId: selectedBranchId
+      }]));
+
+      Promise.allSettled(secondaryEffects).then(results => {
+        const failed = results.filter(r => r.status === 'rejected');
+        if (failed.length > 0) {
+          console.error(`Venta ${newSale.id}: ${failed.length} efecto(s) secundario(s) fallaron`, failed);
+          alert(
+            `La venta ${newSale.id} SÍ quedó registrada, pero no se pudo actualizar ` +
+            `${failed.length === 1 ? 'un dato relacionado' : `${failed.length} datos relacionados`} (inventario / caja / saldo del cliente).\n\n` +
+            'Revisa el inventario y la caja de esta sucursal.'
+          );
+        }
+      });
+
+      // Reset checkout states and triggers success receipt modal
+      setLastCompletedSale(newSale);
+      setLastReceivedAmount(paymentMethod === 'Cash' ? parseFloat(receivedCashAmount) || 0 : 0);
+      setCart([]);
+      setSelectedCustomer(null);
+      setDiscountVal(0);
+      setReceivedCashAmount('');
+      setFolioNumber('');
+      setRequiresInvoice(false);
+      setTaxPct(0);
+      setIsCheckoutOpen(false);
+    } finally {
+      isProcessingSaleRef.current = false;
+      setIsProcessingSale(false);
     }
-
-    // 4. Record Cash/Finance/Card/Transfer transaction in audit log (atomic — see applyCashDelta)
-    const activeBranch = branches.find(b => b.id === selectedBranchId);
-    const branchNameSuffix = activeBranch ? ` (${activeBranch.name})` : '';
-    const paymentLabel = paymentMethod === 'Cash' ? 'Efectivo' : paymentMethod === 'Card' ? 'Tarjeta' : paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito';
-    const descFolio = (paymentMethod === 'Card' || paymentMethod === 'Transfer') && folioNumber.trim() ? ` [Folio: ${folioNumber.trim()}]` : '';
-
-    applyCashDelta(selectedBranchId, paymentMethod === 'Cash' ? cartValues.total : 0, [{
-      type: 'Venta',
-      amount: cartValues.total,
-      description: `Venta ${newSale.id} - ${paymentLabel}${descFolio}${branchNameSuffix}`,
-      time: new Date().toLocaleTimeString(),
-      createdAt: Date.now(),
-      branchId: selectedBranchId
-    }]);
-
-    // 5. Save the new sale record (only this single new doc gets written/diffed)
-    const newSales = [newSale, ...sales];
-    saveAllData(products, customers, newSales, cashRegister);
-
-    // Reset checkout states and triggers success receipt modal
-    setLastCompletedSale(newSale);
-    setLastReceivedAmount(paymentMethod === 'Cash' ? parseFloat(receivedCashAmount) || 0 : 0);
-    setCart([]);
-    setSelectedCustomer(null);
-    setDiscountVal(0);
-    setReceivedCashAmount('');
-    setFolioNumber('');
-    setRequiresInvoice(false);
-    setTaxPct(0);
-    setIsCheckoutOpen(false);
   };
 
   const handleSelectBranch = (branchId: string) => {
@@ -2695,7 +2904,7 @@ export default function App() {
       return;
     }
     const initialStockNum = parseFloat(bulkForm.initialStock) || 0;
-    const poolId = 'P-' + Math.floor(Math.random() * 90000 + 10000);
+    const poolId = 'P-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
     const poolProduct: Product = {
       id: poolId,
       name: bulkForm.baseName.trim(),
@@ -2704,20 +2913,20 @@ export default function App() {
       salePrice: 0,
       stock: initialStockNum,
       minStock: parseInt(bulkForm.minStock) || 0,
-      sku: bulkForm.sku || 'SKU-' + Math.floor(Math.random() * 900000),
+      sku: bulkForm.sku || 'SKU-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
       supplierId: bulkForm.supplierId || undefined,
       branchStocks: { [selectedBranchId]: initialStockNum },
       isStockPool: true
     };
     const childProducts: Product[] = presentations.map((p, idx) => ({
-      id: 'P-' + Math.floor(Math.random() * 90000 + 10000) + idx,
+      id: 'P-' + Date.now() + '-' + idx + '-' + Math.floor(Math.random() * 900 + 100),
       name: `${bulkForm.baseName.trim()} ${p.suffix.trim()}`.trim(),
       category: bulkForm.category,
       costPrice: parseFloat(p.costPrice) || 0,
       salePrice: parseFloat(p.price) || 0,
       stock: 0,
       minStock: parseInt(p.minStock) || 0,
-      sku: p.sku || 'SKU-' + Math.floor(Math.random() * 900000 + idx),
+      sku: p.sku || 'SKU-' + Date.now() + '-' + idx + '-' + Math.floor(Math.random() * 900 + 100),
       branchStocks: {},
       linkedStockProductId: poolId,
       stockConsumptionFactor: parseFloat(p.factor)
@@ -2865,7 +3074,10 @@ export default function App() {
             category: prodForm.category || 'Varios',
             costPrice: costPriceNum,
             salePrice: salePriceNum,
-            stock: isChild ? p.stock : stockNum,
+            // Consolidated total, not this branch's number — writing the active branch's
+            // count here is what let a price/name edit in one sucursal silently redefine
+            // every other sucursal's stock.
+            stock: isChild ? p.stock : sumBranchStocks(branchStocks),
             minStock: minStockNum,
             sku: prodForm.sku,
             supplierId: prodForm.supplierId || undefined,
@@ -2879,14 +3091,14 @@ export default function App() {
       });
     } else {
       const newProd: Product = {
-        id: 'P-' + Math.floor(Math.random() * 90000 + 10000),
+        id: 'P-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
         name: prodForm.name,
         category: prodForm.category || 'Varios',
         costPrice: costPriceNum,
         salePrice: salePriceNum,
         stock: isChild ? 0 : stockNum,
         minStock: minStockNum,
-        sku: prodForm.sku || 'SKU-' + Math.floor(Math.random() * 900000),
+        sku: prodForm.sku || 'SKU-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
         supplierId: prodForm.supplierId || undefined,
         branchStocks: isChild ? {} : { [selectedBranchId]: stockNum },
         linkedStockProductId,
@@ -3518,7 +3730,9 @@ export default function App() {
       return;
     }
 
-    const transferId = 'T-' + Math.floor(Math.random() * 900000 + 100000);
+    // Timestamp-based for the same reason as sale ids — a plain 6-digit random repeats far
+    // sooner than it looks, and a repeat here overwrites a past transfer record outright.
+    const transferId = 'T-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
     const sourceBranch = branches.find(b => b.id === transferSourceBranchId);
     const targetBranch = branches.find(b => b.id === transferTargetBranchId);
     const sourceBranchName = sourceBranch?.name || 'Sucursal';
@@ -3591,14 +3805,28 @@ export default function App() {
         updatedProducts = updatedProducts.map(p => {
           if (p.id !== l.productId) return p;
           const stocks = { ...(p.branchStocks || {}) };
-          const sourceVal = stocks[transferSourceBranchId] !== undefined ? stocks[transferSourceBranchId] : p.stock;
-          const targetVal = stocks[transferTargetBranchId] !== undefined ? stocks[transferTargetBranchId] : p.stock;
+          // Same rule as getProductStock/applyStockDeltas: a branch with no entry has 0, it
+          // does not borrow the consolidated total.
+          const sourceVal = stocks[transferSourceBranchId] ?? 0;
+          const targetVal = stocks[transferTargetBranchId] ?? 0;
           stocks[transferSourceBranchId] = sourceVal - l.quantity;
           stocks[transferTargetBranchId] = targetVal + l.quantity;
           return { ...p, branchStocks: stocks };
         });
       }
-      saveAllData(updatedProducts, customers, sales, cashRegister);
+      // This branch only runs when there's no valid session, and saving locally is exactly
+      // what it's supposed to do here — saveAllData's local state/localStorage write already
+      // happened before it throws, so swallow that specific error and carry on. Anything
+      // else is a real failure worth surfacing.
+      try {
+        await saveAllData(updatedProducts, customers, sales, cashRegister);
+      } catch (err) {
+        if (!isSessionInvalidError(err)) {
+          console.error("Error saving local-only transfer fallback:", err);
+          alert("Ocurrió un error al guardar el traspaso localmente.");
+          return;
+        }
+      }
       setIsTransferModalOpen(false);
       setTransferItems([]);
       setLastCompletedTransfer(completedTransfer);
@@ -4412,6 +4640,20 @@ export default function App() {
         
         {/* Real-time Clock and Auth on right */}
         <div className="flex items-center space-x-2 lg:space-x-4 flex-shrink-0">
+          {/* Sales this device charged but hasn't been able to upload yet (no signal).
+              Firestore retries them by itself; this just makes the queue visible so nobody
+              closes the app assuming everything is already in the cloud. Always shown (not
+              lg-only) — it matters most on the phones/tablets used at the counter. */}
+          {pendingSaleIds.length > 0 && (
+            <span
+              className="px-2 lg:px-2.5 py-1 rounded-md border font-bold text-[10px] lg:text-xs bg-amber-500 border-amber-300 text-white animate-pulse flex items-center gap-1 flex-shrink-0"
+              title="Estas ventas están guardadas en este dispositivo y se subirán solas cuando vuelva la conexión. No cierres la aplicación."
+            >
+              <AlertCircle className="w-3 h-3" />
+              <span className="hidden sm:inline">{pendingSaleIds.length} venta{pendingSaleIds.length === 1 ? '' : 's'} sin subir</span>
+              <span className="sm:hidden">{pendingSaleIds.length}</span>
+            </span>
+          )}
           <div className="hidden lg:flex items-center space-x-2 text-sm font-medium opacity-90">
             <span className="px-2.5 py-1 rounded-md border font-bold text-white text-xs" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 60%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
               Caja Registradora: {formatMXN(displayedCash)}
@@ -5242,13 +5484,14 @@ export default function App() {
  
                     <button
                       onClick={completeTransaction}
-                      className="w-full py-3.5 text-white font-extrabold text-center rounded-xl shadow-lg hover:shadow-xl transition-all duration-150 flex items-center justify-center space-x-2 cursor-pointer"
+                      disabled={isProcessingSale}
+                      className={`w-full py-3.5 text-white font-extrabold text-center rounded-xl shadow-lg transition-all duration-150 flex items-center justify-center space-x-2 ${isProcessingSale ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:shadow-xl'}`}
                       style={{ backgroundColor: 'var(--brand-primary)', filter: 'none' }}
-                      onMouseEnter={e => (e.currentTarget.style.filter = 'brightness(1.1)')}
+                      onMouseEnter={e => { if (!isProcessingSale) e.currentTarget.style.filter = 'brightness(1.1)'; }}
                       onMouseLeave={e => (e.currentTarget.style.filter = 'none')}
                     >
-                      <CircleDollarSign className="w-5 h-5 text-white animate-spin" style={{ animationDuration: '4s' }} />
-                      <span>PROCESAR VENTA ({formatMXN(cartValues.total)})</span>
+                      <CircleDollarSign className="w-5 h-5 text-white animate-spin" style={{ animationDuration: isProcessingSale ? '0.8s' : '4s' }} />
+                      <span>{isProcessingSale ? 'GUARDANDO VENTA...' : `PROCESAR VENTA (${formatMXN(cartValues.total)})`}</span>
                     </button>
                   </div>
                 )}
@@ -8492,6 +8735,28 @@ export default function App() {
             className="text-xs text-slate-500 hover:text-slate-300 underline cursor-pointer transition"
           >
             Salir e intentar de nuevo
+          </button>
+        </div>
+      )}
+
+      {/* Expired-session gate: the background revalidation above found the session is no
+          longer valid server-side. Everything the cashier does from here on would fail to
+          save, so block the POS outright rather than let sales pile up that never persist. */}
+      {user && !isAuthLoading && sessionExpired && (
+        <div className="fixed inset-0 z-50 bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-rose-900/40 border border-rose-700/30 flex items-center justify-center mb-5">
+            <AlertCircle className="w-8 h-8 text-rose-400" />
+          </div>
+          <h2 className="text-xl font-black text-slate-100 mb-2">Tu sesión expiró</h2>
+          <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+            Por seguridad, tu sesión dejó de ser válida. Cierra sesión y vuelve a entrar para poder seguir cobrando —
+            si sigues sin volver a entrar, las ventas no se guardarán.
+          </p>
+          <button
+            onClick={() => signOut(auth)}
+            className="px-6 py-2.5 mb-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-xl shadow cursor-pointer transition"
+          >
+            Cerrar sesión y volver a entrar
           </button>
         </div>
       )}

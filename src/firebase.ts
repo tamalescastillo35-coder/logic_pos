@@ -116,4 +116,22 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
+// Thrown by the shared write helpers in App.tsx (saveAllData / applyStockDeltas /
+// applyCashDelta / applyCustomerBalanceDelta) when `user` or `activeCompanyId` are falsy at
+// call time. Those used to just `return` silently, so a sale/stock/cash change made while the
+// session was momentarily unresolved (shared device, shift handoff, company still loading)
+// updated the screen and vanished without ever reaching Firestore — no error, no trace.
+// Callers tell this apart from a generic network/Firestore failure via instanceof, which
+// survives minification unlike sniffing error.message.
+export class SessionInvalidError extends Error {
+  constructor(message: string = 'SESSION_INVALID') {
+    super(message);
+    this.name = 'SessionInvalidError';
+  }
+}
+
+export function isSessionInvalidError(err: unknown): err is SessionInvalidError {
+  return err instanceof SessionInvalidError;
+}
+
 
