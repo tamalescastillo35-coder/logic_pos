@@ -794,6 +794,20 @@ export default function App() {
   // True when the logged-in user authenticated with an employee code (virtual email), not Google
   const isCredentialEmployee = Boolean(user?.email?.includes('_') && user?.email?.endsWith('@logicpos.com'));
 
+  // Last-resort label for "who rang this up". Credential employees sign in with a virtual
+  // email (comp_384860_103003@logicpos.com) and never get a Firebase displayName, so if their
+  // member document hasn't loaded there'd be nothing left to identify them by — and a sale
+  // with no seller is exactly what makes an incident impossible to trace later. The employee
+  // number is always recoverable from the address itself.
+  const employeeNumberFromEmail = useMemo(() => {
+    if (!isCredentialEmployee || !user?.email) return undefined;
+    const local = user.email.split('@')[0];
+    const firstUnderscore = local.indexOf('_');
+    const secondUnderscore = local.indexOf('_', firstUnderscore + 1);
+    if (secondUnderscore === -1) return undefined;
+    return local.substring(secondUnderscore + 1) || undefined;
+  }, [isCredentialEmployee, user?.email]);
+
   // Handler to Create a new Company inside cloud & bootstrap default entities
   const handleCreateCompany = async (companyName: string) => {
     if (!companyName.trim()) return;
@@ -2130,9 +2144,15 @@ export default function App() {
       folio: (paymentMethod === 'Card' || paymentMethod === 'Transfer') ? folioNumber.trim() : undefined,
       requiresInvoice,
       invoiceStatus: requiresInvoice ? 'pending' : undefined,
-      // `currentUserMember.name` covers owner/encargado/cajero alike (all are member docs);
-      // falls back to the Auth display name for the rare case the member doc hasn't synced yet.
-      employeeName: currentUserMember?.name || user?.displayName || undefined
+      // `currentUserMember.name` covers owner/encargado/cajero alike (all are member docs).
+      // The fallbacks matter: checkout no longer blocks when the member doc hasn't loaded, so
+      // without them a sale could be recorded with no seller at all. Credential employees have
+      // no displayName, hence the employee number parsed from their sign-in address.
+      employeeName: currentUserMember?.name
+        || user?.displayName
+        || (employeeNumberFromEmail ? `Empleado ${employeeNumberFromEmail}` : undefined)
+        || user?.email
+        || undefined
     };
 
     isProcessingSaleRef.current = true;
