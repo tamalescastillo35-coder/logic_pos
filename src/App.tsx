@@ -280,6 +280,38 @@ interface StockMovement {
   unitPrice?: number; // sale price at transfer time, for the printed ticket's total — only set on transfer_out/transfer_in entries created after this field existed
 }
 
+// Best-effort, invisible audit log of the checkout SAVE funnel — one entry per real save
+// attempt inside completeTransaction (i.e. only after credit/folio/stock/session validation
+// already passed and a Sale object exists), plus its eventual outcome. This exists to answer
+// one question after the fact: when a paper sale doesn't show up in Firestore, was it a
+// technical save failure, or was it simply never rung up in the app at all? It is NOT a
+// general error log, NOT surfaced in any UI screen, and NOT a substitute for the Sale record
+// itself — it only has to prove an attempt happened and how it ended.
+type CheckoutEventStatus =
+  | 'started'                  // save attempt kicked off (saveAllData called)
+  | 'success'                  // saveAllData settled with no rejection before the 4s cutoff
+  | 'failed'                   // saveAllData rejected before the 4s cutoff (session/permission/data error)
+  | 'offline_queued'           // still pending after the 4s cutoff — parked by Firestore, not yet known-good/bad
+  | 'offline_resolved_success' // a previously offline_queued attempt later resolved with no rejection
+  | 'offline_resolved_failed'; // a previously offline_queued attempt later resolved WITH a rejection
+
+interface CheckoutEvent {
+  id: string;
+  saleId: string;              // newSale.id — links back to companies/{id}/sales/{saleId} when it exists
+  status: CheckoutEventStatus;
+  branchId?: string;           // newSale.branchId — "per branch" diagnostic
+  branchName?: string;         // resolved once at attempt time, for readability without a join
+  employeeName?: string;       // newSale.employeeName — "per employee" diagnostic
+  userId?: string;             // auth.currentUser.uid — reliable grouping key even if employeeName is a display fallback
+  paymentMethod?: Sale['paymentMethod'];
+  total?: number;              // dollar exposure of attempts that failed/queued
+  itemCount?: number;          // cart size, without duplicating full line-item detail
+  errorMessage?: string;       // only set on failed / offline_resolved_failed
+  isSessionInvalid?: boolean;  // only set on failed / offline_resolved_failed
+  timestamp: string;           // human-readable, same convention as Sale.timestamp / StockMovement.timestamp
+  createdAt: number;           // epoch ms — for sorting/filtering by day, same convention as StockMovement.createdAt
+}
+
 interface TransferLineItem {
   productId: string;
   quantity: number;
@@ -1855,6 +1887,21 @@ export default function App() {
     }));
   };
 
+  // Best-effort write to the invisible checkout-funnel audit log — see CheckoutEvent. Unlike
+  // logStockMovements, this must NEVER be able to affect the real sale path, so on failure it
+  // only console.errors and swallows: no handleFirestoreError (which re-throws), no alert, no
+  // retry, and callers must never `await` it. companyId is read live from state at call time
+  // rather than passed in, so a stale closure can't misattribute an event to the wrong company.
+  const logCheckoutEvent = (fields: Omit<CheckoutEvent, 'id' | 'timestamp' | 'createdAt'>): void => {
+    if (!activeCompanyId) return; // nothing to attribute this to — silently skip, never block the caller
+    const compId = activeCompanyId;
+    const now = Date.now();
+    const id = `CE-${now}-${Math.floor(Math.random() * 900000 + 100000)}`;
+    const event: CheckoutEvent = { ...fields, id, timestamp: new Date().toLocaleString(), createdAt: now };
+    setDoc(doc(db, 'companies', compId, 'checkoutEvents', id), sanitize(event))
+      .catch(err => console.error('[checkoutEvents] best-effort log write failed (ignored):', err));
+  };
+
   // Pos / Cart Operations State
   const [cart, setCart] = useState<CartItem[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -2155,9 +2202,24 @@ export default function App() {
         || undefined
     };
 
+    // Shared identifiers for every checkoutEvents entry this attempt emits, computed once so
+    // all of them (including the offline-resolved one, which can fire minutes later) stay
+    // attributed consistently even if branch/session state moves on in the meantime.
+    const checkoutEventBase = {
+      saleId: newSale.id,
+      branchId: newSale.branchId,
+      branchName: branches.find(b => b.id === newSale.branchId)?.name,
+      employeeName: newSale.employeeName,
+      userId: auth.currentUser?.uid,
+      paymentMethod: newSale.paymentMethod,
+      total: newSale.total,
+      itemCount: newSale.items.length,
+    };
+
     isProcessingSaleRef.current = true;
     setIsProcessingSale(true);
     try {
+      logCheckoutEvent({ ...checkoutEventBase, status: 'started' });
       // 2. Save the sale record FIRST and wait for it. The sale document is the source of
       // truth for "this sale happened"; stock/cash/credit are consequences of it. Firing all
       // four at once (the old behaviour) meant a failed sale write could leave stock and cash
@@ -2180,6 +2242,12 @@ export default function App() {
         // connectivity hiccup. Undo the optimistic local write and keep the cart intact so
         // the sale can simply be charged again once the cause is fixed.
         console.error('Error guardando la venta:', saveRejection);
+        logCheckoutEvent({
+          ...checkoutEventBase,
+          status: 'failed',
+          errorMessage: saveRejection instanceof Error ? saveRejection.message : String(saveRejection),
+          isSessionInvalid: isSessionInvalidError(saveRejection),
+        });
         setSales(prev => {
           const reverted = prev.filter(s => s.id !== newSale.id);
           localStorage.setItem('logic_sales', JSON.stringify(reverted));
@@ -2195,6 +2263,7 @@ export default function App() {
 
       if (!saveSettled) {
         // Still queued after the wait — almost always "no signal right now".
+        logCheckoutEvent({ ...checkoutEventBase, status: 'offline_queued' });
         setPendingSaleIds(prev => [...prev, newSale.id]);
         alert(
           'Sin conexión en este momento.\n\n' +
@@ -2206,8 +2275,20 @@ export default function App() {
           if (saveRejection) {
             console.error('La venta pendiente terminó fallando:', saveRejection);
             alert(`La venta ${newSale.id} no se pudo subir a la nube. Anótala y repórtala a tu encargado.`);
+            logCheckoutEvent({
+              ...checkoutEventBase,
+              status: 'offline_resolved_failed',
+              errorMessage: saveRejection instanceof Error ? saveRejection.message : String(saveRejection),
+              isSessionInvalid: isSessionInvalidError(saveRejection),
+            });
+          } else {
+            logCheckoutEvent({ ...checkoutEventBase, status: 'offline_resolved_success' });
           }
         });
+      }
+
+      if (saveSettled && !saveRejection) {
+        logCheckoutEvent({ ...checkoutEventBase, status: 'success' });
       }
 
       // 3. Sale is safe (either confirmed or reliably queued) — now apply its consequences.

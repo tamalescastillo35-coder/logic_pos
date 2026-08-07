@@ -161,6 +161,27 @@ service cloud.firestore {
           && (!('createdAt' in data) || data.createdAt is number);
     }
 
+    function isValidCheckoutEvent(data) {
+      return data.id is string && data.id.size() <= 128
+          && data.saleId is string && data.saleId.size() <= 128
+          && data.status is string && (
+               data.status == 'started' || data.status == 'success' || data.status == 'failed' ||
+               data.status == 'offline_queued' || data.status == 'offline_resolved_success' ||
+               data.status == 'offline_resolved_failed'
+             )
+          && data.timestamp is string && data.timestamp.size() <= 100
+          && (!('createdAt' in data) || data.createdAt is number)
+          && (!('branchId' in data) || (data.branchId is string && data.branchId.size() <= 128))
+          && (!('branchName' in data) || (data.branchName is string && data.branchName.size() <= 200))
+          && (!('employeeName' in data) || (data.employeeName is string && data.employeeName.size() <= 200))
+          && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
+          && (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 20))
+          && (!('total' in data) || data.total is number)
+          && (!('itemCount' in data) || data.itemCount is number)
+          && (!('errorMessage' in data) || (data.errorMessage is string && data.errorMessage.size() <= 1000))
+          && (!('isSessionInvalid' in data) || data.isSessionInvalid is bool);
+    }
+
     // User Profile Document Access Rules
     match /users/{userId} {
       allow read: if isSignedIn() && request.auth.uid == userId;
@@ -342,6 +363,21 @@ service cloud.firestore {
           && isValidStockMovement(incoming()) && incoming().id == movementId;
         allow update: if false;
         allow delete: if isVerifiedUser() && isOwnerOrAdmin(companyId);
+      }
+
+      // Checkout funnel audit log — best-effort, invisible record of every sale SAVE ATTEMPT
+      // (after all client-side validation/session checks already passed) and its outcome.
+      // Exists to answer, after the fact, whether a sale that never reached Firestore was a
+      // technical save failure or was never rung up at all — not a general error log, not
+      // surfaced in any UI. Fully immutable once written: no update, no delete, not even by
+      // owner/admin — its only value is being a record that can't be quietly edited or
+      // removed by exactly the people whose accountability it might be used to check.
+      match /checkoutEvents/{eventId} {
+        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(eventId)
+          && isValidCheckoutEvent(incoming()) && incoming().id == eventId;
+        allow update: if false;
+        allow delete: if false;
       }
     }
 
