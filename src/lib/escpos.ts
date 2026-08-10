@@ -232,12 +232,12 @@ export function columnsForPaperWidth(paperWidth: '58mm' | '80mm' | 'A4'): number
   return paperWidth === '80mm' ? 48 : 32;
 }
 
-export function buildTestPrint(columns: number): Uint8Array {
+export function buildTestPrint(columns: number, businessName: string): Uint8Array {
   const b = new EscPosBuilder();
   b.init();
   b.align('center');
   b.bold(true).doubleSize(true);
-  b.line('LOGIC POS');
+  b.line(businessName);
   b.doubleSize(false).bold(false);
   b.line('Impresora conectada');
   b.align('left');

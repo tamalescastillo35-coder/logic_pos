@@ -208,7 +208,7 @@ export default function CompanySelector({
               </div>
               <div className="p-3 bg-indigo-950/20 border border-indigo-900/40 rounded-xl text-left">
                 <p className="text-[11px] text-indigo-300 leading-relaxed">
-                  <strong>Paso de Inicialización Automática:</strong> Al crear tu empresa, LOGIC POS importará automáticamente la base de datos de productos por defecto para que puedas comenzar a operar sin demoras.
+                  <strong>Paso de Inicialización Automática:</strong> Al crear tu empresa, XAMU POS importará automáticamente la base de datos de productos por defecto para que puedas comenzar a operar sin demoras.
                 </p>
               </div>
               <button
@@ -270,7 +270,7 @@ export default function CompanySelector({
 
         {/* Global Footer Exit buttons */}
         <div className="bg-slate-900/80 px-6 py-4 border-t border-slate-850 flex justify-between items-center text-xs">
-          <span className="text-slate-500 font-bold">LOGIC POS</span>
+          <span className="text-slate-500 font-bold">XAMU POS</span>
           <button
             onClick={onLogout}
             className="flex items-center space-x-1.5 text-red-400 hover:text-red-300 font-extrabold tracking-wide cursor-pointer uppercase py-1 px-2.5 rounded bg-red-950/40 hover:bg-red-950 border border-red-900/30 transition"

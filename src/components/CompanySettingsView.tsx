@@ -526,7 +526,7 @@ export default function CompanySettingsView({
       const data = await listRes.json();
 
       if (!data.files || data.files.length === 0) {
-        alert("No se encontraron copias de seguridad de LOGIC POS en tu cuenta de Google Drive.");
+        alert("No se encontraron copias de seguridad de XAMU POS en tu cuenta de Google Drive.");
         return;
       }
 
@@ -2174,7 +2174,7 @@ export default function CompanySettingsView({
                       <button
                         type="button"
                         onClick={() => {
-                          const msg = `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`;
+                          const msg = `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *${branding.displayName || companyName}*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`;
                           navigator.clipboard.writeText(msg);
                           setCopiedCredNotify(true);
                           setTimeout(() => setCopiedCredNotify(false), 2000);
@@ -2187,7 +2187,7 @@ export default function CompanySettingsView({
 
                       <a
                         href={`https://api.whatsapp.com/send?text=${encodeURIComponent(
-                          `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *LogicPOS*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`
+                          `¡Hola, *${createdCredentialsShow.name}*! Te comparto tus credenciales de acceso para *${branding.displayName || companyName}*.\n\n*ID de Comercio / Empresa:* ${createdCredentialsShow.companyId}\n*Número de Empleado:* ${createdCredentialsShow.username}\n\n*Instrucciones para iniciar sesión:*\n1. Abre el sistema POS.\n2. Presiona "Acceso al Sistema" en la parte superior.\n3. Ingresa el *Código de Comercio* y tu *Número de Empleado*.\n4. ¡Listo! El número de empleado es tu acceso.`
                         )}`}
                         target="_blank"
                         rel="noopener noreferrer"

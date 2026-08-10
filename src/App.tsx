@@ -47,7 +47,8 @@ import {
   Upload,
   TrendingDown,
   MessageCircle,
-  Mail
+  Mail,
+  Share2
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
@@ -124,45 +125,9 @@ import CompanySettingsView from './components/CompanySettingsView';
 const utf8ToBase64 = (str: string): string =>
   btoa(Array.from(new TextEncoder().encode(str), b => String.fromCharCode(b)).join(''));
 
-// Saves a generated file (CSV/PDF) so it actually reaches the user. In a real browser the
-// classic Blob + <a download> click reliably triggers the browser's download flow. Inside
-// Capacitor's Android WebView that same click does nothing visible — there's no Downloads-
-// folder integration for it. On native we instead write the file to the app's cache dir
-// (@capacitor/filesystem) and hand it to the OS share sheet (@capacitor/share), where the
-// user picks "Guardar en Archivos" / Drive / WhatsApp / etc. Same entry point either way —
-// callers just pass the filename, base64 payload, and mime type.
-const saveFileOnDevice = async (filename: string, base64Data: string, mimeType: string) => {
-  if (isNativePlatform) {
-    try {
-      const result = await Filesystem.writeFile({
-        path: filename,
-        data: base64Data,
-        directory: Directory.Cache,
-      });
-      await Share.share({
-        title: filename,
-        url: result.uri,
-        dialogTitle: `Guardar ${filename}`,
-      });
-    } catch (err) {
-      console.error('Native file save error:', err);
-      alert('No se pudo guardar/compartir el archivo. Intenta de nuevo.');
-    }
-  } else {
-    const byteChars = atob(base64Data);
-    const bytes = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }
-};
+// saveFileOnDevice moved inside the App() component below — it now needs component state
+// (pendingFileSave) to show a Descargar/Compartir choice instead of picking one path
+// automatically per platform.
 
 // Interfaces
 interface Product {
@@ -497,7 +462,7 @@ export default function App() {
   };
   const handleTestPrintBluetooth = async () => {
     if (!bluetoothPrinter) return;
-    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth));
+    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth), businessName);
     await BluetoothPrinter.printEscPos({ address: bluetoothPrinter.address, data: uint8ToBase64(bytes) });
   };
 
@@ -555,7 +520,7 @@ export default function App() {
   };
 
   const handleTestPrintWeb = async () => {
-    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth));
+    const bytes = buildTestPrint(columnsForPaperWidth(printConfig.paperWidth), businessName);
     if (webUsbDevice) return printUsb(webUsbDevice, bytes);
     if (webBluetoothDevice) return printBluetooth(webBluetoothDevice, bytes);
     throw new Error('No hay impresora conectada.');
@@ -736,6 +701,104 @@ export default function App() {
   // Multi-Company States
   const [activeCompanyId, setActiveCompanyId] = useState<string | null>(null);
   const [userCompanies, setUserCompanies] = useState<{ [id: string]: { id: string; name: string; role: 'owner' | 'master_admin' | 'admin' | 'employee' } }>({});
+
+  // Shared "which business is this" resolver — same fallback chain already used by the
+  // printed receipt (ticketBusinessName) and the header, reused here for the browser tab
+  // title/favicon and the WhatsApp/email/printer-test messages so they show the registered
+  // company's own name instead of a hardcoded one (this app is multi-tenant white-label).
+  const businessName = useMemo(
+    () => branding.displayName || (activeCompanyId ? userCompanies[activeCompanyId]?.name : '') || 'Mi Comercio',
+    [branding.displayName, activeCompanyId, userCompanies]
+  );
+
+  // Browser tab title + favicon, kept in sync with the resolved business name/logo. Neither
+  // exists statically beyond a generic default in index.html — this is what makes them
+  // dynamic per company instead of frozen at whatever loaded first.
+  useEffect(() => {
+    document.title = businessName && businessName !== 'Mi Comercio' ? `${businessName} powered by XAMU POS` : 'XAMU POS';
+    let iconLink = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!iconLink) {
+      iconLink = document.createElement('link');
+      iconLink.rel = 'icon';
+      document.head.appendChild(iconLink);
+    }
+    iconLink.href = branding.logoUrl || '/xamu_logo.png';
+  }, [businessName, branding.logoUrl]);
+
+  // Saves a generated file (CSV/PDF) so it actually reaches the user. Both platforms now show
+  // a small Descargar/Compartir choice instead of picking one path automatically: on native,
+  // "share" used to be the ONLY option (straight to the OS share sheet, with a real save
+  // buried inside it as just one of the share targets, no confirmation) — testing the
+  // Descargar path also needed to be possible on desktop, not just on a phone.
+  const [pendingFileSave, setPendingFileSave] = useState<{ filename: string; base64Data: string; mimeType: string } | null>(null);
+
+  const saveFileOnDevice = async (filename: string, base64Data: string, mimeType: string) => {
+    setPendingFileSave({ filename, base64Data, mimeType });
+  };
+
+  const confirmDownloadPendingFile = async () => {
+    if (!pendingFileSave) return;
+    const { filename, base64Data, mimeType } = pendingFileSave;
+    try {
+      if (isNativePlatform) {
+        // Directory.Documents (unlike the old Directory.Cache + share-only path) needs no
+        // extra Android permission and lands somewhere the user can find via a Files app.
+        await Filesystem.writeFile({ path: filename, data: base64Data, directory: Directory.Documents });
+        alert(`"${filename}" se guardó correctamente en Documentos.`);
+      } else {
+        const byteChars = atob(base64Data);
+        const bytes = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+        const blob = new Blob([bytes], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      console.error('File download error:', err);
+      alert('No se pudo descargar el archivo. Intenta compartirlo en su lugar.');
+    } finally {
+      setPendingFileSave(null);
+    }
+  };
+
+  const confirmSharePendingFile = async () => {
+    if (!pendingFileSave) return;
+    const { filename, base64Data, mimeType } = pendingFileSave;
+    try {
+      if (isNativePlatform) {
+        const result = await Filesystem.writeFile({ path: filename, data: base64Data, directory: Directory.Cache });
+        await Share.share({ title: filename, url: result.uri, dialogTitle: `Guardar ${filename}` });
+      } else {
+        // Same base64 -> File conversion already used for the iOS ticket share fallback above.
+        const byteChars = atob(base64Data);
+        const bytes = new Uint8Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i);
+        const file = new File([bytes], filename, { type: mimeType });
+        if (!navigator.share) {
+          throw new Error('share-unsupported');
+        }
+        if (navigator.canShare && !navigator.canShare({ files: [file] })) {
+          throw new Error('share-files-unsupported');
+        }
+        await navigator.share({ files: [file], title: filename });
+      }
+    } catch (err: any) {
+      // AbortError = the user closed the share sheet themselves — not a real failure, no alert.
+      if (err?.name !== 'AbortError') {
+        console.error('File share error:', err);
+        alert('No se pudo compartir el archivo. Usa "Descargar" en su lugar.');
+      }
+    } finally {
+      setPendingFileSave(null);
+    }
+  };
+
   const [currentUserMember, setCurrentUserMember] = useState<any | null>(null);
   // Branch-sync gate ("Cargando tu sucursal..." screen, see the branch-lock effect below):
   // true once ~8s have passed while a branch-locked employee/admin is still waiting for
@@ -4596,7 +4659,8 @@ export default function App() {
               <ShoppingCart className="w-6 h-6 text-indigo-500" />
             </div>
             <div>
-              <h3 className="font-extrabold text-base text-slate-800">LOGIC POS</h3>
+              <h3 className="font-extrabold text-base text-slate-800">TAMALES CASTILLO POS</h3>
+              <p className="text-[9px] text-slate-400 -mt-0.5 font-semibold tracking-wide">powered by XAMU POS</p>
               <p className="text-[10px] text-slate-400 mt-0.5">Ingresa con tu número de empleado o cuenta de propietario.</p>
             </div>
           </div>
@@ -4711,7 +4775,7 @@ export default function App() {
                   {userCompanies[activeCompanyId]?.role === 'owner' ? 'Propietario' : userCompanies[activeCompanyId]?.role === 'master_admin' ? 'Master Admin' : userCompanies[activeCompanyId]?.role === 'admin' ? 'Admin' : 'Empleado'}
                 </span>
               ) : (
-                <span className="hidden md:inline-block px-2 py-0.5 text-white font-bold text-[10px] rounded-full shadow-sm shrink-0" style={{ backgroundColor: 'var(--brand-primary)' }}>LOGIC POS</span>
+                <span className="hidden md:inline-block px-2 py-0.5 text-white font-bold text-[10px] rounded-full shadow-sm shrink-0" style={{ backgroundColor: 'var(--brand-primary)' }}>TAMALES CASTILLO POS</span>
               )}
             </div>
              {/* Active Branch Switching Selector in Header */}
@@ -8510,7 +8574,7 @@ export default function App() {
               <div className="grid grid-cols-2 gap-2 text-xs font-bold">
                 <a
                   href={(() => {
-                    let text = `*ℹ️ TICKET DE COMPRA - LOGIC POS*\n`;
+                    let text = `*ℹ️ TICKET DE COMPRA - ${businessName}*\n`;
                     text += `=========================\n`;
                     text += `*ID de Venta:* ${lastCompletedSale.id}\n`;
                     text += `*Fecha/Hora:* ${lastCompletedSale.timestamp}\n`;
@@ -8543,7 +8607,7 @@ export default function App() {
 
                 <a
                   href={(() => {
-                    const subject = `Recibo de Venta Nro ${lastCompletedSale.id} - LOGIC POS`;
+                    const subject = `Recibo de Venta Nro ${lastCompletedSale.id} - ${businessName}`;
                     let body = `Estimado cliente,\n\n`;
                     body += `Le adjuntamos el detalle de su compra realizada el ${lastCompletedSale.timestamp}:\n\n`;
                     body += `Ticket: ${lastCompletedSale.id}\n`;
@@ -8552,7 +8616,7 @@ export default function App() {
                     lastCompletedSale.items.forEach(it => {
                       body += `- ${it.quantity}x ${it.name} - ${formatMXN(it.salePrice * it.quantity)}\n`;
                     });
-                    body += `\n¡Gracias por preferir nuestros servicios!\n\nLOGIC POS Cloud`;
+                    body += `\n¡Gracias por preferir nuestros servicios!\n\n${businessName}`;
                     return `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
                   })()}
                   className="p-2.5 bg-sky-50 hover:bg-sky-100/80 border border-sky-200 text-sky-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-155"
@@ -8906,6 +8970,40 @@ export default function App() {
           >
             Salir e intentar de nuevo
           </button>
+        </div>
+      )}
+
+      {/* Descargar/Compartir choice for saveFileOnDevice — shown on every platform (web and
+          native) so the flow can be tested on desktop instead of only on a phone. */}
+      {pendingFileSave && (
+        <div className="fixed inset-0 z-[60] bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xs p-5 space-y-4 text-center animate-slide-up">
+            <p className="font-bold text-sm text-slate-800 break-all">{pendingFileSave.filename}</p>
+            <p className="text-xs text-slate-500">¿Qué quieres hacer con este archivo?</p>
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={confirmDownloadPendingFile}
+                className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
+              >
+                <Download className="w-3.5 h-3.5" /> Descargar
+              </button>
+              <button
+                type="button"
+                onClick={confirmSharePendingFile}
+                className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
+              >
+                <Share2 className="w-3.5 h-3.5" /> Compartir
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingFileSave(null)}
+                className="w-full py-2 text-slate-400 hover:text-slate-600 font-bold text-xs cursor-pointer transition"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
