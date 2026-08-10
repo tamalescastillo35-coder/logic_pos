@@ -48,7 +48,8 @@ import {
   TrendingDown,
   MessageCircle,
   Mail,
-  Share2
+  Share2,
+  Pencil
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
@@ -5841,9 +5842,19 @@ export default function App() {
                           <p className="font-extrabold text-violet-400 uppercase tracking-wider">Presentaciones Vinculadas:</p>
                           <div className="space-y-0.5">
                             {getLinkedChildren(prod.id).map(child => (
-                              <div key={child.id} className="flex justify-between items-center text-violet-700 font-bold">
-                                <span className="truncate">{child.name.replace(prod.name, '').trim() || child.name}:</span>
-                                <span>{getProductStock(child, selectedBranchId, products)} u.</span>
+                              <div key={child.id} className="flex justify-between items-center text-violet-700 font-bold gap-1.5">
+                                <span className="truncate flex-1">{child.name.replace(prod.name, '').trim() || child.name}:</span>
+                                <span className="shrink-0">{formatMXN(child.salePrice)} · {getProductStock(child, selectedBranchId, products)} u.</span>
+                                {activeCompanyRole === 'owner' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenProductModal(child)}
+                                    className="shrink-0 p-1 -m-1 text-violet-500 hover:text-violet-800 cursor-pointer"
+                                    title={`Editar ${child.name}`}
+                                  >
+                                    <Pencil className="w-3 h-3" />
+                                  </button>
+                                )}
                               </div>
                             ))}
                           </div>
