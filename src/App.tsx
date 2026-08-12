@@ -1984,9 +1984,35 @@ export default function App() {
   const isProcessingSaleRef = useRef(false);
   // Sales whose cloud write hasn't been confirmed yet (typically the device is offline —
   // Firestore keeps the write queued and retries by itself when the signal comes back).
-  // Tracked in local state only, never written to the sale document: it describes THIS
-  // device's sync state, and the sales listener would overwrite such a field anyway.
-  const [pendingSaleIds, setPendingSaleIds] = useState<string[]>([]);
+  // Never written to the sale document: it describes THIS device's sync state, and the
+  // sales listener would overwrite such a field anyway. Mirrored to localStorage (below)
+  // so the "N ventas sin subir" badge survives a reload instead of resetting to 0 while
+  // Firestore's own queue is still silently working in the background.
+  const [pendingSaleIds, setPendingSaleIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('logic_pending_sale_ids');
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('logic_pending_sale_ids', JSON.stringify(pendingSaleIds));
+  }, [pendingSaleIds]);
+
+  // A pending id clears itself once the sales listener actually receives that document —
+  // proof the write landed — rather than relying on the original in-memory promise, which
+  // doesn't survive a reload. This is what lets the restored (post-reload) badge count go
+  // back down to 0 on its own once the queued writes really finish syncing.
+  useEffect(() => {
+    if (pendingSaleIds.length === 0) return;
+    const confirmedIds = new Set(sales.map(s => s.id));
+    const stillPending = pendingSaleIds.filter(id => !confirmedIds.has(id));
+    if (stillPending.length !== pendingSaleIds.length) {
+      setPendingSaleIds(stillPending);
+    }
+  }, [sales, pendingSaleIds]);
 
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [lastCompletedSale, setLastCompletedSale] = useState<Sale | null>(null);
