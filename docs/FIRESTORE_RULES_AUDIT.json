@@ -1,0 +1,42 @@
+{
+  "score": 4,
+  "summary": "Las reglas aplican denegación global por defecto, aislamiento por empresa, autoridad basada en membresías existentes, control por rol y permiso, alcance por sucursal e inmutabilidad para los registros críticos. Las invitaciones tienen entropía suficiente, expiración, creador, consumo atómico y esquema cerrado. No se identificó una ruta de acceso entre empresas ni una elevación de privilegios. Los riesgos residuales son menores y se concentran en límites estructurales de Firestore Rules y documentos administrativos de configuración sin esquema exhaustivo.",
+  "findings": [
+    {
+      "check": "Update Bypass",
+      "severity": "minor",
+      "issue": "Las ventas, movimientos de caja, movimientos de stock y eventos de checkout tienen transiciones limitadas o son inmutables. Los productos validan valores no negativos, pero un actor con permiso explícito de inventario todavía puede fijar valores de stock arbitrarios dentro del rango permitido.",
+      "recommendation": "Para trazabilidad máxima, mover los ajustes manuales de inventario a una operación confiable de servidor o exigir un movimiento correlacionado para cada cambio de stock cuando el modelo de datos lo permita."
+    },
+    {
+      "check": "Authority Source",
+      "severity": "minor",
+      "issue": "Roles y permisos se leen de companies/{companyId}/members/{uid}; un empleado no puede autoeditar ese documento. El owner es el único que administra membresías e invitaciones, y una invitación de uso único debe consumirse atómicamente.",
+      "recommendation": "Mantener la administración de roles limitada al owner y agregar pruebas automatizadas con el emulador para intentos de autoelevación."
+    },
+    {
+      "check": "Business Logic vs. Rules",
+      "severity": "minor",
+      "issue": "El checkout oficial correlaciona venta, caja y auditoría, pero Firestore Rules no puede recorrer y validar profundamente hasta 450 objetos de partida ni demostrar por sí solo el descuento exacto de cada producto.",
+      "recommendation": "Para endurecimiento máximo, ejecutar checkout en una Cloud Function o API autenticada, o normalizar partidas en documentos verificables."
+    },
+    {
+      "check": "Storage Abuse",
+      "severity": "minor",
+      "issue": "IDs, textos, listas críticas e invitaciones tienen límites. La subcolección administrativa settings todavía permite estructuras variables sin límites específicos por documento.",
+      "recommendation": "Definir validadores keys().hasOnly(), tipos y límites para cada setting antes de permitir configuraciones nuevas o contenido grande."
+    },
+    {
+      "check": "Type Safety",
+      "severity": "minor",
+      "issue": "Los documentos críticos comprueban tipos y rangos, pero isValidSale valida el arreglo items como lista sin validar cada objeto interno por la limitación práctica de iteración en reglas.",
+      "recommendation": "Validar profundamente las partidas en una capa confiable de servidor si el modelo deja de ser exclusivamente cliente Firestore."
+    },
+    {
+      "check": "Field-Level vs. Identity-Level Security",
+      "severity": "minor",
+      "issue": "Las restricciones diff/hasOnly sensibles están acompañadas por identidad, membresía, rol o permiso. Los miembros de una empresa pueden leer nombres y correos de otros miembros de la misma empresa, acceso que podría ser mayor de lo necesario para ciertos cajeros.",
+      "recommendation": "Separar en el futuro el perfil operativo visible para el equipo de los datos privados accesibles solo a owner/admin."
+    }
+  ]
+}
