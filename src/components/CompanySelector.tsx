@@ -90,7 +90,7 @@ export default function CompanySelector({
       <div className="w-full max-w-lg bg-slate-950 border border-slate-800 rounded-3xl shadow-2xl shadow-indigo-950/40 overflow-hidden flex flex-col">
         
         {/* Upper Brand Info */}
-        <div className="bg-gradient-to-r from-slate-900 to-indigo-950 px-6 py-8 border-b border-slate-850 text-center relative">
+        <div className="bg-gradient-to-r from-slate-900 to-indigo-950 px-6 py-8 border-b border-slate-800 text-center relative">
           <div className="mx-auto w-14 h-14 bg-indigo-500/10 rounded-2xl border border-indigo-500/20 flex items-center justify-center mb-4">
             <Building2 className="w-8 h-8 text-indigo-400" />
           </div>
@@ -101,7 +101,7 @@ export default function CompanySelector({
         </div>
 
         {/* Tab Controls Selector */}
-        <div className="flex border-b border-slate-850 px-4 bg-slate-900/40">
+        <div className="flex border-b border-slate-800 px-4 bg-slate-900/40">
           {companyList.length > 0 && (
             <button
               onClick={() => setActiveTab('select')}
@@ -145,7 +145,7 @@ export default function CompanySelector({
                 {companyList.map((company) => (
                   <div
                     key={company.id}
-                    className="w-full bg-slate-900/80 hover:bg-slate-850 border border-slate-800 hover:border-slate-700/85 text-left p-4 rounded-2xl flex items-center justify-between transition duration-150 group"
+                    className="w-full bg-slate-900/80 hover:bg-slate-800 border border-slate-800 hover:border-slate-700/85 text-left p-4 rounded-2xl flex items-center justify-between transition duration-150 group"
                   >
                     <button
                       type="button"
@@ -269,7 +269,7 @@ export default function CompanySelector({
         </div>
 
         {/* Global Footer Exit buttons */}
-        <div className="bg-slate-900/80 px-6 py-4 border-t border-slate-850 flex justify-between items-center text-xs">
+        <div className="bg-slate-900/80 px-6 py-4 border-t border-slate-800 flex justify-between items-center text-xs">
           <span className="text-slate-500 font-bold">XAMU POS</span>
           <button
             onClick={onLogout}

@@ -51,33 +51,32 @@ import {
   Share2,
   Pencil
 } from 'lucide-react';
-import { jsPDF } from 'jspdf';
-import { autoTable } from 'jspdf-autotable';
-
 // Firebase integrations
 import { auth, db, googleProvider, driveGoogleProvider, OperationType, handleFirestoreError, getCachedAccessToken, setCachedAccessToken, SessionInvalidError, isSessionInvalidError } from './firebase';
 import { onAuthStateChanged, signInWithPopup, signInWithCredential, signOut, User, signInWithEmailAndPassword, GoogleAuthProvider } from 'firebase/auth';
-import { Capacitor, registerPlugin } from '@capacitor/core';
-
-// Thin custom-plugin binding — see android/.../ReceiptPrinterPlugin.java. No npm package for
-// this one; it's registered by name only, matching the @CapacitorPlugin("ReceiptPrinter")
-// annotation on the native side.
-const ReceiptPrinter = registerPlugin<{ print(options: { html: string; jobName?: string }): Promise<{ value: boolean }> }>('ReceiptPrinter');
-
-// Direct ESC/POS printing for Bluetooth thermal printers (e.g. MERION PT-B1) that don't
-// implement Android's Print Framework and so never show up in ReceiptPrinter's system dialog —
-// see android/.../BluetoothPrinterPlugin.java and src/lib/escpos.ts.
-interface BluetoothPrinterDevice { name: string; address: string; }
-const BluetoothPrinter = registerPlugin<{
-  listPairedDevices(): Promise<{ devices: BluetoothPrinterDevice[] }>;
-  printEscPos(options: { address: string; data: string }): Promise<{ value: boolean }>;
-}>('BluetoothPrinter');
+import { Capacitor } from '@capacitor/core';
+import { BluetoothPrinter, ReceiptPrinter, type BluetoothPrinterDevice } from './lib/nativePlugins';
 import { buildReceiptEscPos, buildTestPrint, buildTransferEscPos, uint8ToBase64, columnsForPaperWidth } from './lib/escpos';
 import { isWebUsbSupported, requestUsbPrinter, getPairedUsbPrinters, printUsb } from './lib/webUsbPrinter';
 import { isWebBluetoothSupported, requestBluetoothPrinter, printBluetooth } from './lib/webBluetoothPrinter';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
+import { Network } from '@capacitor/network';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
+import {
+  CashRegisterClosedError,
+  StockUnavailableError,
+  describeCheckoutError,
+  getDayRange,
+  getMonthRange,
+  getRecordDayKey,
+  getRecordMonthKey,
+  resolveActiveBranchId,
+  safeLocalStorageRemove,
+  safeLocalStorageSet,
+} from './lib/posSafety';
+import { createDocumentId } from './lib/ids';
+import { hasAppPermission } from './lib/permissions';
 
 const isNativePlatform = Capacitor.isNativePlatform();
 
@@ -111,11 +110,12 @@ import {
   writeBatch,
   getDoc,
   updateDoc,
-  increment,
-  arrayUnion,
   runTransaction,
   query,
-  where
+  where,
+  orderBy,
+  limit,
+  getDocFromServer,
 } from 'firebase/firestore';
 
 // Custom Tenant Components
@@ -202,19 +202,38 @@ interface Sale {
   employeeName?: string; // Who rang up the sale (owner, encargado, or cajero) — "Atendido por"
 }
 
+type CashTransactionType = 'Ingreso' | 'Egreso' | 'Venta' | 'Transferencia' | 'Apertura' | 'Cierre';
+
+interface CashTransaction {
+  id?: string;
+  type: CashTransactionType;
+  amount: number;
+  cashDelta?: number;
+  description: string;
+  time: string;
+  timestamp?: string;
+  createdAt?: number;
+  branchId?: string;
+  shiftId?: string;
+  saleId?: string;
+  paymentMethod?: Sale['paymentMethod'];
+  createdBy?: string;
+  balanceAfter?: number;
+}
+
 interface CashRegister {
   isOpen: boolean;
   initialCash: number;
   currentCash: number;
-  transactions: {
-    type: 'Ingreso' | 'Egreso' | 'Venta' | 'Transferencia';
-    amount: number;
-    description: string;
-    time: string;
-    createdAt?: number; // epoch ms — lets the monthly PDF filter movements by period
-    branchId?: string; // Associated Branch/Office
-  }[];
+  // Read-only compatibility with register documents created before the append-only ledger.
+  // New code never appends to or clears this field.
+  transactions: CashTransaction[];
   lastOperationalDate?: string; // e.g. '2026-05-20'
+  currentShiftId?: string;
+  openedAt?: number;
+  closedAt?: number;
+  lastTransactionId?: string;
+  updatedAt?: number;
 }
 
 interface Branch {
@@ -254,12 +273,12 @@ interface StockMovement {
 // general error log, NOT surfaced in any UI screen, and NOT a substitute for the Sale record
 // itself — it only has to prove an attempt happened and how it ended.
 type CheckoutEventStatus =
-  | 'started'                  // save attempt kicked off (saveAllData called)
-  | 'success'                  // saveAllData settled with no rejection before the 4s cutoff
-  | 'failed'                   // saveAllData rejected before the 4s cutoff (session/permission/data error)
-  | 'offline_queued'           // still pending after the 4s cutoff — parked by Firestore, not yet known-good/bad
-  | 'offline_resolved_success' // a previously offline_queued attempt later resolved with no rejection
-  | 'offline_resolved_failed'; // a previously offline_queued attempt later resolved WITH a rejection
+  | 'started'                  // save attempt began after local validation
+  | 'success'                  // sale and every dependent write committed atomically
+  | 'failed'                   // atomic transaction rejected; no sale-side state was committed
+  | 'offline_queued'           // read-only compatibility with historical diagnostic events
+  | 'offline_resolved_success' // read-only compatibility with historical diagnostic events
+  | 'offline_resolved_failed'; // read-only compatibility with historical diagnostic events
 
 interface CheckoutEvent {
   id: string;
@@ -314,6 +333,7 @@ interface Member {
   role: 'owner' | 'master_admin' | 'admin' | 'employee';
   joinedAt?: string;
   assignedBranchId?: string;
+  permissions?: string[];
 }
 
 // Stock is per-branch: `branchStocks[branchId]` is the only real source of truth. The
@@ -390,16 +410,12 @@ export const getCurrentMonthKey = (): string => {
 // available; falls back to parsing the legacy `timestamp` display string (best-effort,
 // only affects sales recorded before `createdAt` was introduced).
 export const getSaleMonthKey = (sale: Sale): string => {
-  const ms = sale.createdAt ?? Date.parse(sale.timestamp);
-  const d = isNaN(ms) ? new Date() : new Date(ms);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  return getRecordMonthKey(sale);
 };
 
 // Same idea as getSaleMonthKey, but a "YYYY-MM-DD" bucket for the daily cut (Corte Diario).
 export const getSaleDayKey = (sale: Sale): string => {
-  const ms = sale.createdAt ?? Date.parse(sale.timestamp);
-  const d = isNaN(ms) ? new Date() : new Date(ms);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return getRecordDayKey(sale);
 };
 
 // Same "YYYY-MM-DD" bucketing as getSaleDayKey, but for a raw epoch-ms timestamp — used to
@@ -419,7 +435,10 @@ export const getMonthLabel = (monthKey: string): string => {
 // always including the current month even if it has no sales yet.
 export const getAvailableMonths = (allSales: Sale[]): string[] => {
   const keys = new Set<string>([getCurrentMonthKey()]);
-  allSales.forEach(s => keys.add(getSaleMonthKey(s)));
+  allSales.forEach(s => {
+    const key = getSaleMonthKey(s);
+    if (key) keys.add(key);
+  });
   return Array.from(keys).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
 };
 
@@ -454,8 +473,8 @@ export default function App() {
   });
   const saveBluetoothPrinter = (device: BluetoothPrinterDevice | null) => {
     setBluetoothPrinter(device);
-    if (device) localStorage.setItem('logicpos_bt_printer', JSON.stringify(device));
-    else localStorage.removeItem('logicpos_bt_printer');
+    if (device) safeLocalStorageSet('logicpos_bt_printer', JSON.stringify(device));
+    else safeLocalStorageRemove('logicpos_bt_printer');
   };
   const handleScanBluetoothPrinters = async (): Promise<BluetoothPrinterDevice[]> => {
     const { devices } = await BluetoothPrinter.listPairedDevices();
@@ -501,7 +520,7 @@ export default function App() {
     setWebBluetoothDevice(null);
     const info = { mode: 'usb' as const, name: device.productName || 'Impresora USB' };
     setWebPrinterInfo(info);
-    localStorage.setItem('logicpos_web_printer_info', JSON.stringify(info));
+    safeLocalStorageSet('logicpos_web_printer_info', JSON.stringify(info));
   };
 
   const handleConnectWebBluetoothPrinter = async () => {
@@ -510,14 +529,14 @@ export default function App() {
     setWebUsbDevice(null);
     const info = { mode: 'bluetooth' as const, name: device.name || 'Impresora Bluetooth' };
     setWebPrinterInfo(info);
-    localStorage.setItem('logicpos_web_printer_info', JSON.stringify(info));
+    safeLocalStorageSet('logicpos_web_printer_info', JSON.stringify(info));
   };
 
   const handleForgetWebPrinter = () => {
     setWebUsbDevice(null);
     setWebBluetoothDevice(null);
     setWebPrinterInfo(null);
-    localStorage.removeItem('logicpos_web_printer_info');
+    safeLocalStorageRemove('logicpos_web_printer_info');
   };
 
   const handleTestPrintWeb = async () => {
@@ -814,6 +833,7 @@ export default function App() {
   // the checkout path, which would add a network round trip to every single sale — catches
   // that before the next sale is rung up instead of after it silently fails to save.
   const [sessionExpired, setSessionExpired] = useState(false);
+  const [firestoreConnectionState, setFirestoreConnectionState] = useState<'checking' | 'ready' | 'offline' | 'error'>('checking');
   const [folioNumber, setFolioNumber] = useState('');
 
   // Hard States
@@ -837,11 +857,24 @@ export default function App() {
 
   
   const [cashRegister, setCashRegister] = useState<CashRegister>({
-    isOpen: true,
-    initialCash: 2000,
-    currentCash: 2000,
-    transactions: [{ type: 'Ingreso', amount: 2000, description: 'Apertura de Caja', time: new Date().toLocaleTimeString() }]
+    isOpen: false,
+    initialCash: 0,
+    currentCash: 0,
+    transactions: []
   });
+  const [cashTransactions, setCashTransactions] = useState<CashTransaction[]>([]);
+  const [legacyCashTransactions, setLegacyCashTransactions] = useState<CashTransaction[]>([]);
+  const allCashTransactions = useMemo(() => {
+    const merged = new Map<string, CashTransaction>();
+    [...legacyCashTransactions, ...cashTransactions].forEach((entry, index) => {
+      const legacyIndex = index < legacyCashTransactions.length ? index : -1;
+      const key = entry.id || (entry.createdAt !== undefined && legacyIndex >= 0
+        ? `LEGACY-${entry.createdAt}-${legacyIndex}`
+        : `legacy-undated-${entry.type}-${entry.amount}-${entry.description}-${index}`);
+      merged.set(key, entry);
+    });
+    return Array.from(merged.values()).sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+  }, [legacyCashTransactions, cashTransactions]);
 
   // What the various cash-register widgets show — once the turno is closed, `currentCash`
   // still holds the real closing balance for audit/history purposes, but showing that number
@@ -881,6 +914,25 @@ export default function App() {
   // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
   // that change takes effect here automatically since currentUserMember is a live listener.
   const isBranchLocked = activeCompanyRole === 'employee' || activeCompanyRole === 'admin';
+  const canViewSalesHistory = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'sales_history');
+  const canEditProducts = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'products_edit');
+  const canTransferStock = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'stock_transfer');
+  const canManageSuppliers = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'suppliers_restock');
+  const canCloseCash = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'cash_close');
+  const canApplyDiscount = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'apply_discount');
+
+  useEffect(() => {
+    const lacksSelectedModule =
+      ((activeTab === 'history' || activeTab === 'analytics') && !canViewSalesHistory)
+      || (activeTab === 'branches' && !isOwnerOrAdminRole)
+      || (activeTab === 'suppliers' && !canManageSuppliers)
+      || (activeTab === 'invoicing' && !isOwnerOrAdminRole);
+    if (lacksSelectedModule) setActiveTab('pos');
+  }, [activeTab, canManageSuppliers, canViewSalesHistory, isOwnerOrAdminRole]);
+
+  useEffect(() => {
+    if (!canApplyDiscount) setDiscountVal(0);
+  }, [canApplyDiscount]);
   // True while a branch-locked employee/admin's real assigned branch hasn't been confirmed
   // yet from companies/{id}/members/{uid} — gates the whole POS (see the waiting screen near
   // the bottom of this component) so a sale/stock/cash entry can never be filed under a stale
@@ -910,12 +962,12 @@ export default function App() {
     if (!user) return;
 
     try {
-      const companyId = 'comp_' + Math.floor(Math.random() * 900000 + 100000);
+      const companyId = createDocumentId('comp');
       const newCompany = {
         id: companyId,
         name: companyName,
         ownerId: user.uid,
-        invitationCode: 'INV-' + Math.floor(Math.random() * 90000 + 10000),
+        invitationCode: null,
         createdAt: new Date().toISOString()
       };
 
@@ -950,7 +1002,7 @@ export default function App() {
         activeCompanyId: companyId
       }, { merge: true });
 
-      localStorage.setItem(`logic_active_company_${user.uid}`, companyId);
+      safeLocalStorageSet(`logic_active_company_${user.uid}`, companyId);
       setActiveCompanyId(companyId);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `companies_creation`);
@@ -1016,7 +1068,7 @@ export default function App() {
     // Custom Categories
     if (Array.isArray(backupData.customCategories)) {
       onProgress("Restaurando categorías personalizadas...");
-      localStorage.setItem('logic_custom_categories', JSON.stringify(backupData.customCategories));
+      safeLocalStorageSet('logic_custom_categories', JSON.stringify(backupData.customCategories));
       setCustomCategories(backupData.customCategories);
     }
 
@@ -1053,11 +1105,23 @@ export default function App() {
       const compName = inviteData.companyName || "Empresa Invitada";
       const userRole = inviteData.role || "employee";
       const usageType = inviteData.usageType || 'multiple';
+      const expiresAtMs = typeof inviteData.expiresAt?.toMillis === 'function'
+        ? inviteData.expiresAt.toMillis()
+        : 0;
+      if (!expiresAtMs || expiresAtMs <= Date.now()) {
+        alert('Este código de invitación ya expiró. Solicita uno nuevo al propietario.');
+        return;
+      }
 
-      // Write user as employee member of company subcollection
-      // `inviteCode` lets Firestore rules verify this join is backed by a real,
-      // company-matching invitation (see firestore.rules: members.create)
-      await setDoc(doc(db, 'companies', compId, 'members', user.uid), {
+      const memberRef = doc(db, 'companies', compId, 'members', user.uid);
+      const userRef = doc(db, 'users', user.uid);
+      const inviteRef = doc(db, 'invitationCodes', cleanCode);
+      const companyRef = doc(db, 'companies', compId);
+      const joinBatch = writeBatch(db);
+
+      // Membership, user profile and single-use consumption are one atomic request. A
+      // single-use code can therefore never admit two users through a delete race.
+      joinBatch.set(memberRef, {
         userId: user.uid,
         name: user.displayName || 'Empleado',
         email: user.email || '',
@@ -1076,24 +1140,18 @@ export default function App() {
         }
       };
 
-      await setDoc(doc(db, 'users', user.uid), {
+      joinBatch.set(userRef, {
         companies: updatedCompanies,
         activeCompanyId: compId
       }, { merge: true });
 
-      // If single use, delete invitation record from Firestore
       if (usageType === 'single') {
-        try {
-          await deleteDoc(doc(db, 'invitationCodes', cleanCode));
-          await updateDoc(doc(db, 'companies', compId), {
-            invitationCode: null
-          });
-        } catch (errDelete) {
-          console.warn("Could not auto-delete single use invite code:", errDelete);
-        }
+        joinBatch.delete(inviteRef);
+        joinBatch.update(companyRef, { invitationCode: null });
       }
+      await joinBatch.commit();
 
-      localStorage.setItem(`logic_active_company_${user.uid}`, compId);
+      safeLocalStorageSet(`logic_active_company_${user.uid}`, compId);
       setActiveCompanyId(compId);
       alert(`Te has unido exitosamente a "${compName}" con rol de ${userRole === 'admin' ? 'Administrador' : 'Empleado'}.${usageType === 'single' ? ' (El enlace temporal de un solo uso fue desactivado)' : ''}`);
     } catch (err) {
@@ -1144,7 +1202,7 @@ export default function App() {
       });
 
       // Clear local storage key choice
-      localStorage.removeItem(`logic_active_company_${user.uid}`);
+      safeLocalStorageRemove(`logic_active_company_${user.uid}`);
       if (activeCompanyId === companyId) {
         setActiveCompanyId(null);
       }
@@ -1192,50 +1250,82 @@ export default function App() {
     };
   }, [user]);
 
-  // Global safety net for writes that nobody is awaiting. Most of the app's save paths
-  // (product/branch/supplier/customer edits, restocks, refunds, credit payments...) call the
-  // shared helpers fire-and-forget, so a failure — including the SessionInvalidError those
-  // helpers now throw — would otherwise surface only as an "Uncaught (in promise)" line in
-  // devtools that no cashier will ever see. Bursts are coalesced into ONE alert (a refund
-  // alone fires four writes back to back) instead of stacking dialogs to dismiss one by one.
+  // Capacitor's Network status is only a signal that a transport exists. Firestore is marked
+  // ready only after an explicit server read succeeds, which covers stale sockets after Android
+  // background/resume without calling a slow request "offline" after an arbitrary timeout.
   useEffect(() => {
-    let pendingReasons: unknown[] = [];
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    if (!user || !activeCompanyId) {
+      setFirestoreConnectionState('checking');
+      return;
+    }
 
-    const flush = () => {
-      const reasons = pendingReasons;
-      pendingReasons = [];
-      flushTimer = null;
-      if (reasons.length === 0) return;
+    let disposed = false;
+    let removeNetworkListener: (() => Promise<void>) | undefined;
+    let probeTimer: ReturnType<typeof setTimeout> | null = null;
+    let probeInFlight = false;
+    const compId = activeCompanyId;
 
-      if (reasons.some(isSessionInvalidError)) {
-        alert(
-          'Tu sesión no está activa o no se pudo confirmar tu empresa.\n\n' +
-          'Uno o más cambios NO se guardaron en la nube (solo quedaron en este dispositivo). ' +
-          'Cierra sesión y vuelve a entrar antes de seguir vendiendo.'
+    const probeFirestore = async () => {
+      if (disposed || probeInFlight) return;
+      probeInFlight = true;
+      setFirestoreConnectionState('checking');
+      try {
+        // Firestore enables and restores its transport automatically. Calling enableNetwork()
+        // while the application's snapshot listeners are being registered can race their ADD/
+        // REMOVE target acknowledgements and crash the SDK with assertion ca9 (target count -1).
+        await getDocFromServer(doc(db, 'companies', compId));
+        if (!disposed) setFirestoreConnectionState('ready');
+      } catch (error: any) {
+        if (disposed) return;
+        const code = String(error?.code || '').replace(/^firestore\//, '');
+        setFirestoreConnectionState(
+          code === 'unavailable' || code === 'deadline-exceeded' || code === 'cancelled'
+            ? 'offline'
+            : 'error'
         );
-      } else if (reasons.length === 1) {
-        alert('Ocurrió un problema al comunicarse con la nube. Verifica tu conexión e inténtalo de nuevo.');
-      } else {
-        alert(`Ocurrieron ${reasons.length} problemas al comunicarse con la nube. Verifica tu conexión e inténtalo de nuevo.`);
+      } finally {
+        probeInFlight = false;
       }
     };
 
-    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
-      // Deliberately not calling preventDefault(): the browser's own console warning stays,
-      // this only ADDS a user-visible signal on top of it.
-      console.error('Unhandled promise rejection:', event.reason);
-      pendingReasons.push(event.reason);
-      if (flushTimer) clearTimeout(flushTimer);
-      flushTimer = setTimeout(flush, 300);
+    const scheduleProbe = () => {
+      if (probeTimer) clearTimeout(probeTimer);
+      // Let the main real-time listeners finish registering before adding the one-shot
+      // server probe, and collapse duplicate initial Capacitor network notifications.
+      probeTimer = setTimeout(() => {
+        probeTimer = null;
+        void probeFirestore();
+      }, 750);
     };
 
-    window.addEventListener('unhandledrejection', onUnhandledRejection);
-    return () => {
-      window.removeEventListener('unhandledrejection', onUnhandledRejection);
-      if (flushTimer) clearTimeout(flushTimer);
+    const applyNetworkSignal = (connected: boolean) => {
+      if (!connected) {
+        if (probeTimer) clearTimeout(probeTimer);
+        probeTimer = null;
+        setFirestoreConnectionState('offline');
+      } else {
+        scheduleProbe();
+      }
     };
-  }, []);
+
+    void Network.getStatus()
+      .then(status => applyNetworkSignal(status.connected))
+      .catch(() => void probeFirestore());
+    void Network.addListener('networkStatusChange', status => applyNetworkSignal(status.connected))
+      .then(handle => { removeNetworkListener = () => handle.remove(); });
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) scheduleProbe();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      disposed = true;
+      if (probeTimer) clearTimeout(probeTimer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (removeNetworkListener) void removeNetworkListener();
+    };
+  }, [user, activeCompanyId]);
 
   // Listen for direct URL invitation links (e.g. ?invite=INV-XXXXX)
   useEffect(() => {
@@ -1434,10 +1524,21 @@ export default function App() {
     if (isBranchLocked && currentUserMember?.assignedBranchId) {
       if (selectedBranchId !== currentUserMember.assignedBranchId) {
         setSelectedBranchId(currentUserMember.assignedBranchId);
-        localStorage.setItem(`logic_active_branch_${user.uid}`, currentUserMember.assignedBranchId);
+        safeLocalStorageSet(`logic_active_branch_${user.uid}`, currentUserMember.assignedBranchId);
       }
     }
   }, [currentUserMember, isBranchLocked, selectedBranchId, activeCompanyId, user]);
+
+  // Owners can retain a legacy/deleted branch ID in localStorage. A native <select> then
+  // displays its first option even though React state still contains the missing ID, making
+  // the header look correct while POS stock and cash are read from a nonexistent branch.
+  useEffect(() => {
+    if (!user || !activeCompanyId || isBranchLocked || branches.length === 0) return;
+    const resolvedBranchId = resolveActiveBranchId(selectedBranchId, branches.map(branch => branch.id));
+    if (!resolvedBranchId || resolvedBranchId === selectedBranchId) return;
+    setSelectedBranchId(resolvedBranchId);
+    safeLocalStorageSet(`logic_active_branch_${user.uid}`, resolvedBranchId);
+  }, [branches, selectedBranchId, isBranchLocked, activeCompanyId, user]);
 
   // Safety valve for the branch-sync gate above: if companies/{id}/members/{uid} never
   // resolves (permission error, offline, etc. — see the onSnapshot error handler above,
@@ -1583,24 +1684,53 @@ export default function App() {
     if (!user || !activeCompanyId || !selectedBranchId) return;
     const compId = activeCompanyId;
     const branchId = selectedBranchId;
+    const currentMonthRange = getMonthRange(getCurrentMonthKey());
+
+    setCashTransactions([]);
+    setLegacyCashTransactions([]);
 
     const unsubCash = onSnapshot(doc(db, 'companies', compId, 'cashRegisters', branchId), (snapshot) => {
       if (snapshot.exists()) {
         // Defaults first, then the doc's own fields — a register doc can exist with only
         // currentCash/transactions if it was auto-created by a sale/transfer delta before
         // anyone ever pressed "abrir caja" (isOpen/initialCash would otherwise be missing).
-        setCashRegister({ isOpen: false, initialCash: 0, currentCash: 0, transactions: [], ...snapshot.data() } as CashRegister);
+        const data = snapshot.data() as Partial<CashRegister>;
+        setLegacyCashTransactions(Array.isArray(data.transactions) ? data.transactions : []);
+        setCashRegister({ isOpen: false, initialCash: 0, currentCash: 0, ...data, transactions: [] } as CashRegister);
       } else {
         // No register doc yet for this branch (brand-new branch, never opened) — show a
         // clean closed state instead of leaking whatever the previous branch had cached.
         setCashRegister({ isOpen: false, initialCash: 0, currentCash: 0, transactions: [] });
+        setLegacyCashTransactions([]);
       }
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, `companies/${compId}/cashRegisters/${branchId}`);
     });
 
-    return () => unsubCash();
-  }, [user, activeCompanyId, selectedBranchId]);
+    let unsubCashTransactions = () => {};
+    if (canViewSalesHistory) {
+      const cashLedgerQuery = currentMonthRange
+        ? query(
+            collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'),
+            where('createdAt', '>=', currentMonthRange.start),
+            orderBy('createdAt', 'desc'),
+            limit(2000)
+          )
+        : query(collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'), limit(2000));
+      unsubCashTransactions = onSnapshot(cashLedgerQuery, (snapshot) => {
+        const list: CashTransaction[] = [];
+        snapshot.forEach(entry => list.push({ id: entry.id, ...entry.data() } as CashTransaction));
+        setCashTransactions(list);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, `companies/${compId}/cashRegisters/${branchId}/transactions`);
+      });
+    }
+
+    return () => {
+      unsubCash();
+      unsubCashTransactions();
+    };
+  }, [user, activeCompanyId, selectedBranchId, canViewSalesHistory]);
 
   // Sales and stock movements are the two largest, fastest-growing collections in the
   // company, so — like cashRegister above — they're scoped to the active branch's own
@@ -1611,12 +1741,27 @@ export default function App() {
   // Facturación, and reprinting a transfer from the receiving branch) fetch those separately
   // with a one-off getDocs query instead of depending on this live, branch-scoped stream.
   useEffect(() => {
-    if (!user || !activeCompanyId || !selectedBranchId) return;
+    if (!user || !activeCompanyId || !selectedBranchId || !canViewSalesHistory) {
+      setSales([]);
+      setStockMovements([]);
+      return;
+    }
     const compId = activeCompanyId;
     const branchId = selectedBranchId;
+    const currentMonthRange = getMonthRange(getCurrentMonthKey());
+    if (!currentMonthRange) return;
+
+    setSales([]);
+    setStockMovements([]);
 
     const unsubSales = onSnapshot(
-      query(collection(db, 'companies', compId, 'sales'), where('branchId', '==', branchId)),
+      query(
+        collection(db, 'companies', compId, 'sales'),
+        where('branchId', '==', branchId),
+        where('createdAt', '>=', currentMonthRange.start),
+        orderBy('createdAt', 'desc'),
+        limit(2000)
+      ),
       (snapshot) => {
         const list: Sale[] = [];
         snapshot.forEach(d => list.push(d.data() as Sale));
@@ -1632,7 +1777,13 @@ export default function App() {
     );
 
     const unsubStockMovements = onSnapshot(
-      query(collection(db, 'companies', compId, 'stockMovements'), where('branchId', '==', branchId)),
+      query(
+        collection(db, 'companies', compId, 'stockMovements'),
+        where('branchId', '==', branchId),
+        where('createdAt', '>=', currentMonthRange.start),
+        orderBy('createdAt', 'desc'),
+        limit(2000)
+      ),
       (snapshot) => {
         const list: StockMovement[] = [];
         snapshot.forEach(d => list.push(d.data() as StockMovement));
@@ -1647,7 +1798,7 @@ export default function App() {
       unsubSales();
       unsubStockMovements();
     };
-  }, [user, activeCompanyId, selectedBranchId]);
+  }, [user, activeCompanyId, selectedBranchId, canViewSalesHistory]);
 
   const getTodayDateString = () => {
     const d = new Date();
@@ -1663,7 +1814,6 @@ export default function App() {
       if (!cashRegister.lastOperationalDate) {
         const updated = { ...cashRegister, lastOperationalDate: todayStr };
         setCashRegister(updated);
-        localStorage.setItem('logic_cash', JSON.stringify(updated));
       } else if (cashRegister.lastOperationalDate !== todayStr) {
         setWarningOperationalDate(cashRegister.lastOperationalDate);
         setShowOvernightWarning(true);
@@ -1677,22 +1827,45 @@ export default function App() {
     }
   }, [cashRegister?.isOpen]);
 
-  // Opening/closing the register is a deliberate single-actor action (not a concurrent
-  // delta like a sale), so it writes the whole branch-scoped doc directly instead of
-  // going through applyCashDelta's increment/arrayUnion.
-  const writeCashRegisterForBranch = async (branchId: string, newCash: CashRegister) => {
-    setCashRegister(newCash);
-    localStorage.setItem('logic_cash', JSON.stringify(newCash));
-    if (user && activeCompanyId) {
-      try {
-        await setDoc(doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId), sanitize(newCash));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, `companies/${activeCompanyId}/cashRegisters/${branchId}`);
-      }
-    }
+  // Register state and its append-only ledger entry are committed in one batch. The legacy
+  // `transactions` array is deliberately omitted so opening a new shift neither deletes old
+  // history nor makes the register document grow forever.
+  const writeCashRegisterForBranch = async (
+    branchId: string,
+    newCash: CashRegister,
+    entry: CashTransaction
+  ) => {
+    if (!user || !activeCompanyId) throw new SessionInvalidError('writeCashRegisterForBranch: sesión inválida');
+    const now = entry.createdAt ?? Date.now();
+    const transactionId = entry.id || `CT-${now}-${crypto.randomUUID()}`;
+    const fullEntry: CashTransaction = {
+      ...entry,
+      id: transactionId,
+      branchId,
+      createdAt: now,
+      timestamp: entry.timestamp || new Date(now).toISOString(),
+      createdBy: user.uid,
+    };
+    const { transactions: _legacyTransactions, ...registerState } = newCash;
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId), sanitize({
+      ...registerState,
+      lastTransactionId: transactionId,
+      updatedAt: now,
+    }), { merge: true });
+    batch.set(
+      doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId, 'transactions', transactionId),
+      sanitize(fullEntry)
+    );
+    await batch.commit();
+    setCashRegister({ ...newCash, transactions: [] });
   };
 
-  const handleCloseCaja = (realCashValue: number) => {
+  const handleCloseCaja = async (realCashValue: number) => {
+    if (!canCloseCash) {
+      alert('Tu cuenta no tiene permiso para cerrar la caja.');
+      return;
+    }
     const expected = cashRegister.currentCash;
     const diff = realCashValue - expected;
     const diffText = diff === 0
@@ -1701,48 +1874,70 @@ export default function App() {
         ? `Sobrante de ${formatMXN(diff)}`
         : `Faltante de ${formatMXN(Math.abs(diff))}`;
 
-    const newTx = {
-      type: 'Egreso' as const,
+    const now = Date.now();
+    const newTx: CashTransaction = {
+      type: 'Cierre',
       amount: Math.abs(diff),
+      cashDelta: diff,
       description: `Cierre de Caja - Real: ${formatMXN(realCashValue)} | Esp: ${formatMXN(expected)} (${diffText})`,
       time: new Date().toLocaleTimeString(),
-      createdAt: Date.now()
+      createdAt: now,
+      shiftId: cashRegister.currentShiftId,
+      balanceAfter: realCashValue,
     };
 
     const closedCash: CashRegister = {
       ...cashRegister,
       isOpen: false,
       currentCash: realCashValue,
-      transactions: [...cashRegister.transactions, newTx]
+      closedAt: now,
+      transactions: []
     };
 
-    writeCashRegisterForBranch(selectedBranchId, closedCash);
-    setShowOvernightWarning(false);
-    setIsCorteModalOpen(false);
-    alert(`¡Caja cerrada correctamente! Total esperado: ${formatMXN(expected)} | Físico: ${formatMXN(realCashValue)} (${diffText}).`);
-
-    setIsOpeningCajaModalOpen(true);
+    try {
+      await writeCashRegisterForBranch(selectedBranchId, closedCash, newTx);
+      setShowOvernightWarning(false);
+      setIsCorteModalOpen(false);
+      alert(`¡Caja cerrada correctamente! Total esperado: ${formatMXN(expected)} | Físico: ${formatMXN(realCashValue)} (${diffText}).`);
+      setIsOpeningCajaModalOpen(true);
+    } catch (error) {
+      console.error('Error closing cash register:', error);
+      alert('No se pudo confirmar el cierre de caja. La caja permanece abierta; intenta nuevamente.');
+    }
   };
 
-  const handleOpenCaja = (initialCashValue: number) => {
+  const handleOpenCaja = async (initialCashValue: number) => {
     const todayStr = getTodayDateString();
+    const now = Date.now();
+    const shiftId = `SHIFT-${now}-${crypto.randomUUID()}`;
     const newCash: CashRegister = {
       isOpen: true,
       initialCash: initialCashValue,
       currentCash: initialCashValue,
       lastOperationalDate: todayStr,
-      transactions: [{
-        type: 'Ingreso',
-        amount: initialCashValue,
-        description: `Apertura de Caja - Saldo Inicial: ${formatMXN(initialCashValue)}`,
-        time: new Date().toLocaleTimeString(),
-        createdAt: Date.now()
-      }]
+      currentShiftId: shiftId,
+      openedAt: now,
+      closedAt: undefined,
+      transactions: []
     };
 
-    writeCashRegisterForBranch(selectedBranchId, newCash);
-    setIsOpeningCajaModalOpen(false);
-    alert(`¡Caja abierta correctamente con un saldo inicial de ${formatMXN(initialCashValue)}!`);
+    try {
+      await writeCashRegisterForBranch(selectedBranchId, newCash, {
+        type: 'Apertura',
+        amount: initialCashValue,
+        cashDelta: initialCashValue,
+        description: `Apertura de Caja - Saldo Inicial: ${formatMXN(initialCashValue)}`,
+        time: new Date().toLocaleTimeString(),
+        createdAt: now,
+        shiftId,
+        balanceAfter: initialCashValue,
+      });
+      setIsOpeningCajaModalOpen(false);
+      alert(`¡Caja abierta correctamente con un saldo inicial de ${formatMXN(initialCashValue)}!`);
+    } catch (error) {
+      console.error('Error opening cash register:', error);
+      alert('No se pudo confirmar la apertura de caja. Intenta nuevamente antes de cobrar.');
+    }
   };
 
   // Synchronize state functions across Cache & Firestore Cloud
@@ -1775,27 +1970,17 @@ export default function App() {
     setBranches(newBranches);
     setSuppliers(newSuppliers);
 
-    // 2. Offline persistent local state fallback storage
-    localStorage.setItem('logic_products', JSON.stringify(newProds));
-    localStorage.setItem('logic_customers', JSON.stringify(newCusts));
-    localStorage.setItem('logic_sales', JSON.stringify(newSales));
-    localStorage.setItem('logic_cash', JSON.stringify(newCash));
-    localStorage.setItem('logic_branches', JSON.stringify(newBranches));
-    localStorage.setItem('logic_suppliers', JSON.stringify(newSuppliers));
-
-    // 3. Save directly to Cloud if logged into Firebase Auth — only the docs that changed
+    // Firestore's persistent IndexedDB cache is the offline cache. Do not duplicate whole
+    // catalogues or sales history in localStorage; quota failures must not precede cloud writes.
     if (user && activeCompanyId) {
       const compId = activeCompanyId;
       try {
-        const batch = writeBatch(db);
-        let opCount = 0;
-
+        const writes: { col: string; item: { id: string } }[] = [];
         const diffInto = (prevArr: { id: string }[], nextArr: { id: string }[], col: string) => {
           const prevById = new Map(prevArr.map(item => [item.id, item]));
           nextArr.forEach(item => {
             if (prevById.get(item.id) !== item) {
-              batch.set(doc(db, 'companies', compId, col, item.id), sanitize(item));
-              opCount++;
+              writes.push({ col, item });
             }
           });
         };
@@ -1810,11 +1995,15 @@ export default function App() {
         // branch (companies/{id}/cashRegisters/{branchId}) and goes through either
         // applyCashDelta() (atomic deltas) or writeCashRegisterForBranch() (open/close).
 
-        if (opCount > 0) {
+        for (let index = 0; index < writes.length; index += 400) {
+          const batch = writeBatch(db);
+          writes.slice(index, index + 400).forEach(({ col, item }) => {
+            batch.set(doc(db, 'companies', compId, col, item.id), sanitize(item));
+          });
           await batch.commit();
         }
       } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, `companies/${compId}/batch_sync`);
+        throw handleFirestoreError(err, OperationType.WRITE, `companies/${compId}/batch_sync`);
       }
     } else {
       // Steps 1-2 above already ran unconditionally, so a caller that genuinely wants a
@@ -1826,56 +2015,102 @@ export default function App() {
     }
   };
 
-  // Atomically applies a delta to a branch's cash register (currentCash + appended
-  // transaction log entries) via Firestore's increment()/arrayUnion() field transforms.
-  // Unlike saveAllData's overwrite, this is safe when multiple terminals post to the same
-  // `cashRegisters/{branchId}` doc at the same time: each caller only describes the change
-  // IT is contributing, so concurrent writers can never silently clobber each other's
-  // totals. Uses setDoc+merge (not updateDoc) so it also works as an upsert — a branch
-  // that has never had its register opened yet still gets a doc instead of erroring.
+  // Atomically applies a cash delta and appends ledger documents without growing the register
+  // document. Checkout uses the stronger all-in-one transaction below; this helper is for
+  // manual cash flows, restocks, balance payments, refunds, and transfers.
   const applyCashDelta = async (branchId: string, amountDelta: number, txEntries: CashRegister['transactions']) => {
     // No branch selected is a caller-side "nothing to do", not a broken session.
     if (!branchId) return;
+    if (txEntries.length !== 1) throw new Error('Cada cambio de caja debe corresponder a un solo movimiento de ledger.');
     if (!user || !activeCompanyId) {
       throw new SessionInvalidError('applyCashDelta: sesión o empresa activa inválida');
     }
 
-    // Optimistic local update, mirroring writeCashRegisterForBranch's pattern (abrir/cerrar
-    // caja already feels instant because of this) — only when the delta is for the branch
-    // currently on screen: applyCashDelta is also used for refunds of sales made at a
-    // *different* branch (sale.branchId), and touching `cashRegister` for a branch that
-    // isn't selectedBranchId would show the wrong branch's numbers. The onSnapshot listener's
-    // later authoritative read fully replaces this state, so there's no double-counting risk.
-    if (branchId === selectedBranchId) {
-      setCashRegister(prev => ({
-        ...prev,
-        currentCash: prev.currentCash + amountDelta,
-        transactions: [...prev.transactions, ...txEntries],
-      }));
-    }
-
     try {
-      await setDoc(doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId), {
-        currentCash: increment(amountDelta),
-        transactions: arrayUnion(...txEntries.map(sanitize))
-      }, { merge: true });
+      const now = Date.now();
+      const normalizedEntries = txEntries.map((entry, index): CashTransaction => ({
+        ...entry,
+        id: entry.id || `CT-${now}-${index}-${crypto.randomUUID()}`,
+        branchId,
+        createdAt: entry.createdAt ?? now,
+        timestamp: entry.timestamp || new Date(entry.createdAt ?? now).toISOString(),
+        createdBy: user.uid,
+        shiftId: entry.shiftId || (branchId === selectedBranchId ? cashRegister.currentShiftId : undefined),
+        cashDelta: entry.cashDelta ?? (index === txEntries.length - 1 ? amountDelta : 0),
+      }));
+      const lastEntry = normalizedEntries[normalizedEntries.length - 1];
+      const registerRef = doc(db, 'companies', activeCompanyId, 'cashRegisters', branchId);
+      await runTransaction(db, async transaction => {
+        const registerSnapshot = await transaction.get(registerRef);
+        if (!registerSnapshot.exists() || !(registerSnapshot.data() as CashRegister).isOpen) {
+          throw new CashRegisterClosedError();
+        }
+        const register = registerSnapshot.data() as CashRegister;
+        const nextCash = register.currentCash + amountDelta;
+        transaction.update(registerRef, {
+          currentCash: nextCash,
+          lastTransactionId: lastEntry.id,
+          updatedAt: now,
+        });
+        normalizedEntries.forEach(entry => {
+          transaction.set(
+            doc(db, 'companies', activeCompanyId!, 'cashRegisters', branchId, 'transactions', entry.id!),
+            sanitize({ ...entry, balanceAfter: entry.id === lastEntry.id ? nextCash : undefined })
+          );
+        });
+      });
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/cashRegisters/${branchId}`);
+      throw handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/cashRegisters/${branchId}`);
     }
   };
 
-  // Atomically applies a balance delta to a single customer (credit sales / "fiado" payments)
-  const applyCustomerBalanceDelta = async (customerId: string, balanceDelta: number) => {
+  // A customer payment and its cash entry are one transaction. The amount is recalculated
+  // against the live balance so two terminals cannot both collect the same outstanding debt.
+  const applyCustomerPaymentAtomically = async (customerId: string, requestedAmount: number): Promise<number> => {
     if (!user || !activeCompanyId) {
-      throw new SessionInvalidError('applyCustomerBalanceDelta: sesión o empresa activa inválida');
+      throw new SessionInvalidError('applyCustomerPaymentAtomically: sesión o empresa activa inválida');
     }
-    try {
-      await updateDoc(doc(db, 'companies', activeCompanyId, 'customers', customerId), {
-        unpaidBalance: increment(balanceDelta)
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/customers/${customerId}`);
-    }
+    if (!selectedBranchId || requestedAmount <= 0) return 0;
+    const compId = activeCompanyId;
+    const now = Date.now();
+    const transactionId = `PAYMENT-${now}-${crypto.randomUUID()}`;
+    const customerRef = doc(db, 'companies', compId, 'customers', customerId);
+    const registerRef = doc(db, 'companies', compId, 'cashRegisters', selectedBranchId);
+    const entryRef = doc(db, 'companies', compId, 'cashRegisters', selectedBranchId, 'transactions', transactionId);
+    let appliedAmount = 0;
+
+    await runTransaction(db, async transaction => {
+      const [customerSnapshot, registerSnapshot] = await Promise.all([
+        transaction.get(customerRef),
+        transaction.get(registerRef),
+      ]);
+      if (!customerSnapshot.exists()) throw new Error('El cliente ya no existe.');
+      if (!registerSnapshot.exists() || !(registerSnapshot.data() as CashRegister).isOpen) {
+        throw new CashRegisterClosedError();
+      }
+      const customer = customerSnapshot.data() as Customer;
+      const register = registerSnapshot.data() as CashRegister;
+      appliedAmount = Math.min(Math.max(0, customer.unpaidBalance || 0), requestedAmount);
+      if (appliedAmount <= 0) return;
+      const nextCash = register.currentCash + appliedAmount;
+      transaction.update(customerRef, { unpaidBalance: Math.max(0, customer.unpaidBalance - appliedAmount) });
+      transaction.update(registerRef, { currentCash: nextCash, lastTransactionId: transactionId, updatedAt: now });
+      transaction.set(entryRef, sanitize({
+        id: transactionId,
+        type: 'Ingreso',
+        amount: appliedAmount,
+        cashDelta: appliedAmount,
+        description: `Abono "Fiado" de ${customer.name}`,
+        time: new Date(now).toLocaleTimeString(),
+        timestamp: new Date(now).toISOString(),
+        createdAt: now,
+        branchId: selectedBranchId,
+        shiftId: register.currentShiftId,
+        createdBy: user.uid,
+        balanceAfter: nextCash,
+      }));
+    });
+    return appliedAmount;
   };
 
   // Atomically applies stock deltas (global + per-branch) to one or more products in a
@@ -1884,38 +2119,70 @@ export default function App() {
   // never both succeed in selling more stock than actually exists / silently overwrite
   // each other's stock count (the failure mode of the old computed-from-stale-local-state
   // overwrite approach).
-  const applyStockDeltas = async (deltas: { productId: string; branchId: string; qtyDelta: number }[]) => {
+  const applyStockDeltas = async (
+    deltas: { productId: string; branchId: string; qtyDelta: number }[],
+    movementEntries: Omit<StockMovement, 'id' | 'timestamp' | 'createdAt' | 'userName'>[] = []
+  ) => {
     // An empty delta list is a caller-side "nothing to do", not a broken session.
     if (deltas.length === 0) return;
     if (!user || !activeCompanyId) {
       throw new SessionInvalidError('applyStockDeltas: sesión o empresa activa inválida');
     }
     const compId = activeCompanyId;
+    const now = Date.now();
+    const normalizedMovements = movementEntries.map((entry, index): StockMovement => ({
+      ...entry,
+      id: `${createDocumentId('SM')}-${index}`,
+      userName: currentUserMember?.name || user.displayName || 'Sistema',
+      timestamp: new Date(now).toLocaleString(),
+      createdAt: now,
+    }));
     try {
       await runTransaction(db, async (tx) => {
-        const productIds = Array.from(new Set(deltas.map(d => d.productId)));
+        const aggregated = new Map<string, Map<string, number>>();
+        deltas.forEach(delta => {
+          const byBranch = aggregated.get(delta.productId) || new Map<string, number>();
+          byBranch.set(delta.branchId, (byBranch.get(delta.branchId) || 0) + delta.qtyDelta);
+          aggregated.set(delta.productId, byBranch);
+        });
+        const productIds = Array.from(aggregated.keys()).sort();
+        if (productIds.length + normalizedMovements.length > 450) {
+          throw new Error('La operación supera 450 cambios atómicos. Divide el movimiento en grupos más pequeños.');
+        }
         const refs = productIds.map(id => doc(db, 'companies', compId, 'products', id));
         const snaps = await Promise.all(refs.map(ref => tx.get(ref)));
 
         snaps.forEach((snap, idx) => {
-          if (!snap.exists()) return;
+          if (!snap.exists()) throw new StockUnavailableError(`El producto ${productIds[idx]} ya no existe.`);
           const data = snap.data() as Product;
           const productId = productIds[idx];
           const branchStocks = { ...(data.branchStocks || {}) };
-          deltas.filter(d => d.productId === productId).forEach(d => {
+          aggregated.get(productId)!.forEach((qtyDelta, branchId) => {
             // A branch with no entry starts from 0, never from the shared total — otherwise
             // it silently adopts another branch's count as its own starting point.
-            const currentBranchStock = branchStocks[d.branchId] ?? 0;
-            branchStocks[d.branchId] = Math.max(0, Math.round((currentBranchStock + d.qtyDelta) * 1000) / 1000);
+            const currentBranchStock = branchStocks[branchId] ?? 0;
+            const nextStock = Math.round((currentBranchStock + qtyDelta) * 1000) / 1000;
+            if (nextStock < 0) {
+              throw new StockUnavailableError(
+                `Stock insuficiente para "${data.name}". Disponible: ${currentBranchStock}; solicitado: ${Math.abs(qtyDelta)}.`
+              );
+            }
+            branchStocks[branchId] = nextStock;
           });
 
           // `stock` is only ever the consolidated total now — recomputed from the branches
           // instead of being nudged by whichever branch happened to make this change.
           tx.update(refs[idx], { stock: sumBranchStocks(branchStocks), branchStocks });
         });
+        normalizedMovements.forEach(movement => {
+          tx.set(
+            doc(db, 'companies', compId, 'stockMovements', movement.id),
+            sanitize(movement)
+          );
+        });
       });
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `companies/${compId}/products/stock_transaction`);
+      throw handleFirestoreError(err, OperationType.UPDATE, `companies/${compId}/products/stock_transaction`);
     }
   };
 
@@ -1933,24 +2200,6 @@ export default function App() {
     return { productId, branchId, qtyDelta: quantity };
   };
 
-  // Writes append-only entries to the inventory audit log (surtidos / transfers). Each
-  // caller passes the meaningful fields; id/user/timestamps are filled in here. Best-effort:
-  // a logging failure must not block the actual stock change that already succeeded.
-  const logStockMovements = async (
-    entries: Pick<StockMovement, 'type' | 'productId' | 'productName' | 'quantity' | 'branchId' | 'branchName' | 'counterpartBranchId' | 'counterpartBranchName'>[]
-  ) => {
-    if (!user || !activeCompanyId || entries.length === 0) return;
-    const compId = activeCompanyId;
-    const now = Date.now();
-    const userName = currentUserMember?.name || user.displayName || 'Sistema';
-    const timestamp = new Date().toLocaleString();
-    await Promise.all(entries.map((e, i) => {
-      const id = `SM-${now}-${i}-${Math.floor(Math.random() * 10000)}`;
-      return setDoc(doc(db, 'companies', compId, 'stockMovements', id), sanitize({ ...e, id, userName, timestamp, createdAt: now }))
-        .catch(err => handleFirestoreError(err, OperationType.CREATE, `companies/${compId}/stockMovements/${id}`));
-    }));
-  };
-
   // Best-effort write to the invisible checkout-funnel audit log — see CheckoutEvent. Unlike
   // logStockMovements, this must NEVER be able to affect the real sale path, so on failure it
   // only console.errors and swallows: no handleFirestoreError (which re-throws), no alert, no
@@ -1960,10 +2209,281 @@ export default function App() {
     if (!activeCompanyId) return; // nothing to attribute this to — silently skip, never block the caller
     const compId = activeCompanyId;
     const now = Date.now();
-    const id = `CE-${now}-${Math.floor(Math.random() * 900000 + 100000)}`;
+    const id = createDocumentId('CE');
     const event: CheckoutEvent = { ...fields, id, timestamp: new Date().toLocaleString(), createdAt: now };
     setDoc(doc(db, 'companies', compId, 'checkoutEvents', id), sanitize(event))
       .catch(err => console.error('[checkoutEvents] best-effort log write failed (ignored):', err));
+  };
+
+  const commitSaleAtomically = async (
+    sale: Sale,
+    stockDeltas: { productId: string; branchId: string; qtyDelta: number }[],
+    checkoutEventBase: Omit<CheckoutEvent, 'id' | 'timestamp' | 'createdAt' | 'status'>,
+    cashEntry: CashTransaction
+  ): Promise<void> => {
+    if (!user || !activeCompanyId) throw new SessionInvalidError('commitSaleAtomically: sesión inválida');
+    if (!sale.branchId) throw new Error('La venta no tiene una sucursal válida.');
+
+    const compId = activeCompanyId;
+    const branchId = sale.branchId;
+    const actorId = user.uid;
+    const aggregated = new Map<string, number>();
+    stockDeltas.forEach(delta => {
+      if (delta.branchId !== branchId) throw new Error('La venta contiene movimientos de otra sucursal.');
+      aggregated.set(delta.productId, (aggregated.get(delta.productId) || 0) + delta.qtyDelta);
+    });
+    const productIds = Array.from(aggregated.keys()).sort();
+    if (productIds.length > 450) throw new Error('La venta excede el máximo seguro de artículos distintos.');
+
+    const saleRef = doc(db, 'companies', compId, 'sales', sale.id);
+    const registerRef = doc(db, 'companies', compId, 'cashRegisters', branchId);
+    const productRefs = productIds.map(productId => doc(db, 'companies', compId, 'products', productId));
+    const customerRef = sale.paymentMethod === 'Credit' && sale.customerId
+      ? doc(db, 'companies', compId, 'customers', sale.customerId)
+      : null;
+    const cashTransactionId = `SALE-${sale.id}`;
+    const checkoutEventId = `CE-COMMIT-${sale.id}`;
+    const cashTransactionRef = doc(
+      db, 'companies', compId, 'cashRegisters', branchId, 'transactions', cashTransactionId
+    );
+    const checkoutEventRef = doc(db, 'companies', compId, 'checkoutEvents', checkoutEventId);
+
+    await runTransaction(db, async transaction => {
+      // Firestore requires every read before the first write. Reading the register and products
+      // makes concurrent terminals retry against the newest stock/cash state automatically.
+      const readRefs = [saleRef, registerRef, ...productRefs, ...(customerRef ? [customerRef] : [])];
+      const snapshots = await Promise.all(readRefs.map(ref => transaction.get(ref)));
+      const saleSnapshot = snapshots[0];
+      if (saleSnapshot.exists()) return; // deterministic id: a replay is already committed
+
+      const registerSnapshot = snapshots[1];
+      if (!registerSnapshot.exists() || !(registerSnapshot.data() as CashRegister).isOpen) {
+        throw new CashRegisterClosedError();
+      }
+      const registerData = registerSnapshot.data() as CashRegister;
+      const stockUpdates: { ref: (typeof productRefs)[number]; branchStocks: Record<string, number> }[] = [];
+
+      productRefs.forEach((ref, index) => {
+        const snapshot = snapshots[index + 2];
+        if (!snapshot.exists()) throw new StockUnavailableError(`El producto ${productIds[index]} ya no existe.`);
+        const product = snapshot.data() as Product;
+        const branchStocks = { ...(product.branchStocks || {}) };
+        const currentStock = branchStocks[branchId] ?? 0;
+        const qtyDelta = aggregated.get(productIds[index]) || 0;
+        const nextStock = Math.round((currentStock + qtyDelta) * 1000) / 1000;
+        if (nextStock < 0) {
+          throw new StockUnavailableError(
+            `Stock insuficiente para "${product.name}". Disponible: ${currentStock}; solicitado: ${Math.abs(qtyDelta)}.`
+          );
+        }
+        branchStocks[branchId] = nextStock;
+        stockUpdates.push({ ref, branchStocks });
+      });
+
+      let customerBalanceUpdate: { ref: NonNullable<typeof customerRef>; balance: number } | null = null;
+      if (customerRef) {
+        const customerSnapshot = snapshots[snapshots.length - 1];
+        if (!customerSnapshot.exists()) throw new Error('El cliente seleccionado ya no existe.');
+        const customer = customerSnapshot.data() as Customer;
+        customerBalanceUpdate = { ref: customerRef, balance: (customer.unpaidBalance || 0) + sale.total };
+      }
+
+      const now = Date.now();
+      const cashDelta = sale.paymentMethod === 'Cash' ? sale.total : 0;
+      const fullCashEntry: CashTransaction = {
+        ...cashEntry,
+        id: cashTransactionId,
+        branchId,
+        saleId: sale.id,
+        paymentMethod: sale.paymentMethod,
+        shiftId: registerData.currentShiftId,
+        cashDelta,
+        createdAt: sale.createdAt || now,
+        timestamp: new Date(sale.createdAt || now).toISOString(),
+        createdBy: actorId,
+        balanceAfter: registerData.currentCash + cashDelta,
+      };
+      const committedEvent: CheckoutEvent = {
+        ...checkoutEventBase,
+        id: checkoutEventId,
+        saleId: sale.id,
+        status: 'success',
+        timestamp: new Date(now).toISOString(),
+        createdAt: now,
+      };
+
+      transaction.set(saleRef, sanitize(sale));
+      stockUpdates.forEach(update => {
+        transaction.update(update.ref, {
+          branchStocks: update.branchStocks,
+          stock: sumBranchStocks(update.branchStocks),
+        });
+      });
+      if (customerBalanceUpdate) {
+        transaction.update(customerBalanceUpdate.ref, { unpaidBalance: customerBalanceUpdate.balance });
+      }
+      transaction.update(registerRef, {
+        currentCash: registerData.currentCash + cashDelta,
+        lastTransactionId: cashTransactionId,
+        updatedAt: now,
+      });
+      transaction.set(cashTransactionRef, sanitize(fullCashEntry));
+      transaction.set(checkoutEventRef, sanitize(committedEvent));
+    });
+  };
+
+  const refundSaleAtomically = async (sale: Sale): Promise<void> => {
+    if (!user || !activeCompanyId) throw new SessionInvalidError('refundSaleAtomically: sesión inválida');
+    const compId = activeCompanyId;
+    const branchId = sale.branchId || selectedBranchId;
+    const saleRef = doc(db, 'companies', compId, 'sales', sale.id);
+    const registerRef = doc(db, 'companies', compId, 'cashRegisters', branchId);
+    const aggregated = new Map<string, number>();
+    sale.items.forEach(item => {
+      const delta = resolveStockTarget(
+        item.productId, branchId, item.quantity,
+        item.linkedStockProductId, item.stockConsumptionFactor
+      );
+      aggregated.set(delta.productId, (aggregated.get(delta.productId) || 0) + delta.qtyDelta);
+    });
+    const productIds = Array.from(aggregated.keys()).sort();
+    const productRefs = productIds.map(productId => doc(db, 'companies', compId, 'products', productId));
+    const customerRef = sale.paymentMethod === 'Credit' && sale.customerId
+      ? doc(db, 'companies', compId, 'customers', sale.customerId)
+      : null;
+    const transactionId = `REFUND-${sale.id}`;
+    const cashEntryRef = doc(db, 'companies', compId, 'cashRegisters', branchId, 'transactions', transactionId);
+
+    await runTransaction(db, async transaction => {
+      const readRefs = [saleRef, registerRef, ...productRefs, ...(customerRef ? [customerRef] : [])];
+      const snapshots = await Promise.all(readRefs.map(ref => transaction.get(ref)));
+      if (!snapshots[0].exists()) throw new Error('La venta ya no existe.');
+      const serverSale = snapshots[0].data() as Sale;
+      if (serverSale.status === 'Refunded') return;
+      const registerSnapshot = snapshots[1];
+      if (!registerSnapshot.exists() || !(registerSnapshot.data() as CashRegister).isOpen) {
+        throw new CashRegisterClosedError('La caja de la sucursal original debe estar abierta para registrar el reembolso.');
+      }
+      const register = registerSnapshot.data() as CashRegister;
+
+      productRefs.forEach((ref, index) => {
+        const snapshot = snapshots[index + 2];
+        if (!snapshot.exists()) throw new Error(`No existe el producto ${productIds[index]} para restituir inventario.`);
+        const product = snapshot.data() as Product;
+        const branchStocks = { ...(product.branchStocks || {}) };
+        branchStocks[branchId] = Math.round(((branchStocks[branchId] ?? 0) + (aggregated.get(productIds[index]) || 0)) * 1000) / 1000;
+        transaction.update(ref, { branchStocks, stock: sumBranchStocks(branchStocks) });
+      });
+
+      if (customerRef) {
+        const customerSnapshot = snapshots[snapshots.length - 1];
+        if (!customerSnapshot.exists()) throw new Error('No existe el cliente asociado al crédito.');
+        const customer = customerSnapshot.data() as Customer;
+        transaction.update(customerRef, { unpaidBalance: Math.max(0, (customer.unpaidBalance || 0) - sale.total) });
+      }
+
+      const now = Date.now();
+      const cashDelta = sale.paymentMethod === 'Cash' ? -sale.total : 0;
+      const nextCash = register.currentCash + cashDelta;
+      transaction.update(saleRef, { status: 'Refunded' });
+      transaction.update(registerRef, {
+        currentCash: nextCash,
+        lastTransactionId: transactionId,
+        updatedAt: now,
+      });
+      transaction.set(cashEntryRef, sanitize({
+        id: transactionId,
+        type: 'Egreso',
+        amount: sale.total,
+        cashDelta,
+        description: `Cancelación/Reembolso Venta ${sale.id}`,
+        time: new Date(now).toLocaleTimeString(),
+        timestamp: new Date(now).toISOString(),
+        createdAt: now,
+        branchId,
+        shiftId: register.currentShiftId,
+        saleId: sale.id,
+        paymentMethod: sale.paymentMethod,
+        createdBy: user.uid,
+        balanceAfter: nextCash,
+      }));
+    });
+  };
+
+  const commitRestockAtomically = async (params: {
+    targetProduct: Product;
+    displayProduct: Product;
+    supplier: Supplier;
+    supplierId: string;
+    purchasedQuantity: number;
+    stockQuantity: number;
+    unitCost: number;
+    branchId: string;
+  }): Promise<void> => {
+    if (!user || !activeCompanyId) throw new SessionInvalidError('commitRestockAtomically: sesión inválida');
+    const compId = activeCompanyId;
+    const now = Date.now();
+    const cashTransactionId = `RESTOCK-${now}-${crypto.randomUUID()}`;
+    const movementId = `SM-${now}-${crypto.randomUUID()}`;
+    const totalExpense = params.purchasedQuantity * params.unitCost;
+    const productRef = doc(db, 'companies', compId, 'products', params.targetProduct.id);
+    const registerRef = doc(db, 'companies', compId, 'cashRegisters', params.branchId);
+    const cashEntryRef = doc(db, 'companies', compId, 'cashRegisters', params.branchId, 'transactions', cashTransactionId);
+    const movementRef = doc(db, 'companies', compId, 'stockMovements', movementId);
+
+    await runTransaction(db, async transaction => {
+      const [productSnapshot, registerSnapshot] = await Promise.all([
+        transaction.get(productRef),
+        transaction.get(registerRef),
+      ]);
+      if (!productSnapshot.exists()) throw new StockUnavailableError('El producto ya no existe.');
+      if (!registerSnapshot.exists() || !(registerSnapshot.data() as CashRegister).isOpen) {
+        throw new CashRegisterClosedError();
+      }
+      const product = productSnapshot.data() as Product;
+      const register = registerSnapshot.data() as CashRegister;
+      const branchStocks = { ...(product.branchStocks || {}) };
+      branchStocks[params.branchId] = Math.round(((branchStocks[params.branchId] ?? 0) + params.stockQuantity) * 1000) / 1000;
+      const nextCash = register.currentCash - totalExpense;
+
+      transaction.update(productRef, {
+        branchStocks,
+        stock: sumBranchStocks(branchStocks),
+        costPrice: params.unitCost,
+        supplierId: params.supplierId,
+      });
+      transaction.update(registerRef, {
+        currentCash: nextCash,
+        lastTransactionId: cashTransactionId,
+        updatedAt: now,
+      });
+      transaction.set(cashEntryRef, sanitize({
+        id: cashTransactionId,
+        type: 'Egreso',
+        amount: totalExpense,
+        cashDelta: -totalExpense,
+        description: `Surtido de Stock: ${params.purchasedQuantity}x ${params.displayProduct.name} (Ref: ${params.supplier.name})`,
+        time: new Date(now).toLocaleTimeString(),
+        timestamp: new Date(now).toISOString(),
+        createdAt: now,
+        branchId: params.branchId,
+        shiftId: register.currentShiftId,
+        createdBy: user.uid,
+        balanceAfter: nextCash,
+      }));
+      transaction.set(movementRef, sanitize({
+        id: movementId,
+        type: 'surtido',
+        productId: params.targetProduct.id,
+        productName: params.targetProduct.name,
+        quantity: params.stockQuantity,
+        branchId: params.branchId,
+        branchName: branches.find(branch => branch.id === params.branchId)?.name,
+        userName: currentUserMember?.name || user.displayName || 'Sistema',
+        timestamp: new Date(now).toLocaleString(),
+        createdAt: now,
+      }));
+    });
   };
 
   // Pos / Cart Operations State
@@ -1982,38 +2502,6 @@ export default function App() {
   // UI, the ref blocks a second click landing before React re-renders the disabled button.
   const [isProcessingSale, setIsProcessingSale] = useState(false);
   const isProcessingSaleRef = useRef(false);
-  // Sales whose cloud write hasn't been confirmed yet (typically the device is offline —
-  // Firestore keeps the write queued and retries by itself when the signal comes back).
-  // Never written to the sale document: it describes THIS device's sync state, and the
-  // sales listener would overwrite such a field anyway. Mirrored to localStorage (below)
-  // so the "N ventas sin subir" badge survives a reload instead of resetting to 0 while
-  // Firestore's own queue is still silently working in the background.
-  const [pendingSaleIds, setPendingSaleIds] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem('logic_pending_sale_ids');
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
-  });
-
-  useEffect(() => {
-    localStorage.setItem('logic_pending_sale_ids', JSON.stringify(pendingSaleIds));
-  }, [pendingSaleIds]);
-
-  // A pending id clears itself once the sales listener actually receives that document —
-  // proof the write landed — rather than relying on the original in-memory promise, which
-  // doesn't survive a reload. This is what lets the restored (post-reload) badge count go
-  // back down to 0 on its own once the queued writes really finish syncing.
-  useEffect(() => {
-    if (pendingSaleIds.length === 0) return;
-    const confirmedIds = new Set(sales.map(s => s.id));
-    const stillPending = pendingSaleIds.filter(id => !confirmedIds.has(id));
-    if (stillPending.length !== pendingSaleIds.length) {
-      setPendingSaleIds(stillPending);
-    }
-  }, [sales, pendingSaleIds]);
-
   const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
   const [lastCompletedSale, setLastCompletedSale] = useState<Sale | null>(null);
   const [lastReceivedAmount, setLastReceivedAmount] = useState<number>(0);
@@ -2039,7 +2527,7 @@ export default function App() {
     }
     const updated = [...customCategories, clean];
     setCustomCategories(updated);
-    localStorage.setItem('logic_custom_categories', JSON.stringify(updated));
+    safeLocalStorageSet('logic_custom_categories', JSON.stringify(updated));
     setNewCategoryInput('');
     alert(`Categoría "${clean}" agregada con éxito.`);
   };
@@ -2188,19 +2676,35 @@ export default function App() {
   // Cart Metrics
   const cartValues = useMemo(() => {
     const subtotal = cart.reduce((acc, item) => acc + (item.product.salePrice * item.quantity), 0);
-    const calculatedDiscount = discountType === 'pct' 
-      ? (subtotal * discountVal / 100) 
-      : discountVal;
+    const calculatedDiscount = canApplyDiscount
+      ? (discountType === 'pct' ? (subtotal * discountVal / 100) : discountVal)
+      : 0;
     const discountedTotal = Math.max(0, subtotal - calculatedDiscount);
     const taxValue = discountedTotal * taxPct / 100;
     const total = discountedTotal + taxValue;
     return { subtotal, calculatedDiscount, taxValue, total };
-  }, [cart, discountType, discountVal, taxPct]);
+  }, [cart, discountType, discountVal, taxPct, canApplyDiscount]);
 
   // Execute Checkout Payment
   const completeTransaction = async () => {
     if (isProcessingSaleRef.current) return;
     if (cart.length === 0) return;
+    if (firestoreConnectionState === 'checking') {
+      alert('Firestore está reconectando y validando la sesión. Espera a que el indicador muestre “En línea” antes de cobrar.');
+      return;
+    }
+    if (firestoreConnectionState === 'offline') {
+      alert('No hay conexión confirmada con Firestore. La venta NO se registró; el carrito permanece intacto.');
+      return;
+    }
+    if (firestoreConnectionState === 'error') {
+      alert('Firestore no pudo validar el acceso de esta sesión. La venta NO se registró; revisa la cuenta o los permisos.');
+      return;
+    }
+    if (!cashRegister.isOpen) {
+      alert('La caja de esta sucursal está cerrada. Ábrela y confirma la apertura antes de cobrar.');
+      return;
+    }
 
     // Validate Credit payment requires customer
     if (paymentMethod === 'Credit' && !selectedCustomer) {
@@ -2256,7 +2760,7 @@ export default function App() {
       // single flat collection already holding 11k+ sales; a comparison against the last 7
       // days of point-in-time history found no sale actually lost to a repeat, but a repeat
       // would silently overwrite an existing sale for good, so the risk isn't worth keeping.
-      id: 'S-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
+      id: `S-${Date.now()}-${crypto.randomUUID()}`,
       items: cart.map(item => ({
         productId: item.product.id,
         name: item.product.name,
@@ -2310,116 +2814,30 @@ export default function App() {
     setIsProcessingSale(true);
     try {
       logCheckoutEvent({ ...checkoutEventBase, status: 'started' });
-      // 2. Save the sale record FIRST and wait for it. The sale document is the source of
-      // truth for "this sale happened"; stock/cash/credit are consequences of it. Firing all
-      // four at once (the old behaviour) meant a failed sale write could leave stock and cash
-      // already moved with no sale to explain them, and nothing on screen said so.
-      const newSales = [newSale, ...sales];
-      let saveRejection: unknown = null;
-      let saveSettled = false;
-      const trackedSave = saveAllData(products, customers, newSales, cashRegister)
-        .then(() => { saveSettled = true; })
-        .catch((err) => { saveSettled = true; saveRejection = err; });
-
-      // Offline is NOT a failure here: Firestore parks the write and replays it once the
-      // signal returns, so its promise simply stays pending rather than rejecting. Waiting
-      // forever would strand a cashier with a customer in front of them, so cap the wait —
-      // whatever hasn't settled by then is treated as "queued", not "lost".
-      await Promise.race([trackedSave, new Promise(resolve => setTimeout(resolve, 4000))]);
-
-      if (saveSettled && saveRejection) {
-        // Rejected quickly = a real error (invalid session, permissions, bad data), not a
-        // connectivity hiccup. Undo the optimistic local write and keep the cart intact so
-        // the sale can simply be charged again once the cause is fixed.
-        console.error('Error guardando la venta:', saveRejection);
-        logCheckoutEvent({
-          ...checkoutEventBase,
-          status: 'failed',
-          errorMessage: saveRejection instanceof Error ? saveRejection.message : String(saveRejection),
-          isSessionInvalid: isSessionInvalidError(saveRejection),
-        });
-        setSales(prev => {
-          const reverted = prev.filter(s => s.id !== newSale.id);
-          localStorage.setItem('logic_sales', JSON.stringify(reverted));
-          return reverted;
-        });
-        alert(
-          isSessionInvalidError(saveRejection)
-            ? 'Tu sesión expiró o no se pudo confirmar tu empresa activa.\n\nLa venta NO se registró y no se descontó inventario ni caja. Cierra sesión, vuelve a entrar e intenta cobrar de nuevo.'
-            : 'No se pudo guardar la venta.\n\nNo se descontó inventario ni caja y el carrito quedó intacto. Verifica tu conexión e intenta cobrar de nuevo.'
-        );
-        return;
-      }
-
-      if (!saveSettled) {
-        // Still queued after the wait — almost always "no signal right now".
-        logCheckoutEvent({ ...checkoutEventBase, status: 'offline_queued' });
-        setPendingSaleIds(prev => [...prev, newSale.id]);
-        alert(
-          'Sin conexión en este momento.\n\n' +
-          `La venta ${newSale.id} quedó guardada en este dispositivo y se subirá sola en cuanto vuelva la señal. ` +
-          'No cierres la aplicación hasta que el contador de "ventas pendientes" llegue a 0.'
-        );
-        trackedSave.then(() => {
-          setPendingSaleIds(prev => prev.filter(id => id !== newSale.id));
-          if (saveRejection) {
-            console.error('La venta pendiente terminó fallando:', saveRejection);
-            alert(`La venta ${newSale.id} no se pudo subir a la nube. Anótala y repórtala a tu encargado.`);
-            logCheckoutEvent({
-              ...checkoutEventBase,
-              status: 'offline_resolved_failed',
-              errorMessage: saveRejection instanceof Error ? saveRejection.message : String(saveRejection),
-              isSessionInvalid: isSessionInvalidError(saveRejection),
-            });
-          } else {
-            logCheckoutEvent({ ...checkoutEventBase, status: 'offline_resolved_success' });
-          }
-        });
-      }
-
-      if (saveSettled && !saveRejection) {
-        logCheckoutEvent({ ...checkoutEventBase, status: 'success' });
-      }
-
-      // 3. Sale is safe (either confirmed or reliably queued) — now apply its consequences.
-      // These don't block the receipt, but they're tracked so a failure still gets reported
-      // instead of vanishing the way it used to.
-      const secondaryEffects: Promise<unknown>[] = [
-        applyStockDeltas(cart.map(item => resolveStockTarget(
-          item.product.id, selectedBranchId, -item.quantity,
-          item.product.linkedStockProductId, item.product.stockConsumptionFactor
-        )))
-      ];
-
-      if (selectedCustomer && paymentMethod === 'Credit') {
-        secondaryEffects.push(applyCustomerBalanceDelta(selectedCustomer.id, cartValues.total));
-      }
-
       const activeBranch = branches.find(b => b.id === selectedBranchId);
       const branchNameSuffix = activeBranch ? ` (${activeBranch.name})` : '';
       const paymentLabel = paymentMethod === 'Cash' ? 'Efectivo' : paymentMethod === 'Card' ? 'Tarjeta' : paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito';
       const descFolio = (paymentMethod === 'Card' || paymentMethod === 'Transfer') && folioNumber.trim() ? ` [Folio: ${folioNumber.trim()}]` : '';
 
-      secondaryEffects.push(applyCashDelta(selectedBranchId, paymentMethod === 'Cash' ? cartValues.total : 0, [{
-        type: 'Venta',
-        amount: cartValues.total,
-        description: `Venta ${newSale.id} - ${paymentLabel}${descFolio}${branchNameSuffix}`,
-        time: new Date().toLocaleTimeString(),
-        createdAt: Date.now(),
-        branchId: selectedBranchId
-      }]));
-
-      Promise.allSettled(secondaryEffects).then(results => {
-        const failed = results.filter(r => r.status === 'rejected');
-        if (failed.length > 0) {
-          console.error(`Venta ${newSale.id}: ${failed.length} efecto(s) secundario(s) fallaron`, failed);
-          alert(
-            `La venta ${newSale.id} SÍ quedó registrada, pero no se pudo actualizar ` +
-            `${failed.length === 1 ? 'un dato relacionado' : `${failed.length} datos relacionados`} (inventario / caja / saldo del cliente).\n\n` +
-            'Revisa el inventario y la caja de esta sucursal.'
-          );
+      // One server transaction is the confirmation boundary. It either creates the sale,
+      // decrements every live stock document, updates credit/cash, appends the cash ledger,
+      // and records success together, or commits none of them. There is no UI timeout.
+      await commitSaleAtomically(
+        newSale,
+        cart.map(item => resolveStockTarget(
+          item.product.id, selectedBranchId, -item.quantity,
+          item.product.linkedStockProductId, item.product.stockConsumptionFactor
+        )),
+        checkoutEventBase,
+        {
+          type: 'Venta',
+          amount: cartValues.total,
+          description: `Venta ${newSale.id} - ${paymentLabel}${descFolio}${branchNameSuffix}`,
+          time: new Date().toLocaleTimeString(),
+          createdAt: newSale.createdAt,
         }
-      });
+      );
+      setSales(prev => prev.some(sale => sale.id === newSale.id) ? prev : [newSale, ...prev]);
 
       // Reset checkout states and triggers success receipt modal
       setLastCompletedSale(newSale);
@@ -2432,6 +2850,18 @@ export default function App() {
       setRequiresInvoice(false);
       setTaxPct(0);
       setIsCheckoutOpen(false);
+    } catch (error) {
+      console.error('Error guardando la venta atómicamente:', error);
+      const description = isSessionInvalidError(error)
+        ? { message: 'La sesión ya no es válida. La venta NO se registró; vuelve a iniciar sesión.' }
+        : describeCheckoutError(error);
+      logCheckoutEvent({
+        ...checkoutEventBase,
+        status: 'failed',
+        errorMessage: error instanceof Error ? error.message : String(error),
+        isSessionInvalid: isSessionInvalidError(error),
+      });
+      alert(`${description.message}\n\nEl carrito permanece intacto y no se modificó inventario, caja ni saldo del cliente.`);
     } finally {
       isProcessingSaleRef.current = false;
       setIsProcessingSale(false);
@@ -2440,7 +2870,7 @@ export default function App() {
 
   const handleSelectBranch = (branchId: string) => {
     setSelectedBranchId(branchId);
-    if (user) localStorage.setItem(`logic_active_branch_${user.uid}`, branchId);
+    if (user) safeLocalStorageSet(`logic_active_branch_${user.uid}`, branchId);
   };
 
   // Prints a receipt via a hidden iframe instead of window.open(). The old approach opened
@@ -3063,8 +3493,8 @@ export default function App() {
   });
 
   const handleOpenBulkProductModal = () => {
-    if (activeCompanyRole !== 'owner') {
-      alert('Solo el Dueño puede crear productos.');
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para crear productos.');
       return;
     }
     setBulkForm({
@@ -3080,8 +3510,12 @@ export default function App() {
     setIsBulkProductModalOpen(true);
   };
 
-  const handleSaveBulkProductGroup = (e: FormEvent) => {
+  const handleSaveBulkProductGroup = async (e: FormEvent) => {
     e.preventDefault();
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para crear productos.');
+      return;
+    }
     const presentations = bulkForm.presentations.filter(p => p.suffix.trim() && p.price !== '' && p.factor !== '');
     if (!bulkForm.baseName.trim() || !bulkForm.category.trim() || presentations.length === 0) {
       alert('Nombre base, categoría, y al menos una presentación completa (nombre, precio y factor) son obligatorios.');
@@ -3095,7 +3529,7 @@ export default function App() {
       return;
     }
     const initialStockNum = parseFloat(bulkForm.initialStock) || 0;
-    const poolId = 'P-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+    const poolId = createDocumentId('P');
     const poolProduct: Product = {
       id: poolId,
       name: bulkForm.baseName.trim(),
@@ -3104,26 +3538,30 @@ export default function App() {
       salePrice: 0,
       stock: initialStockNum,
       minStock: parseInt(bulkForm.minStock) || 0,
-      sku: bulkForm.sku || 'SKU-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
+      sku: bulkForm.sku || createDocumentId('SKU'),
       supplierId: bulkForm.supplierId || undefined,
       branchStocks: { [selectedBranchId]: initialStockNum },
       isStockPool: true
     };
     const childProducts: Product[] = presentations.map((p, idx) => ({
-      id: 'P-' + Date.now() + '-' + idx + '-' + Math.floor(Math.random() * 900 + 100),
+      id: `${createDocumentId('P')}-${idx}`,
       name: `${bulkForm.baseName.trim()} ${p.suffix.trim()}`.trim(),
       category: bulkForm.category,
       costPrice: parseFloat(p.costPrice) || 0,
       salePrice: parseFloat(p.price) || 0,
       stock: 0,
       minStock: parseInt(p.minStock) || 0,
-      sku: p.sku || 'SKU-' + Date.now() + '-' + idx + '-' + Math.floor(Math.random() * 900 + 100),
+      sku: p.sku || `${createDocumentId('SKU')}-${idx}`,
       branchStocks: {},
       linkedStockProductId: poolId,
       stockConsumptionFactor: parseFloat(p.factor)
     }));
-    saveAllData([...products, poolProduct, ...childProducts], customers, sales, cashRegister);
-    setIsBulkProductModalOpen(false);
+    try {
+      await saveAllData([...products, poolProduct, ...childProducts], customers, sales, cashRegister);
+      setIsBulkProductModalOpen(false);
+    } catch {
+      alert('No se pudo confirmar el guardado de los productos. Revisa el acceso e inténtalo de nuevo.');
+    }
   };
 
   // Quick add-stock ("Surtir") — adds units to the ACTIVE branch instead of overwriting
@@ -3134,6 +3572,10 @@ export default function App() {
   const [isSavingQuickStock, setIsSavingQuickStock] = useState(false);
 
   const handleQuickAddStock = async () => {
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para ajustar existencias.');
+      return;
+    }
     if (!quickStockProduct) return;
     // parseFloat (not parseInt) so restocking a shared-stock "parent" pool in liters (e.g. 2.5)
     // isn't silently truncated — doesn't change anything for products restocked in whole units.
@@ -3164,10 +3606,9 @@ export default function App() {
     setIsSavingQuickStock(true);
     try {
       // Positive = surtido (entrada); negative = merma/ajuste. Per-branch + atomic.
-      await applyStockDeltas([{ productId: targetProduct.id, branchId: selectedBranchId, qtyDelta: effectiveQty }]);
-      // Record it in the inventory audit log so it shows in Historial and the PDF.
       const branchName = branches.find(b => b.id === selectedBranchId)?.name;
-      await logStockMovements([{
+      // Stock and its audit movement share one transaction: either both exist or neither does.
+      await applyStockDeltas([{ productId: targetProduct.id, branchId: selectedBranchId, qtyDelta: effectiveQty }], [{
         type: effectiveQty > 0 ? 'surtido' : 'merma',
         productId: targetProduct.id,
         productName: targetProduct.name,
@@ -3187,8 +3628,8 @@ export default function App() {
 
 
   const handleOpenProductModal = (product?: Product) => {
-    if (activeCompanyRole !== 'owner') {
-      alert('Solo el Dueño puede crear o editar productos.');
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para crear o editar productos.');
       return;
     }
     if (product) {
@@ -3225,8 +3666,12 @@ export default function App() {
     setIsProductModalOpen(true);
   };
 
-  const handleSaveProduct = (e: FormEvent) => {
+  const handleSaveProduct = async (e: FormEvent) => {
     e.preventDefault();
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para crear o editar productos.');
+      return;
+    }
     if (!prodForm.name || !prodForm.salePrice) {
       alert('Nombre y Precio de Venta son obligatorios.');
       return;
@@ -3282,14 +3727,14 @@ export default function App() {
       });
     } else {
       const newProd: Product = {
-        id: 'P-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
+        id: createDocumentId('P'),
         name: prodForm.name,
         category: prodForm.category || 'Varios',
         costPrice: costPriceNum,
         salePrice: salePriceNum,
         stock: isChild ? 0 : stockNum,
         minStock: minStockNum,
-        sku: prodForm.sku || 'SKU-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100),
+        sku: prodForm.sku || createDocumentId('SKU'),
         supplierId: prodForm.supplierId || undefined,
         branchStocks: isChild ? {} : { [selectedBranchId]: stockNum },
         linkedStockProductId,
@@ -3299,13 +3744,17 @@ export default function App() {
       updatedProducts = [...products, newProd];
     }
 
-    saveAllData(updatedProducts, customers, sales, cashRegister);
-    setIsProductModalOpen(false);
+    try {
+      await saveAllData(updatedProducts, customers, sales, cashRegister);
+      setIsProductModalOpen(false);
+    } catch {
+      alert('No se pudo confirmar el guardado del producto. Revisa el acceso e inténtalo de nuevo.');
+    }
   };
 
   const handleDeleteProduct = async (prodId: string) => {
-    if (activeCompanyRole !== 'owner') {
-      alert('Solo el Dueño puede eliminar productos.');
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para eliminar productos.');
       return;
     }
     // Deleting a shared-stock "parent" leaves its children pointing at nothing — getProductStock
@@ -3320,10 +3769,14 @@ export default function App() {
         try {
           await deleteDoc(doc(db, 'companies', activeCompanyId, 'products', prodId));
         } catch (err) {
-          handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/products/${prodId}`);
+          throw handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/products/${prodId}`);
         }
       }
-      saveAllData(updated, customers, sales, cashRegister);
+      try {
+        await saveAllData(updated, customers, sales, cashRegister);
+      } catch {
+        alert('No se pudo confirmar la eliminación del producto.');
+      }
     }
   };
 
@@ -3354,12 +3807,20 @@ export default function App() {
     // appended in `branches` order afterward, since Promise.all resolves out of order.
     if (user && activeCompanyId) {
       const compId = activeCompanyId;
+      const dashboardRange = statsMonth === 'all' ? null : getMonthRange(statsMonth);
       const branchTotals = await Promise.all(branches.map(async (b) => {
-        const snap = await getDocs(query(
-          collection(db, 'companies', compId, 'sales'),
-          where('branchId', '==', b.id),
-          where('status', '==', 'Completed')
-        ));
+        const salesRef = collection(db, 'companies', compId, 'sales');
+        const snap = await getDocs(dashboardRange
+          ? query(
+              salesRef,
+              where('branchId', '==', b.id),
+              where('status', '==', 'Completed'),
+              where('createdAt', '>=', dashboardRange.start),
+              where('createdAt', '<', dashboardRange.end),
+              orderBy('createdAt', 'desc')
+            )
+          : query(salesRef, where('branchId', '==', b.id), where('status', '==', 'Completed'))
+        );
         let bTotal = 0;
         snap.forEach(d => {
           const s = d.data() as Sale;
@@ -3418,6 +3879,10 @@ export default function App() {
   // selected branch and month — every past month with recorded sales is selectable,
   // since the underlying history in Firestore is never pruned.
   const handleDownloadMonthlyCutPdf = async () => {
+    const [{ jsPDF }, { autoTable }] = await Promise.all([
+      import('jspdf'),
+      import('jspdf-autotable'),
+    ]);
     const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
     const branchName = branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal';
     const companyName = branding.displayName || userCompanies[activeCompanyId || '']?.name || 'Mi Comercio';
@@ -3453,7 +3918,7 @@ export default function App() {
       const d = new Date(ms);
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     };
-    const monthCashMovements = cashRegister.transactions
+    const monthCashMovements = allCashTransactions
       .filter((tx): tx is typeof tx & { createdAt: number } =>
         (tx.type === 'Ingreso' || tx.type === 'Egreso') &&
         tx.createdAt !== undefined && msToMonthKey(tx.createdAt) === pdfCutMonth
@@ -3591,6 +4056,10 @@ export default function App() {
   // but scoped to a single day (`statsDay`) instead of a month, plus a Top 5 products table.
   // Fully independent from the monthly cut: separate state, separate function, doesn't touch it.
   const handleDownloadDailyCutPdf = async () => {
+    const [{ jsPDF }, { autoTable }] = await Promise.all([
+      import('jspdf'),
+      import('jspdf-autotable'),
+    ]);
     if (!statsDay) return;
     const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
     const branchName = branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal';
@@ -3619,7 +4088,7 @@ export default function App() {
       byPaymentMethod[key].total += s.total;
     });
 
-    const dayCashMovements = cashRegister.transactions
+    const dayCashMovements = allCashTransactions
       .filter((tx): tx is typeof tx & { createdAt: number } =>
         (tx.type === 'Ingreso' || tx.type === 'Egreso') &&
         tx.createdAt !== undefined && msToDayKey(tx.createdAt) === statsDay
@@ -3839,6 +4308,10 @@ export default function App() {
   // (rather than adding flags to it) since the preload logic genuinely differs: every product at
   // full stock vs. one optional product at qty 1, fixed Matriz target vs. "first other branch."
   const handleOpenMoveAllToMatrizModal = () => {
+    if (!canTransferStock) {
+      alert('Tu cuenta no tiene permiso para transferir existencias.');
+      return;
+    }
     if (!matrizBranch) {
       alert('No se puede continuar: debe existir exactamente una sucursal marcada como "Matriz" en Sucursales. Revisa la configuración con el Dueño.');
       return;
@@ -3859,6 +4332,10 @@ export default function App() {
   };
 
   const handleOpenTransferModal = (prodId?: string) => {
+    if (!canTransferStock) {
+      alert('Tu cuenta no tiene permiso para transferir existencias.');
+      return;
+    }
     // Always overwrites the cart (never merges with a leftover cart from a cancelled
     // session), same as the single-product version used to fully overwrite transferProductId.
     setTransferItems(prodId ? [{ productId: prodId, quantity: 1 }] : []);
@@ -3877,6 +4354,10 @@ export default function App() {
   };
 
   const handleExecuteTransfer = async () => {
+    if (!canTransferStock) {
+      alert('Tu cuenta no tiene permiso para transferir existencias.');
+      return;
+    }
     if (transferItems.length === 0) {
       alert("Agrega al menos un producto a la transferencia.");
       return;
@@ -3890,10 +4371,8 @@ export default function App() {
       return;
     }
 
-    // Aggregate by productId defensively (not just relying on the cart's merge-on-add) —
-    // applyStockDeltas doesn't validate a combined delta against the read snapshot, it just
-    // clamps at zero, so two undetected lines for the same product could silently manufacture
-    // stock at the target while clamping the source to 0.
+    // Aggregate by productId defensively (not just relying on the cart's merge-on-add).
+    // applyStockDeltas validates the combined live delta and rejects any negative result.
     const aggregated = new Map<string, number>();
     for (const it of transferItems) {
       aggregated.set(it.productId, (aggregated.get(it.productId) || 0) + it.quantity);
@@ -3903,6 +4382,10 @@ export default function App() {
       const prod = products.find(p => p.id === productId);
       return { productId, quantity, prod };
     });
+    if (lines.length > 150) {
+      alert('Una transferencia puede incluir hasta 150 productos distintos para conservar inventario e historial en una sola operación segura. Divide el movimiento en dos transferencias.');
+      return;
+    }
 
     const missing = lines.filter(l => !l.prod);
     if (missing.length > 0) {
@@ -3923,7 +4406,7 @@ export default function App() {
 
     // Timestamp-based for the same reason as sale ids — a plain 6-digit random repeats far
     // sooner than it looks, and a repeat here overwrites a past transfer record outright.
-    const transferId = 'T-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+    const transferId = createDocumentId('T');
     const sourceBranch = branches.find(b => b.id === transferSourceBranchId);
     const targetBranch = branches.find(b => b.id === transferTargetBranchId);
     const sourceBranchName = sourceBranch?.name || 'Sucursal';
@@ -3951,10 +4434,8 @@ export default function App() {
           { productId: l.productId, branchId: transferSourceBranchId, qtyDelta: -l.quantity },
           { productId: l.productId, branchId: transferTargetBranchId, qtyDelta: l.quantity },
         ]);
-        await applyStockDeltas(deltas);
-
-        // Record both sides of every product in the inventory audit log (dedicated
-        // collection, not the cash register), grouped by transferId.
+        // Stock updates and both audit sides commit together. The 150-product guard keeps
+        // the request below Firestore's 500-write ceiling (3 writes per product).
         const movements = lines.flatMap(l => [
           {
             type: 'transfer_out' as const,
@@ -3981,7 +4462,7 @@ export default function App() {
             unitPrice: l.prod!.salePrice,
           },
         ]);
-        await logStockMovements(movements);
+        await applyStockDeltas(deltas, movements);
 
         setIsTransferModalOpen(false);
         setTransferItems([]);
@@ -3991,42 +4472,13 @@ export default function App() {
         alert("Ocurrió un error al guardar los cambios en la base de datos de Firebase.");
       }
     } else {
-      let updatedProducts = products;
-      for (const l of lines) {
-        updatedProducts = updatedProducts.map(p => {
-          if (p.id !== l.productId) return p;
-          const stocks = { ...(p.branchStocks || {}) };
-          // Same rule as getProductStock/applyStockDeltas: a branch with no entry has 0, it
-          // does not borrow the consolidated total.
-          const sourceVal = stocks[transferSourceBranchId] ?? 0;
-          const targetVal = stocks[transferTargetBranchId] ?? 0;
-          stocks[transferSourceBranchId] = sourceVal - l.quantity;
-          stocks[transferTargetBranchId] = targetVal + l.quantity;
-          return { ...p, branchStocks: stocks };
-        });
-      }
-      // This branch only runs when there's no valid session, and saving locally is exactly
-      // what it's supposed to do here — saveAllData's local state/localStorage write already
-      // happened before it throws, so swallow that specific error and carry on. Anything
-      // else is a real failure worth surfacing.
-      try {
-        await saveAllData(updatedProducts, customers, sales, cashRegister);
-      } catch (err) {
-        if (!isSessionInvalidError(err)) {
-          console.error("Error saving local-only transfer fallback:", err);
-          alert("Ocurrió un error al guardar el traspaso localmente.");
-          return;
-        }
-      }
-      setIsTransferModalOpen(false);
-      setTransferItems([]);
-      setLastCompletedTransfer(completedTransfer);
+      alert('La sesión no está activa. El traspaso NO se aplicó; vuelve a iniciar sesión e inténtalo de nuevo.');
     }
   };
 
   const handleOpenBranchModal = (branch?: Branch) => {
-    if (branch && activeCompanyRole !== 'owner') {
-      alert('Solo el Dueño puede editar sucursales existentes.');
+    if (!isOwnerOrAdminRole) {
+      alert('Solo el Dueño o un administrador puede administrar sucursales.');
       return;
     }
     if (branch) {
@@ -4045,8 +4497,12 @@ export default function App() {
     setIsBranchModalOpen(true);
   };
 
-  const handleSaveBranch = (e: FormEvent) => {
+  const handleSaveBranch = async (e: FormEvent) => {
     e.preventDefault();
+    if (!isOwnerOrAdminRole) {
+      alert('Solo el Dueño o un administrador puede administrar sucursales.');
+      return;
+    }
     if (!branchForm.name) {
       alert('El nombre de la sucursal es obligatorio.');
       return;
@@ -4064,7 +4520,7 @@ export default function App() {
       } : b);
     } else {
       const newB: Branch = {
-        id: 'B-' + Math.floor(Math.random() * 9000 + 1000),
+        id: createDocumentId('B'),
         name: branchForm.name,
         address: branchForm.address,
         phone: branchForm.phone,
@@ -4073,8 +4529,12 @@ export default function App() {
       };
       updated = [...branches, newB];
     }
-    saveAllData(products, customers, sales, cashRegister, updated, suppliers);
-    setIsBranchModalOpen(false);
+    try {
+      await saveAllData(products, customers, sales, cashRegister, updated, suppliers);
+      setIsBranchModalOpen(false);
+    } catch {
+      alert('No se pudo confirmar el guardado de la sucursal.');
+    }
   };
 
   const handleDeleteBranch = async (bId: string) => {
@@ -4090,15 +4550,19 @@ export default function App() {
       const updated = branches.filter(b => b.id !== bId);
       const nextActive = selectedBranchId === bId ? updated[0].id : selectedBranchId;
       setSelectedBranchId(nextActive);
-      if (user) localStorage.setItem(`logic_active_branch_${user.uid}`, nextActive);
+      if (user) safeLocalStorageSet(`logic_active_branch_${user.uid}`, nextActive);
       if (user && activeCompanyId) {
         try {
           await deleteDoc(doc(db, 'companies', activeCompanyId, 'branches', bId));
         } catch (err) {
-          handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/branches/${bId}`);
+          throw handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/branches/${bId}`);
         }
       }
-      saveAllData(products, customers, sales, cashRegister, updated, suppliers);
+      try {
+        await saveAllData(products, customers, sales, cashRegister, updated, suppliers);
+      } catch {
+        alert('No se pudo confirmar la eliminación de la sucursal.');
+      }
     }
   };
 
@@ -4123,26 +4587,26 @@ export default function App() {
     (async () => {
       try {
         const entries = await Promise.all(branches.map(async (branch) => {
-          // Only count sales since the branch's last "Apertura de Caja" so this resets at
-          // every corte instead of accumulating forever. The register doc's `transactions`
-          // array is reset to just the opening entry each time caja is opened (see
-          // handleOpenCaja) — closing does NOT clear it — so transactions[0].createdAt is
-          // exactly that boundary, whether the register is currently open or was just
-          // closed (shows the just-finished shift until the next apertura, then drops to
-          // 0). Filtered client-side rather than via a `where('createdAt', '>=', ...)`
-          // clause so this doesn't need a new Firestore composite index.
+          // Only count sales since the current/last shift opening. New register documents
+          // keep this boundary in `openedAt`; the legacy array is a read-only fallback.
           let since = 0;
           try {
             const cashSnap = await getDoc(doc(db, 'companies', compId, 'cashRegisters', branch.id));
-            const openTx = (cashSnap.data() as CashRegister | undefined)?.transactions?.[0];
-            if (openTx?.createdAt) since = openTx.createdAt;
+            const register = cashSnap.data() as CashRegister | undefined;
+            since = register?.openedAt || register?.transactions?.[0]?.createdAt || 0;
           } catch { /* no register doc yet (branch never opened caja) — falls back to all-time */ }
 
-          const snap = await getDocs(query(
-            collection(db, 'companies', compId, 'sales'),
-            where('branchId', '==', branch.id),
-            where('status', '==', 'Completed')
-          ));
+          const salesRef = collection(db, 'companies', compId, 'sales');
+          const snap = await getDocs(since
+            ? query(
+                salesRef,
+                where('branchId', '==', branch.id),
+                where('status', '==', 'Completed'),
+                where('createdAt', '>=', since),
+                orderBy('createdAt', 'desc')
+              )
+            : query(salesRef, where('branchId', '==', branch.id), where('status', '==', 'Completed'))
+          );
           let revenue = 0;
           let count = 0;
           snap.forEach(d => {
@@ -4217,6 +4681,10 @@ export default function App() {
   const [supplierProductIds, setSupplierProductIds] = useState<string[]>([]);
 
   const handleOpenSupplierModal = (supplier?: Supplier) => {
+    if (!canManageSuppliers) {
+      alert('Tu cuenta no tiene permiso para administrar proveedores.');
+      return;
+    }
     if (supplier) {
       setEditingSupplier(supplier);
       setSupplierForm({
@@ -4237,14 +4705,18 @@ export default function App() {
     setIsSupplierModalOpen(true);
   };
 
-  const handleSaveSupplier = (e: FormEvent) => {
+  const handleSaveSupplier = async (e: FormEvent) => {
     e.preventDefault();
+    if (!canManageSuppliers) {
+      alert('Tu cuenta no tiene permiso para administrar proveedores.');
+      return;
+    }
     if (!supplierForm.name) {
       alert('El nombre del proveedor es obligatorio.');
       return;
     }
 
-    const targetSupplierId = editingSupplier ? editingSupplier.id : ('prov-' + Math.floor(Math.random() * 90000 + 10000));
+    const targetSupplierId = editingSupplier ? editingSupplier.id : createDocumentId('prov');
 
     let updated: Supplier[];
     if (editingSupplier) {
@@ -4270,7 +4742,7 @@ export default function App() {
       updated = [...suppliers, newS];
     }
 
-    // Link/unlink products on firebase/localStorage
+    // Link/unlink products in Firestore through the shared catalogue save path.
     const processedProducts = products.map(p => {
       const shouldBeLinked = supplierProductIds.includes(p.id);
       if (shouldBeLinked) {
@@ -4283,11 +4755,19 @@ export default function App() {
       return p;
     });
 
-    saveAllData(processedProducts, customers, sales, cashRegister, branches, updated);
-    setIsSupplierModalOpen(false);
+    try {
+      await saveAllData(processedProducts, customers, sales, cashRegister, branches, updated);
+      setIsSupplierModalOpen(false);
+    } catch {
+      alert('No se pudo confirmar el guardado del proveedor.');
+    }
   };
 
   const handleDeleteSupplier = async (sId: string) => {
+    if (!canManageSuppliers) {
+      alert('Tu cuenta no tiene permiso para eliminar proveedores.');
+      return;
+    }
     if (confirm('¿Está seguro de eliminar este proveedor? Los artículos correspondientes se desvincularán del proveedor.')) {
       const updated = suppliers.filter(s => s.id !== sId);
       const updatedProducts = products.map(p => p.supplierId === sId ? { ...p, supplierId: undefined } : p);
@@ -4295,15 +4775,20 @@ export default function App() {
         try {
           await deleteDoc(doc(db, 'companies', activeCompanyId, 'suppliers', sId));
         } catch (err) {
-          handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/suppliers/${sId}`);
+          throw handleFirestoreError(err, OperationType.DELETE, `companies/${activeCompanyId}/suppliers/${sId}`);
         }
       }
-      saveAllData(updatedProducts, customers, sales, cashRegister, branches, updated);
+      try {
+        await saveAllData(updatedProducts, customers, sales, cashRegister, branches, updated);
+      } catch {
+        alert('No se pudo confirmar la eliminación del proveedor.');
+      }
     }
   };
 
   // Supplier Supply Order (Surtido / Compra) State & Handler
   const [isRestockOpen, setIsRestockOpen] = useState(false);
+  const [isSavingRestock, setIsSavingRestock] = useState(false);
   const [restockForm, setRestockForm] = useState({
     supplierId: '',
     productId: '',
@@ -4312,6 +4797,10 @@ export default function App() {
   });
 
   const handleOpenRestock = (supplierId?: string, productId?: string) => {
+    if (!canManageSuppliers) {
+      alert('Tu cuenta no tiene permiso para reabastecer productos.');
+      return;
+    }
     setRestockForm({
       supplierId: supplierId || '',
       productId: productId || '',
@@ -4321,8 +4810,12 @@ export default function App() {
     setIsRestockOpen(true);
   };
 
-  const handleSaveRestock = (e: FormEvent) => {
+  const handleSaveRestock = async (e: FormEvent) => {
     e.preventDefault();
+    if (!canManageSuppliers) {
+      alert('Tu cuenta no tiene permiso para reabastecer productos.');
+      return;
+    }
     const { supplierId, productId, qty, cost } = restockForm;
     if (!supplierId || !productId || !qty || !cost) {
       alert('Por favor complete todos los campos para procesar el reabastecimiento.');
@@ -4368,29 +4861,29 @@ export default function App() {
       }
     }
 
-    // Stock increment is atomic (transaction); cost/supplier metadata is a plain field set
-    applyStockDeltas([{ productId: targetProd.id, branchId: selectedBranchId, qtyDelta: effectiveQ }]);
-    if (user && activeCompanyId) {
-      updateDoc(doc(db, 'companies', activeCompanyId, 'products', targetProd.id), {
-        costPrice: c, // Record new supplier cost price automatically!
-        supplierId
-      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/products/${targetProd.id}`));
+    setIsSavingRestock(true);
+    try {
+      await commitRestockAtomically({
+        targetProduct: targetProd,
+        displayProduct: prod,
+        supplier: supp,
+        supplierId,
+        purchasedQuantity: q,
+        stockQuantity: effectiveQ,
+        unitCost: c,
+        branchId: selectedBranchId,
+      });
+      setIsRestockOpen(false);
+      const stockMsg = targetProd.id === prod.id
+        ? `Se añadieron ${q} unidades de ${prod.name}`
+        : `Se añadieron ${effectiveQ.toFixed(2)} unidades al fondo de ${targetProd.name} (por ${q}x ${prod.name})`;
+      alert(`¡Reabastecimiento procesado! ${stockMsg} y se generó un egreso de ${formatMXN(totalExpense)} en Caja.`);
+    } catch (error) {
+      console.error('Error saving restock:', error);
+      alert(`${describeCheckoutError(error).message}\n\nEl surtido y el egreso no se aplicaron.`);
+    } finally {
+      setIsSavingRestock(false);
     }
-
-    // Outflow Egreso in Register (atomic — see applyCashDelta)
-    applyCashDelta(selectedBranchId, -totalExpense, [{
-      type: 'Egreso',
-      amount: totalExpense,
-      description: `Surtido de Stock: ${q}x ${prod.name} (Ref: ${supp.name})`,
-      time: new Date().toLocaleTimeString(),
-      createdAt: Date.now()
-    }]);
-
-    setIsRestockOpen(false);
-    const stockMsg = targetProd.id === prod.id
-      ? `Se añadieron ${q} unidades de ${prod.name}`
-      : `Se añadieron ${effectiveQ.toFixed(2)} unidades al fondo de ${targetProd.name} (por ${q}x ${prod.name})`;
-    alert(`¡Reabastecimiento procesado! ${stockMsg} y se generó un egreso de ${formatMXN(totalExpense)} en Caja.`);
   };
 
 
@@ -4414,7 +4907,7 @@ export default function App() {
     setIsCustomerModalOpen(true);
   };
 
-  const handleSaveCustomer = (e: FormEvent) => {
+  const handleSaveCustomer = async (e: FormEvent) => {
     e.preventDefault();
     if (!custForm.name) return;
 
@@ -4428,7 +4921,7 @@ export default function App() {
       } : c);
     } else {
       const newCust: Customer = {
-        id: 'C-' + Math.floor(Math.random() * 90000 + 10000),
+        id: createDocumentId('C'),
         name: custForm.name,
         phone: custForm.phone,
         email: custForm.email,
@@ -4438,67 +4931,51 @@ export default function App() {
       updatedCustomers = [...customers, newCust];
     }
 
-    saveAllData(products, updatedCustomers, sales, cashRegister);
-    setIsCustomerModalOpen(false);
+    try {
+      await saveAllData(products, updatedCustomers, sales, cashRegister);
+      setIsCustomerModalOpen(false);
+    } catch {
+      alert('No se pudo confirmar el guardado del cliente.');
+    }
   };
 
-  const handlePayBalance = (custId: string, amountToPay: number) => {
+  const handlePayBalance = async (custId: string, amountToPay: number) => {
     if (amountToPay <= 0) return;
     const target = customers.find(c => c.id === custId);
     if (!target) return;
 
-    const actualPayAmount = Math.min(target.unpaidBalance, amountToPay);
-    if (actualPayAmount <= 0) {
+    if (target.unpaidBalance <= 0) {
       alert('Este cliente no tiene saldo pendiente.');
       return;
     }
 
-    applyCustomerBalanceDelta(custId, -actualPayAmount);
-    applyCashDelta(selectedBranchId, actualPayAmount, [{
-      type: 'Ingreso',
-      amount: actualPayAmount,
-      description: `Abono "Fiado" de ${target.name}`,
-      time: new Date().toLocaleTimeString(),
-      createdAt: Date.now()
-    }]);
-    alert(`Abono aplicado con éxito: ${formatMXN(actualPayAmount)}`);
+    try {
+      const actualPayAmount = await applyCustomerPaymentAtomically(custId, amountToPay);
+      if (actualPayAmount <= 0) {
+        alert('Este cliente ya no tiene saldo pendiente.');
+        return;
+      }
+      alert(`Abono aplicado con éxito: ${formatMXN(actualPayAmount)}`);
+    } catch (error) {
+      console.error('Error applying customer payment:', error);
+      alert(`${describeCheckoutError(error).message}\n\nEl abono no se aplicó.`);
+    }
   };
 
-  // Refund Venta
-  const handleRefundSale = (saleId: string) => {
-    if (confirm('¿Está seguro de que desea REEMBOLSAR esta venta? Se restituirá el inventario.')) {
-      const sale = sales.find(s => s.id === saleId);
-      if (!sale) return;
+  // Refund Venta. Sale status, returned stock, customer credit and cash ledger are one
+  // Firestore transaction, so a retry cannot duplicate a refund or leave partial state.
+  const handleRefundSale = async (saleId: string) => {
+    if (!confirm('¿Está seguro de que desea REEMBOLSAR esta venta? Se restituirá el inventario.')) return;
+    const sale = sales.find(s => s.id === saleId);
+    if (!sale) return;
 
-      // Restore inventories atomically (per-product Firestore transaction). Uses the link
-      // snapshotted on each SaleItem at sale time (not the current live product) so this stays
-      // correct even if the product's link config changed or it was deleted since the sale.
-      applyStockDeltas(sale.items.map(item => resolveStockTarget(
-        item.productId, sale.branchId || selectedBranchId, item.quantity,
-        item.linkedStockProductId, item.stockConsumptionFactor
-      )));
-
-      // Adjust customer balance if it was Credit (atomic)
-      if (sale.customerId && sale.paymentMethod === 'Credit') {
-        applyCustomerBalanceDelta(sale.customerId, -sale.total);
-      }
-
-      // Deduct from cash if it was Cash, but always log in transactions audit history (atomic)
-      const refundPaymentLabel = sale.paymentMethod === 'Cash' ? 'Efectivo' : sale.paymentMethod === 'Card' ? 'Tarjeta' : sale.paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito';
-      const refundBranchId = sale.branchId || selectedBranchId;
-      applyCashDelta(refundBranchId, sale.paymentMethod === 'Cash' ? -sale.total : 0, [{
-        type: 'Egreso',
-        amount: sale.total,
-        description: `Cancelación/Reembolso Venta ${sale.id} (${refundPaymentLabel})`,
-        time: new Date().toLocaleTimeString(),
-        createdAt: Date.now(),
-        branchId: refundBranchId
-      }]);
-
-      // Status change (only this single sale doc gets written/diffed)
-      const updatedSales = sales.map(s => s.id === saleId ? { ...s, status: 'Refunded' as const } : s);
-      saveAllData(products, customers, updatedSales, cashRegister);
+    try {
+      await refundSaleAtomically(sale);
       alert('Venta reembolsada con éxito.');
+    } catch (error) {
+      console.error('Error refunding sale:', error);
+      const failure = describeCheckoutError(error);
+      alert(`${failure.message}\n\nNo se aplicó ningún cambio; puedes intentarlo nuevamente.`);
     }
   };
 
@@ -4514,6 +4991,110 @@ export default function App() {
   const [statsDay, setStatsDay] = useState<string>('');
   // Month scope for the "Corte Mensual (PDF)" export in Historial/Caja
   const [pdfCutMonth, setPdfCutMonth] = useState<string>(getCurrentMonthKey());
+  const [isHistoricalLoading, setIsHistoricalLoading] = useState(false);
+  const [historicalLimitWarning, setHistoricalLimitWarning] = useState(false);
+  const historicalLoadLimit = 2000;
+
+  // Keep the real-time streams operational and small. Older months (or all history) are
+  // fetched once only when a report screen requests them, then merged by document id.
+  useEffect(() => {
+    if (!user || !activeCompanyId || !selectedBranchId) return;
+    if (activeTab !== 'analytics' && activeTab !== 'history') return;
+
+    const requestedKey = activeTab === 'history'
+      ? pdfCutMonth
+      : statsDay || statsMonth;
+    if (!requestedKey) return;
+    const range = requestedKey === 'all'
+      ? null
+      : requestedKey.length === 10
+        ? getDayRange(requestedKey)
+        : getMonthRange(requestedKey);
+    if (requestedKey !== 'all' && !range) return;
+    const isMatriz = branches.find(branch => branch.id === selectedBranchId)?.isMatriz ?? false;
+    setHistoricalLimitWarning(false);
+    // The current-month live stream is enough for migrated branches. Matriz still performs
+    // the compatibility read because old sales with no branchId cannot be expressed as a query.
+    if (requestedKey === getCurrentMonthKey() && activeTab === 'history' && !isMatriz) return;
+
+    let cancelled = false;
+    const compId = activeCompanyId;
+    const branchId = selectedBranchId;
+    setIsHistoricalLoading(true);
+
+    const withPeriod = (collectionRef: ReturnType<typeof collection>, branchScoped: boolean) => {
+      const filters = branchScoped ? [where('branchId', '==', branchId)] : [];
+      if (range) {
+        return query(
+          collectionRef,
+          ...filters,
+          where('createdAt', '>=', range.start),
+          where('createdAt', '<', range.end),
+          orderBy('createdAt', 'desc'),
+          limit(historicalLoadLimit + 1)
+        );
+      }
+      return query(collectionRef, ...filters, orderBy('createdAt', 'desc'), limit(historicalLoadLimit + 1));
+    };
+
+    void (async () => {
+      try {
+        const [salesSnapshot, stockSnapshot, cashSnapshot, legacySalesSnapshot] = await Promise.all([
+          getDocs(withPeriod(collection(db, 'companies', compId, 'sales'), true)),
+          getDocs(withPeriod(collection(db, 'companies', compId, 'stockMovements'), true)),
+          getDocs(withPeriod(collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'), false)),
+          // Firestore cannot query for a missing field. This intentionally expensive fallback
+          // runs only on-demand for Matriz reports until the migration script is executed.
+          isMatriz ? getDocs(query(collection(db, 'companies', compId, 'sales'), limit(historicalLoadLimit + 1))) : Promise.resolve(null),
+        ]);
+        if (cancelled) return;
+
+        const wasLimited = salesSnapshot.size > historicalLoadLimit
+          || stockSnapshot.size > historicalLoadLimit
+          || cashSnapshot.size > historicalLoadLimit
+          || Boolean(legacySalesSnapshot && legacySalesSnapshot.size > historicalLoadLimit);
+        setHistoricalLimitWarning(wasLimited);
+
+        const loadedSales = salesSnapshot.docs.slice(0, historicalLoadLimit).map(snapshot => snapshot.data() as Sale);
+        if (legacySalesSnapshot) {
+          legacySalesSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => {
+            const sale = snapshot.data() as Sale;
+            const createdAt = sale.createdAt ?? 0;
+            const inRange = !range || (createdAt >= range.start && createdAt < range.end) || (
+              !sale.createdAt && (requestedKey === 'all' || getSaleMonthKey(sale) === requestedKey || getSaleDayKey(sale) === requestedKey)
+            );
+            if (!sale.branchId && inRange) loadedSales.push(sale);
+          });
+        }
+        setSales(previous => {
+          const merged = new Map<string, Sale>(previous.map(sale => [sale.id, sale]));
+          loadedSales.forEach(sale => merged.set(sale.id, sale));
+          return Array.from(merged.values()).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+        });
+
+        setStockMovements(previous => {
+          const merged = new Map<string, StockMovement>(previous.map(movement => [movement.id, movement]));
+          stockSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => {
+            const movement = snapshot.data() as StockMovement;
+            merged.set(movement.id, movement);
+          });
+          return Array.from(merged.values()).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+        });
+
+        setCashTransactions(previous => {
+          const merged = new Map<string, CashTransaction>(previous.filter(entry => entry.id).map(entry => [entry.id!, entry]));
+          cashSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => merged.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as CashTransaction));
+          return Array.from(merged.values()).sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+        });
+      } catch (error) {
+        console.error('Historical period load failed:', error);
+      } finally {
+        if (!cancelled) setIsHistoricalLoading(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [activeTab, user, activeCompanyId, selectedBranchId, pdfCutMonth, statsMonth, statsDay, branches]);
   
   const handleRecordCashFlow = async (type: 'Ingreso' | 'Egreso') => {
     const val = parseFloat(cashFlowAmount);
@@ -4557,7 +5138,15 @@ export default function App() {
   // `cashRegister` is now the selected branch's own document (see the dedicated
   // onSnapshot effect above), so every entry in it already belongs to this branch —
   // no filtering needed here anymore, unlike branchScopedSales above.
-  const branchScopedTransactions = cashRegister.transactions;
+  const branchScopedTransactions = allCashTransactions;
+  const currentShiftTransactions = useMemo(() => {
+    if (cashRegister.currentShiftId) {
+      return allCashTransactions.filter(transaction => transaction.shiftId === cashRegister.currentShiftId);
+    }
+    return allCashTransactions.filter(transaction =>
+      transaction.createdAt !== undefined && transaction.createdAt >= (cashRegister.openedAt || 0)
+    );
+  }, [allCashTransactions, cashRegister.currentShiftId, cashRegister.openedAt]);
 
   // Inventory movements (surtidos + transfers) that touch the active branch.
   const branchScopedStockMovements = useMemo(
@@ -4571,7 +5160,15 @@ export default function App() {
     tx.type === 'Transferencia' ? `${tx.amount} unid.` : formatMXN(tx.amount);
 
   // Analytics helper metrics
-  const availableStatsMonths = useMemo(() => getAvailableMonths(sales), [sales]);
+  const availableStatsMonths = useMemo(() => {
+    const keys = new Set(getAvailableMonths(sales));
+    const now = new Date();
+    for (let offset = 0; offset < 60; offset++) {
+      const date = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+      keys.add(`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`);
+    }
+    return Array.from(keys).sort((a, b) => b.localeCompare(a));
+  }, [sales]);
 
   const stats = useMemo(() => {
     const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
@@ -4620,14 +5217,14 @@ export default function App() {
   // currently-displayed branch's register. Only computed when a day is actually selected.
   const dailyCashFlow = useMemo(() => {
     if (!statsDay) return null;
-    const movements = cashRegister.transactions.filter((tx): tx is typeof tx & { createdAt: number } =>
+    const movements = allCashTransactions.filter((tx): tx is typeof tx & { createdAt: number } =>
       (tx.type === 'Ingreso' || tx.type === 'Egreso') &&
       tx.createdAt !== undefined && msToDayKey(tx.createdAt) === statsDay
     );
     const totalIngresos = movements.filter(t => t.type === 'Ingreso').reduce((acc, t) => acc + t.amount, 0);
     const totalEgresos = movements.filter(t => t.type === 'Egreso').reduce((acc, t) => acc + t.amount, 0);
     return { movements, totalIngresos, totalEgresos, net: totalIngresos - totalEgresos };
-  }, [cashRegister.transactions, statsDay]);
+  }, [allCashTransactions, statsDay]);
 
   // Corte Diario — top 5 best-selling products for the selected day (by units), from
   // stats.activeSales (already day-filtered above). Day-only per product decision; the
@@ -4660,12 +5257,9 @@ export default function App() {
 
   // Hard login gate: nothing below this point (catalog, sales, sucursales, estadisticas,
   // caja, etc.) mounts until Firebase Auth resolves to a real user. There used to be a
-  // "Modo Local" that ran the whole POS off localStorage without any login — besides
-  // showing operational data to whoever opened the page, saveAllData() mirrors every
-  // authenticated write into those same localStorage keys as an offline-durability cache,
-  // so a logged-out session on a previously-used device could actually surface real
-  // production data. Gating the entire render on `user` closes that regardless of what's
-  // sitting in localStorage.
+  // "Modo Local" that ran the whole POS off localStorage without any login. Historical
+  // devices may still contain those old keys, so gating the entire render on `user` prevents
+  // a logged-out session from surfacing operational data left by an older application build.
   if (isAuthLoading) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -4832,18 +5426,17 @@ export default function App() {
         
         {/* Real-time Clock and Auth on right */}
         <div className="flex items-center space-x-2 lg:space-x-4 flex-shrink-0">
-          {/* Sales this device charged but hasn't been able to upload yet (no signal).
-              Firestore retries them by itself; this just makes the queue visible so nobody
-              closes the app assuming everything is already in the cloud. Always shown (not
-              lg-only) — it matters most on the phones/tablets used at the counter. */}
-          {pendingSaleIds.length > 0 && (
+          {firestoreConnectionState !== 'ready' && (
             <span
-              className="px-2 lg:px-2.5 py-1 rounded-md border font-bold text-[10px] lg:text-xs bg-amber-500 border-amber-300 text-white animate-pulse flex items-center gap-1 flex-shrink-0"
-              title="Estas ventas están guardadas en este dispositivo y se subirán solas cuando vuelva la conexión. No cierres la aplicación."
+              className={`px-2 lg:px-2.5 py-1 rounded-md border font-bold text-[10px] lg:text-xs text-white flex items-center gap-1 flex-shrink-0 ${
+                firestoreConnectionState === 'checking'
+                  ? 'bg-amber-500 border-amber-300 animate-pulse'
+                  : 'bg-rose-600 border-rose-400'
+              }`}
+              title="El cobro se habilita únicamente después de confirmar acceso al servidor de Firestore."
             >
               <AlertCircle className="w-3 h-3" />
-              <span className="hidden sm:inline">{pendingSaleIds.length} venta{pendingSaleIds.length === 1 ? '' : 's'} sin subir</span>
-              <span className="sm:hidden">{pendingSaleIds.length}</span>
+              <span>{firestoreConnectionState === 'checking' ? 'Reconectando…' : firestoreConnectionState === 'offline' ? 'Sin conexión' : 'Revisar acceso'}</span>
             </span>
           )}
           <div className="hidden lg:flex items-center space-x-2 text-sm font-medium opacity-90">
@@ -4871,7 +5464,7 @@ export default function App() {
             </div>
             <div className="flex space-x-1 lg:space-x-1.5 flex-shrink-0">
               <button
-                onClick={() => { localStorage.removeItem(`logic_active_company_${user.uid}`); setActiveCompanyId(null); }}
+                onClick={() => { safeLocalStorageRemove(`logic_active_company_${user.uid}`); setActiveCompanyId(null); }}
                 className="text-[9px] lg:text-[10px] text-white font-bold px-2 lg:px-2.5 py-1 rounded-lg cursor-pointer transition select-none border"
                 style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 70%, black)', borderColor: 'color-mix(in srgb, var(--brand-primary) 35%, transparent)' }}
                 title="Cambiar de comercio / empresa"
@@ -4892,7 +5485,7 @@ export default function App() {
 
       {/* Alert Warn: Unclosed cash register from previous day */}
       {showOvernightWarning && (
-        <div className="bg-gradient-to-r from-amber-500 via-amber-655 to-red-600 text-white px-6 py-3 shadow-md flex justify-between items-center space-x-4 animate-pulse z-10 border-b border-amber-500/10">
+        <div className="bg-gradient-to-r from-amber-500 via-amber-600 to-red-600 text-white px-6 py-3 shadow-md flex justify-between items-center space-x-4 animate-pulse z-10 border-b border-amber-500/10">
           <div className="flex items-center space-x-3 text-xs leading-relaxed">
             <AlertCircle className="w-5 h-5 flex-shrink-0 animate-bounce text-white" />
             <div>
@@ -4901,7 +5494,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center space-x-2.5 flex-shrink-0">
-            <button
+            {canCloseCash && <button
               onClick={() => {
                 setRealCashInput(cashRegister.currentCash.toString());
                 setIsCorteModalOpen(true);
@@ -4909,7 +5502,7 @@ export default function App() {
               className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
             >
               Hacer Corte Ahora <FileText className="w-3 h-3" />
-            </button>
+            </button>}
             <button
               onClick={() => setShowOvernightWarning(false)}
               className="text-white hover:text-slate-100 font-bold p-1 hover:bg-white/10 rounded-full cursor-pointer"
@@ -4922,7 +5515,7 @@ export default function App() {
 
       {/* Alert Warn: Cash register closed — needs opening before selling */}
       {!cashRegister.isOpen && showClosedCajaBanner && (
-        <div className="bg-gradient-to-r from-amber-500 via-amber-655 to-red-600 text-white px-6 py-3 shadow-md flex justify-between items-center space-x-4 animate-pulse z-10 border-b border-amber-500/10">
+        <div className="bg-gradient-to-r from-amber-500 via-amber-600 to-red-600 text-white px-6 py-3 shadow-md flex justify-between items-center space-x-4 animate-pulse z-10 border-b border-amber-500/10">
           <div className="flex items-center space-x-3 text-xs leading-relaxed">
             <AlertCircle className="w-5 h-5 flex-shrink-0 animate-bounce text-white" />
             <div>
@@ -4980,13 +5573,18 @@ export default function App() {
             </button>
           ))}
 
-          {activeCompanyRole !== 'employee' && [
+          {[
             { id: 'branches',   label: 'Sucursales',          icon: <Store className="w-5 h-5" /> },
             { id: 'suppliers',  label: 'Proveedores',         icon: <Truck className="w-5 h-5" /> },
             { id: 'invoicing',  label: 'Facturación',         icon: <FileText className="w-5 h-5" /> },
             { id: 'history',    label: 'Historial / Caja',    icon: <Receipt className="w-5 h-5" /> },
             { id: 'analytics',  label: 'Estadísticas',        icon: <BarChart3 className="w-5 h-5" /> },
-          ].filter(item => item.id !== 'branches' || activeCompanyRole === 'owner').map(({ id, label, icon }) => (
+          ].filter(item =>
+            item.id === 'branches' ? isOwnerOrAdminRole
+              : item.id === 'suppliers' ? canManageSuppliers
+                : item.id === 'invoicing' ? isOwnerOrAdminRole
+                  : canViewSalesHistory
+          ).map(({ id, label, icon }) => (
             <button key={id} id={`nav-${id}`}
               onClick={() => { setActiveTab(id as typeof activeTab); setIsMobileMenuOpen(false); }}
               className={activeTab === id ? navActiveClass : navInactiveClass}
@@ -5007,6 +5605,11 @@ export default function App() {
 
         {/* Dynamic Frame Screen Views */}
         <main className="flex-grow p-4 md:p-6 select-none overflow-y-auto max-w-7xl mx-auto w-full">
+          {historicalLimitWarning && (activeTab === 'history' || activeTab === 'analytics') && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-900 break-words">
+              Este período supera 2,000 registros por tipo. Se muestran los 2,000 más recientes para evitar que el equipo se bloquee; selecciona un mes o día más específico para obtener un reporte completo.
+            </div>
+          )}
           
           {/* SCREEN: TERMINAL POS */}
           {activeTab === 'pos' && (
@@ -5023,8 +5626,8 @@ export default function App() {
                     onClick={() => setPosSubTab('catalog')}
                     className={`flex-1 py-2.5 text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-2 cursor-pointer ${
                       posSubTab === 'catalog'
-                        ? 'bg-white text-slate-800 shadow-sm border border-slate-150'
-                        : 'text-slate-505 hover:text-slate-800'
+                        ? 'bg-white text-slate-800 shadow-sm border border-slate-200'
+                        : 'text-slate-500 hover:text-slate-800'
                     }`}
                   >
                     <ShoppingCart className="w-3.5 h-3.5 inline mr-1" /><span>Catálogo</span>
@@ -5034,7 +5637,7 @@ export default function App() {
                     onClick={() => setPosSubTab('history')}
                     className={`flex-1 py-2.5 text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-2 cursor-pointer ${
                       posSubTab === 'history'
-                        ? 'bg-white text-slate-800 shadow-sm border border-slate-150'
+                        ? 'bg-white text-slate-800 shadow-sm border border-slate-200'
                         : 'text-slate-500 hover:text-slate-800'
                     }`}
                   >
@@ -5045,7 +5648,7 @@ export default function App() {
                     onClick={() => setPosSubTab('cashier')}
                     className={`flex-1 py-2.5 text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-2 cursor-pointer ${
                       posSubTab === 'cashier'
-                        ? 'bg-white text-slate-800 shadow-sm border border-slate-150'
+                        ? 'bg-white text-slate-800 shadow-sm border border-slate-200'
                         : 'text-slate-500 hover:text-slate-800'
                     }`}
                   >
@@ -5065,7 +5668,7 @@ export default function App() {
                             placeholder="Pesquisa por nombre de producto o categoría..."
                             value={searchTerm}
                             onChange={e => setSearchTerm(e.target.value)}
-                            className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-505 text-sm font-medium transition"
+                            className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm font-medium transition"
                           />
                         </div>
                         {/* View toggle: cards vs compact list — helps a lot once the
@@ -5074,7 +5677,7 @@ export default function App() {
                         <div className="flex bg-slate-100 border border-slate-200 rounded-xl p-0.5 shrink-0">
                           <button
                             type="button"
-                            onClick={() => { setPosCatalogView('grid'); localStorage.setItem('logic_pos_catalog_view', 'grid'); }}
+                            onClick={() => { setPosCatalogView('grid'); safeLocalStorageSet('logic_pos_catalog_view', 'grid'); }}
                             className={`p-2.5 rounded-lg transition cursor-pointer ${posCatalogView === 'grid' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}
                             title="Vista de tarjetas"
                             aria-label="Vista de tarjetas"
@@ -5083,7 +5686,7 @@ export default function App() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => { setPosCatalogView('list'); localStorage.setItem('logic_pos_catalog_view', 'list'); }}
+                            onClick={() => { setPosCatalogView('list'); safeLocalStorageSet('logic_pos_catalog_view', 'list'); }}
                             className={`p-2.5 rounded-lg transition cursor-pointer ${posCatalogView === 'list' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}
                             title="Vista de lista"
                             aria-label="Vista de lista"
@@ -5128,7 +5731,7 @@ export default function App() {
                             <p className="font-medium text-lg">No se encontraron productos coincidentes o vacíos</p>
                             <button
                               onClick={() => handleOpenProductModal()}
-                              className="mt-4 px-4 py-2 bg-indigo-605 hover:bg-indigo-700 text-white text-sm font-bold rounded-xl shadow cursor-pointer transition"
+                              className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-xl shadow cursor-pointer transition"
                             >
                               + Crear Nuevo Producto
                             </button>
@@ -5143,7 +5746,7 @@ export default function App() {
                             <div
                                key={prod.id}
                                onClick={() => addToCart(prod)}
-                               className="bg-white border border-slate-200/80 hover:border-indigo-505 rounded-2xl p-3 sm:p-4 flex flex-col justify-between cursor-pointer transition-all hover:shadow-md relative group duration-150"
+                               className="bg-white border border-slate-200/80 hover:border-indigo-500 rounded-2xl p-3 sm:p-4 flex flex-col justify-between cursor-pointer transition-all hover:shadow-md relative group duration-150"
                             >
                               {/* Stock Badges */}
                               <div className="flex flex-wrap gap-1 justify-between items-start mb-2">
@@ -5244,7 +5847,7 @@ export default function App() {
                     ) : (
                       <div className="space-y-3 max-h-[60vh] overflow-y-auto pr-1">
                         {branchScopedSales.map(sale => (
-                          <div key={sale.id} className="border border-slate-150 rounded-xl p-3 bg-slate-50 hover:bg-white transition duration-150 space-y-2 overflow-hidden">
+                          <div key={sale.id} className="border border-slate-200 rounded-xl p-3 bg-slate-50 hover:bg-white transition duration-150 space-y-2 overflow-hidden">
                             <div className="flex justify-between items-center gap-2 text-xs">
                               <span className="font-black text-slate-800 bg-slate-100 border px-2 py-0.5 rounded text-[10px] truncate min-w-0">{sale.id}</span>
                               <span className="text-[10px] text-slate-400 font-mono shrink-0">{sale.timestamp}</span>
@@ -5266,7 +5869,7 @@ export default function App() {
                               <div className="text-right shrink-0">
                                 <p className="font-extrabold text-indigo-700 text-xs">{formatMXN(sale.total)}</p>
                                 <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full border block mt-1 ${
-                                  sale.status === 'Completed' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-750 border-red-200'
+                                  sale.status === 'Completed' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-red-50 text-red-700 border-red-200'
                                 }`}>
                                   {sale.status === 'Completed' ? 'Exitosa' : 'Reembolsada'}
                                 </span>
@@ -5297,7 +5900,7 @@ export default function App() {
                                   setLastCompletedSale(sale);
                                   setLastReceivedAmount(0); // non-cash popup
                                 }}
-                                className="text-[9px] font-black bg-indigo-50 border border-indigo-150 hover:bg-indigo-600 hover:text-white px-2.5 py-1 rounded text-indigo-600 transition cursor-pointer inline-flex items-center gap-1"
+                                className="text-[9px] font-black bg-indigo-50 border border-indigo-100 hover:bg-indigo-600 hover:text-white px-2.5 py-1 rounded text-indigo-600 transition cursor-pointer inline-flex items-center gap-1"
                               >
                                 <Download className="w-2.5 h-2.5" /> Compartir / Recibo
                               </button>
@@ -5317,25 +5920,25 @@ export default function App() {
                         <p className="text-[10px] text-slate-400">Verifica montos físicos, realiza entradas y egresos, y haz cortes.</p>
                       </div>
                       <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider inline-flex items-center gap-1 ${
-                        cashRegister.isOpen ? 'bg-emerald-100 text-emerald-850 border border-emerald-250' : 'bg-rose-105 text-rose-800 border border-rose-250 animate-pulse'
+                        cashRegister.isOpen ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-rose-100 text-rose-800 border border-rose-200 animate-pulse'
                       }`}>
                         Estado: {cashRegister.isOpen ? <>Caja Abierta <Check className="w-3 h-3" /></> : <>Caja Cerrada <X className="w-3 h-3" /></>}
                       </span>
                     </div>
 
                     <div className="grid grid-cols-2 lg:grid-cols-2 gap-4">
-                      <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl space-y-1 text-left">
+                      <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-1 text-left">
                         <span className="text-[9px] text-slate-400 font-black uppercase">Saldo Inicial de Turno</span>
                         <p className="text-sm font-black text-slate-700 font-mono">{formatMXN(cashRegister.initialCash)}</p>
                       </div>
                       <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl space-y-1 text-left">
                         <span className="text-[9px] text-indigo-500 font-black uppercase">Efectivo Sugerido (Sistema)</span>
-                        <p className="text-sm font-black text-indigo-750 font-mono">{formatMXN(displayedCash)}</p>
+                        <p className="text-sm font-black text-indigo-700 font-mono">{formatMXN(displayedCash)}</p>
                       </div>
                     </div>
 
                     <div className="flex justify-center pt-1">
-                      {cashRegister.isOpen ? (
+                      {cashRegister.isOpen && canCloseCash ? (
                         <button
                           type="button"
                           onClick={() => {
@@ -5346,22 +5949,24 @@ export default function App() {
                         >
                           Corte de Caja (Cierre de Turno) <FileText className="w-3.5 h-3.5" />
                         </button>
-                      ) : (
+                      ) : !cashRegister.isOpen ? (
                         <button
                           type="button"
                           onClick={() => {
                             setOpeningCashInput('500');
                             setIsOpeningCajaModalOpen(true);
                           }}
-                          className="w-full py-3 bg-gradient-to-r from-indigo-600 to-indigo-750 hover:from-indigo-700 hover:to-indigo-800 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider animate-pulse inline-flex items-center justify-center gap-1.5"
+                          className="w-full py-3 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-700 hover:to-indigo-800 text-white font-extrabold text-xs rounded-xl shadow cursor-pointer transition uppercase tracking-wider animate-pulse inline-flex items-center justify-center gap-1.5"
                         >
                           Realizar Apertura de Caja <Rocket className="w-3.5 h-3.5" />
                         </button>
+                      ) : (
+                        <p className="text-center text-[10px] text-slate-400 font-bold">Tu cuenta no tiene permiso para cerrar caja.</p>
                       )}
                     </div>
 
                     {cashRegister.isOpen && (
-                      <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl space-y-4 text-left">
+                      <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-4 text-left">
                         <h4 className="font-extrabold text-slate-700 text-xs flex items-center gap-1"><DollarSign className="w-3.5 h-3.5" /> Movimiento de Caja Manual</h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                           <div className="space-y-1/2">
@@ -5371,7 +5976,7 @@ export default function App() {
                               placeholder="Ej: Pago de gas, Propina"
                               value={cashFlowDesc}
                               onChange={e => setCashFlowDesc(e.target.value)}
-                              className="w-full bg-white border border-slate-205 rounded-xl px-3 py-2 outline-none font-bold text-xs"
+                              className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 outline-none font-bold text-xs"
                             />
                           </div>
                           <div className="space-y-1/2">
@@ -5382,7 +5987,7 @@ export default function App() {
                                 placeholder="0.00"
                                 value={cashFlowAmount}
                                 onChange={e => setCashFlowAmount(e.target.value)}
-                                className="w-1/2 bg-white border border-slate-205 rounded-xl px-3 py-2 outline-none font-bold text-xs"
+                                className="w-1/2 bg-white border border-slate-200 rounded-xl px-3 py-2 outline-none font-bold text-xs"
                               />
                               <button
                                 type="button"
@@ -5406,8 +6011,8 @@ export default function App() {
 
                     <div className="space-y-2 text-left">
                       <h4 className="font-extrabold text-xs text-slate-600 flex items-center gap-1"><History className="w-3.5 h-3.5" /> Transacciones del Turno</h4>
-                      <div className="border border-slate-150 rounded-2xl bg-white divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
-                        {cashRegister.transactions.slice().reverse().map((tx, idx) => (
+                      <div className="border border-slate-200 rounded-2xl bg-white divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
+                        {currentShiftTransactions.slice().reverse().map((tx, idx) => (
                           <div key={idx} className="p-3 flex justify-between items-center text-xs">
                             <div className="space-y-0.5">
                               <p className="font-extrabold text-slate-700">{tx.description}</p>
@@ -5420,7 +6025,7 @@ export default function App() {
                             </span>
                           </div>
                         ))}
-                        {cashRegister.transactions.length === 0 && (
+                        {currentShiftTransactions.length === 0 && (
                           <p className="text-center text-[10px] text-slate-400 py-6">Ninguna transacción registrada en la sesión actual.</p>
                         )}
                       </div>
@@ -5440,7 +6045,7 @@ export default function App() {
                     {cart.length > 0 && (
                       <button 
                         onClick={() => setCart([])} 
-                        className="text-xs text-slate-400 hover:text-indigo-650 font-semibold cursor-pointer"
+                        className="text-xs text-slate-400 hover:text-indigo-600 font-semibold cursor-pointer"
                       >
                         Vaciar
                       </button>
@@ -5448,17 +6053,17 @@ export default function App() {
                   </div>
  
                   {/* Customer Selector inside Cart */}
-                  <div className="bg-indigo-55/10 p-3 rounded-xl border border-dashed border-indigo-200/55 mb-4">
+                  <div className="bg-indigo-50/10 p-3 rounded-xl border border-dashed border-indigo-200/55 mb-4">
                     {selectedCustomer ? (
                       <div className="flex justify-between items-center">
                         <div>
                           <p className="text-xs text-slate-400 uppercase tracking-widest font-extrabold">Cliente Seleccionado</p>
                           <p className="font-extrabold text-sm text-slate-800 mt-0.5">{selectedCustomer.name}</p>
-                          <p className="text-xs text-slate-500">Saldo "Fiado" Pendiente: <span className="font-bold text-purple-650">{formatMXN(selectedCustomer.unpaidBalance)}</span></p>
+                          <p className="text-xs text-slate-500">Saldo "Fiado" Pendiente: <span className="font-bold text-purple-600">{formatMXN(selectedCustomer.unpaidBalance)}</span></p>
                         </div>
                         <button 
                           onClick={() => setSelectedCustomer(null)}
-                          className="p-1 text-slate-400 hover:text-purple-650 bg-white shadow rounded-full"
+                          className="p-1 text-slate-400 hover:text-purple-600 bg-white shadow rounded-full"
                         >
                           <X className="w-4 h-4" />
                         </button>
@@ -5531,7 +6136,7 @@ export default function App() {
                   )}
  
                   {/* Cart Discount Tool Panel */}
-                  {cart.length > 0 && (
+                  {cart.length > 0 && canApplyDiscount && (
                     <div className="mt-4 pt-4 border-t border-slate-100 space-y-2.5">
                       <div className="flex justify-between items-center">
                         <span className="text-xs font-bold text-slate-500 flex items-center">
@@ -5676,14 +6281,14 @@ export default function App() {
  
                     <button
                       onClick={completeTransaction}
-                      disabled={isProcessingSale}
-                      className={`w-full py-3.5 text-white font-extrabold text-center rounded-xl shadow-lg transition-all duration-150 flex items-center justify-center space-x-2 ${isProcessingSale ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:shadow-xl'}`}
+                      disabled={isProcessingSale || firestoreConnectionState !== 'ready' || !cashRegister.isOpen}
+                      className={`w-full py-3.5 text-white font-extrabold text-center rounded-xl shadow-lg transition-all duration-150 flex items-center justify-center space-x-2 ${isProcessingSale || firestoreConnectionState !== 'ready' || !cashRegister.isOpen ? 'cursor-not-allowed opacity-70' : 'cursor-pointer hover:shadow-xl'}`}
                       style={{ backgroundColor: 'var(--brand-primary)', filter: 'none' }}
-                      onMouseEnter={e => { if (!isProcessingSale) e.currentTarget.style.filter = 'brightness(1.1)'; }}
+                      onMouseEnter={e => { if (!isProcessingSale && firestoreConnectionState === 'ready' && cashRegister.isOpen) e.currentTarget.style.filter = 'brightness(1.1)'; }}
                       onMouseLeave={e => (e.currentTarget.style.filter = 'none')}
                     >
                       <CircleDollarSign className="w-5 h-5 text-white animate-spin" style={{ animationDuration: isProcessingSale ? '0.8s' : '4s' }} />
-                      <span>{isProcessingSale ? 'GUARDANDO VENTA...' : `PROCESAR VENTA (${formatMXN(cartValues.total)})`}</span>
+                      <span>{isProcessingSale ? 'GUARDANDO / CONFIRMANDO...' : firestoreConnectionState === 'checking' ? 'RECONECTANDO FIRESTORE...' : !cashRegister.isOpen ? 'ABRE CAJA PARA COBRAR' : `PROCESAR VENTA (${formatMXN(cartValues.total)})`}</span>
                     </button>
                   </div>
                 )}
@@ -5704,7 +6309,7 @@ export default function App() {
                   {/* View toggle: cards vs compact list */}
                   <div className="flex bg-slate-100 border border-slate-200 rounded-xl p-0.5">
                     <button
-                      onClick={() => { setInventoryView('grid'); localStorage.setItem('logic_inventory_view', 'grid'); }}
+                      onClick={() => { setInventoryView('grid'); safeLocalStorageSet('logic_inventory_view', 'grid'); }}
                       className={`p-2 rounded-lg transition cursor-pointer ${inventoryView === 'grid' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}
                       title="Vista de tarjetas"
                       aria-label="Vista de tarjetas"
@@ -5712,7 +6317,7 @@ export default function App() {
                       <LayoutGrid className="w-4 h-4" />
                     </button>
                     <button
-                      onClick={() => { setInventoryView('list'); localStorage.setItem('logic_inventory_view', 'list'); }}
+                      onClick={() => { setInventoryView('list'); safeLocalStorageSet('logic_inventory_view', 'list'); }}
                       className={`p-2 rounded-lg transition cursor-pointer ${inventoryView === 'list' ? 'bg-white shadow-sm text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}
                       title="Vista de lista"
                       aria-label="Vista de lista"
@@ -5720,23 +6325,25 @@ export default function App() {
                       <List className="w-4 h-4" />
                     </button>
                   </div>
-                {activeCompanyRole !== 'employee' && (
+                {(canEditProducts || canTransferStock || canViewSalesHistory) && (
                   <div className="flex gap-2 flex-wrap">
                     <button
                       onClick={handleExportProducts}
-                      className="bg-emerald-600 hover:bg-emerald-705 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
                       title="Exportar catálogo completo con existencias multisuccursal a CSV"
                     >
                       <Download className="w-4 h-4" /> Exportar Inventario (CSV)
                     </button>
-                    <button
-                      onClick={() => setIsCategoryModalOpen(true)}
-                      className="bg-slate-100 hover:bg-slate-200 text-slate-705 border border-slate-200 font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
-                    >
-                      <Layers className="w-4 h-4 text-slate-500" />
-                      Editar Categorías
-                    </button>
-                    {selectedBranchId !== matrizBranch?.id && (
+                    {canEditProducts && (
+                      <button
+                        onClick={() => setIsCategoryModalOpen(true)}
+                        className="bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                      >
+                        <Layers className="w-4 h-4 text-slate-500" />
+                        Editar Categorías
+                      </button>
+                    )}
+                    {canTransferStock && selectedBranchId !== matrizBranch?.id && (
                       <button
                         type="button"
                         onClick={handleOpenMoveAllToMatrizModal}
@@ -5747,7 +6354,7 @@ export default function App() {
                         Mover Todo a Matriz
                       </button>
                     )}
-                    {activeCompanyRole === 'owner' && (
+                    {canEditProducts && (
                       <button
                         onClick={() => handleOpenProductModal()}
                         className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
@@ -5756,7 +6363,7 @@ export default function App() {
                         Nuevo Producto
                       </button>
                     )}
-                    {activeCompanyRole === 'owner' && (
+                    {canEditProducts && (
                       <button
                         onClick={handleOpenBulkProductModal}
                         className="bg-violet-600 hover:bg-violet-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
@@ -5780,7 +6387,7 @@ export default function App() {
                   placeholder="Buscar producto por nombre, categoría o SKU..."
                   value={inventorySearchTerm}
                   onChange={e => setInventorySearchTerm(e.target.value)}
-                  className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-505 text-sm font-medium transition"
+                  className="w-full pl-11 pr-4 py-3 rounded-xl bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm font-medium transition"
                 />
               </div>
 
@@ -5793,7 +6400,7 @@ export default function App() {
                   </p>
                 )}
                 {topLevelInventoryProducts.map(prod => (
-                  <div key={prod.id} className="border border-slate-200/80 rounded-2xl p-4 flex flex-col justify-between hover:border-indigo-30 shadow-sm duration-150">
+                  <div key={prod.id} className="border border-slate-200/80 rounded-2xl p-4 flex flex-col justify-between hover:border-indigo-50 shadow-sm duration-150">
                     <div className="space-y-2.5">
                       <div className="flex justify-between items-start">
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
@@ -5811,9 +6418,9 @@ export default function App() {
                         <span className="p-2 rounded-xl flex items-center justify-center" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-primary) 10%, white)' }}>
                           <Package className="w-6 h-6" style={{ color: 'color-mix(in srgb, var(--brand-primary) 60%, #94a3b8)' }} />
                         </span>
-                        <div>
-                          <h4 className="font-extrabold text-slate-800 text-sm leading-tight">{prod.name}</h4>
-                          <p className="text-[10px] text-slate-400 font-mono">ID: {prod.id} {prod.sku ? `| SKU: ${prod.sku}` : ''}</p>
+                        <div className="min-w-0 flex-1">
+                          <h4 className="font-extrabold text-slate-800 text-sm leading-tight break-words">{prod.name}</h4>
+                          <p className="text-[10px] text-slate-400 font-mono truncate" title={`ID: ${prod.id}${prod.sku ? ` | SKU: ${prod.sku}` : ''}`}>ID: {prod.id} {prod.sku ? `| SKU: ${prod.sku}` : ''}</p>
                           {prod.supplierId && (
                             <p className="text-[9px] text-amber-600 font-extrabold tracking-wide uppercase mt-1">
                               <Truck className="w-2.5 h-2.5 inline mr-0.5" />Prov: {suppliers.find(s => s.id === prod.supplierId)?.name || 'Desconocido'}
@@ -5836,7 +6443,7 @@ export default function App() {
                           <p className="text-slate-400 font-medium">Costo</p>
                           <p className="font-bold text-slate-700">{formatMXN(prod.costPrice)}</p>
                         </div>
-                        <div className="text-center bg-indigo-55/10 p-1.5 rounded">
+                        <div className="text-center bg-indigo-50/10 p-1.5 rounded">
                           <p className="text-indigo-400 font-medium">Precio</p>
                           <p className="font-bold text-indigo-700">{formatMXN(prod.salePrice)}</p>
                         </div>
@@ -5844,7 +6451,7 @@ export default function App() {
 
                       <div className="flex justify-between text-xs font-semibold text-slate-600 pt-1">
                         <span>Cant. en Inventario:</span>
-                        <span className={`font-bold ${getProductStock(prod, selectedBranchId, products) <= prod.minStock ? 'text-purple-650' : 'text-slate-800'}`}>{getProductStock(prod, selectedBranchId, products)} u.</span>
+                        <span className={`font-bold ${getProductStock(prod, selectedBranchId, products) <= prod.minStock ? 'text-purple-600' : 'text-slate-800'}`}>{getProductStock(prod, selectedBranchId, products)} u.</span>
                       </div>
 
                       {activeCompanyRole !== 'employee' && branches.length > 1 && (
@@ -5871,7 +6478,7 @@ export default function App() {
                               <div key={child.id} className="flex justify-between items-center text-violet-700 font-bold gap-1.5">
                                 <span className="truncate flex-1">{child.name.replace(prod.name, '').trim() || child.name}:</span>
                                 <span className="shrink-0">{formatMXN(child.salePrice)} · {getProductStock(child, selectedBranchId, products)} u.</span>
-                                {activeCompanyRole === 'owner' && (
+                                {canEditProducts && (
                                   <button
                                     type="button"
                                     onClick={() => handleOpenProductModal(child)}
@@ -5888,9 +6495,9 @@ export default function App() {
                       )}
                     </div>
 
-                    {activeCompanyRole !== 'employee' ? (
+                    {(canEditProducts || canTransferStock) ? (
                       <div className="mt-4 pt-4 border-t border-slate-100">
-                        {branches.length > 1 && (
+                        {canTransferStock && branches.length > 1 && (
                           <button
                             type="button"
                             onClick={() => handleOpenTransferModal(prod.id)}
@@ -5899,15 +6506,17 @@ export default function App() {
                             <Package className="w-3.5 h-3.5 inline mr-1" /><span>Transferir / Repartir Stock</span>
                           </button>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
-                          className="w-full py-2 mb-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 text-xs font-black rounded-xl cursor-pointer transition text-center flex items-center justify-center"
-                          title={`Sumar unidades al stock de ${branches.find(b => b.id === selectedBranchId)?.name || 'esta sucursal'}`}
-                        >
-                          <Plus className="w-3.5 h-3.5 inline mr-1" /><span>Surtir Stock</span>
-                        </button>
-                        {activeCompanyRole === 'owner' ? (
+                        {canEditProducts && (
+                          <button
+                            type="button"
+                            onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
+                            className="w-full py-2 mb-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 text-xs font-black rounded-xl cursor-pointer transition text-center flex items-center justify-center"
+                            title={`Sumar unidades al stock de ${branches.find(b => b.id === selectedBranchId)?.name || 'esta sucursal'}`}
+                          >
+                            <Plus className="w-3.5 h-3.5 inline mr-1" /><span>Surtir Stock</span>
+                          </button>
+                        )}
+                        {canEditProducts ? (
                           <div className="flex space-x-2">
                             <button
                               onClick={() => handleOpenProductModal(prod)}
@@ -5917,20 +6526,20 @@ export default function App() {
                             </button>
                             <button
                               onClick={() => handleDeleteProduct(prod.id)}
-                              className="w-1/2 py-2 hover:bg-purple-50 text-purple-605 text-xs font-bold rounded-xl border border-transparent hover:border-purple-200 cursor-pointer transition text-center"
+                              className="w-1/2 py-2 hover:bg-purple-50 text-purple-600 text-xs font-bold rounded-xl border border-transparent hover:border-purple-200 cursor-pointer transition text-center"
                             >
                               Eliminar
                             </button>
                           </div>
                         ) : (
                           <p className="text-center text-[10px] text-slate-400 font-semibold select-none py-1 flex items-center justify-center gap-1">
-                            <Lock className="w-2.5 h-2.5" /> Solo el Dueño puede editar o eliminar artículos
+                            <Lock className="w-2.5 h-2.5" /> Tu cuenta no puede editar o eliminar artículos
                           </p>
                         )}
                       </div>
                     ) : (
                       <div className="mt-4 pt-3 border-t border-slate-50 text-center text-[10px] text-slate-400 font-semibold select-none flex items-center justify-center gap-1">
-                        <Settings className="w-2.5 h-2.5" /> Solo Administradores pueden gestionar stock
+                        <Settings className="w-2.5 h-2.5" /> Tu cuenta no tiene permisos para gestionar stock
                       </div>
                     )}
                   </div>
@@ -5969,17 +6578,19 @@ export default function App() {
                           </p>
                         )}
                       </div>
-                      {activeCompanyRole !== 'employee' && (
+                      {(canEditProducts || canTransferStock) && (
                         <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
-                            className="p-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 rounded-lg cursor-pointer transition"
-                            title="Surtir stock"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                          </button>
-                          {branches.length > 1 && (
+                          {canEditProducts && (
+                            <button
+                              type="button"
+                              onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
+                              className="p-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 rounded-lg cursor-pointer transition"
+                              title="Surtir stock"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {canTransferStock && branches.length > 1 && (
                             <button
                               type="button"
                               onClick={() => handleOpenTransferModal(prod.id)}
@@ -5989,7 +6600,7 @@ export default function App() {
                               <Package className="w-3.5 h-3.5" />
                             </button>
                           )}
-                          {activeCompanyRole === 'owner' ? (
+                          {canEditProducts ? (
                             <>
                               <button
                                 type="button"
@@ -6043,20 +6654,20 @@ export default function App() {
               <div className="space-y-4">
                 {customers.map(cust => (
                   <div key={cust.id} className="border border-slate-200/80 hover:border-slate-300 rounded-2xl p-4 md:p-5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white shadow-sm transition">
-                    <div className="space-y-1.5 flex-grow">
-                      <div className="flex items-center space-x-2">
-                        <h4 className="font-extrabold text-lg text-slate-800 leading-tight">{cust.name}</h4>
-                        <span className="text-[10px] bg-slate-100 border text-slate-400 font-mono py-0.5 px-2 rounded-full">ID: {cust.id}</span>
+                    <div className="space-y-1.5 flex-grow min-w-0 w-full md:w-auto">
+                      <div className="flex items-start gap-2 min-w-0">
+                        <h4 className="font-extrabold text-lg text-slate-800 leading-tight break-words min-w-0">{cust.name}</h4>
+                        <span className="text-[10px] bg-slate-100 border text-slate-400 font-mono py-0.5 px-2 rounded-full truncate max-w-[45%] shrink-0" title={`ID: ${cust.id}`}>ID: {cust.id}</span>
                       </div>
                       
-                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-semibold text-slate-600">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs font-semibold text-slate-600">
                         <div>
                           <p className="text-slate-400 text-[10px] uppercase">Contacto Tel.</p>
-                          <p className="text-slate-850 font-bold">{cust.phone || 'Vacio'}</p>
+                          <p className="text-slate-800 font-bold">{cust.phone || 'Vacio'}</p>
                         </div>
                         <div>
                           <p className="text-slate-400 text-[10px] uppercase">Correo Electrónico</p>
-                          <p className="text-slate-800 font-bold truncate">{cust.email || 'Vacio'}</p>
+                          <p className="text-slate-800 font-bold truncate" title={cust.email}>{cust.email || 'Vacio'}</p>
                         </div>
                         <div>
                           <p className="text-slate-400 text-[10px] uppercase">Registro</p>
@@ -6072,8 +6683,8 @@ export default function App() {
                     {/* Pending loan (fiado) actions on right */}
                     <div className="w-full md:w-auto p-4 bg-slate-50 border rounded-xl flex flex-col justify-between space-y-3 min-w-[220px]">
                       <div className="flex justify-between items-center text-xs">
-                        <span className="text-slate-505 font-bold">Saldo Fiado:</span>
-                        <span className={`text-sm font-extrabold ${cust.unpaidBalance > 0 ? 'text-purple-605 animate-pulse' : 'text-emerald-600'}`}>
+                        <span className="text-slate-500 font-bold">Saldo Fiado:</span>
+                        <span className={`text-sm font-extrabold ${cust.unpaidBalance > 0 ? 'text-purple-600 animate-pulse' : 'text-emerald-600'}`}>
                           {formatMXN(cust.unpaidBalance)}
                         </span>
                       </div>
@@ -6143,13 +6754,15 @@ export default function App() {
           )}
 
           {/* SCREEN: HISTORIAL DE VENTAS & CONTROL DE CAJA */}
-          {activeTab === 'history' && (
+          {activeTab === 'history' && canViewSalesHistory && (
             <div className="space-y-6">
 
               {/* Cash Register Control Card */}
               <div className="rounded-3xl p-6 text-white shadow-md grid grid-cols-1 md:grid-cols-12 gap-6 items-center border" style={{ background: 'linear-gradient(to right, color-mix(in srgb, var(--brand-dark) 95%, black), color-mix(in srgb, var(--brand-dark) 82%, black), color-mix(in srgb, var(--brand-dark) 70%, black))', borderColor: 'color-mix(in srgb, var(--brand-dark) 55%, black)' }}>
                 <div className="md:col-span-4 space-y-1">
-                  <span className="text-[10px] font-extrabold py-1 px-3 rounded-full uppercase tracking-wider" style={{ color: 'color-mix(in srgb, var(--brand-primary) 45%, white)', backgroundColor: 'color-mix(in srgb, var(--brand-dark) 40%, black)' }}>Caja Activa (Flujo del día)</span>
+                  <span className="text-[10px] font-extrabold py-1 px-3 rounded-full uppercase tracking-wider" style={{ color: 'color-mix(in srgb, var(--brand-primary) 45%, white)', backgroundColor: 'color-mix(in srgb, var(--brand-dark) 40%, black)' }}>
+                    {cashRegister.isOpen ? 'Caja activa (flujo del día)' : 'Caja cerrada (último turno)'}
+                  </span>
                   <p className="text-2xl font-extrabold">Efectivo en Caja</p>
                   <p className="text-3xl font-black text-yellow-400">{formatMXN(displayedCash)}</p>
                   {editInitialCashPrompt ? (
@@ -6163,19 +6776,33 @@ export default function App() {
                          autoFocus
                        />
                        <button
-                         onClick={() => {
-                           const val = parseFloat(newInitialCash);
-                           if (!isNaN(val) && val >= 0) {
-                             const diff = val - cashRegister.initialCash;
-                             if (user && activeCompanyId) {
-                               setDoc(doc(db, 'companies', activeCompanyId, 'cashRegisters', selectedBranchId), {
-                                 initialCash: val,
-                                 currentCash: increment(diff)
-                               }, { merge: true }).catch(err => handleFirestoreError(err, OperationType.UPDATE, `companies/${activeCompanyId}/cashRegisters/${selectedBranchId}`));
-                             }
-                             setEditInitialCashPrompt(false);
-                           }
-                         }}
+                          onClick={async () => {
+                            const val = parseFloat(newInitialCash);
+                            if (!isNaN(val) && val >= 0) {
+                              const diff = val - cashRegister.initialCash;
+                              try {
+                                await writeCashRegisterForBranch(selectedBranchId, {
+                                  ...cashRegister,
+                                  initialCash: val,
+                                  currentCash: cashRegister.currentCash + diff,
+                                  transactions: [],
+                                }, {
+                                  type: diff >= 0 ? 'Ingreso' : 'Egreso',
+                                  amount: Math.abs(diff),
+                                  cashDelta: diff,
+                                  description: `Ajuste de monto de apertura: ${formatMXN(cashRegister.initialCash)} → ${formatMXN(val)}`,
+                                  time: new Date().toLocaleTimeString(),
+                                  createdAt: Date.now(),
+                                  shiftId: cashRegister.currentShiftId,
+                                  balanceAfter: cashRegister.currentCash + diff,
+                                });
+                                setEditInitialCashPrompt(false);
+                              } catch (error) {
+                                console.error('Opening amount adjustment failed:', error);
+                                alert('No se pudo confirmar el ajuste del monto de apertura.');
+                              }
+                            }
+                          }}
                          className="bg-emerald-500 hover:bg-emerald-600 text-white px-2 py-0.5 text-[10px] rounded font-bold transition shadow-sm inline-flex items-center gap-1"
                        ><Check className="w-3 h-3" /> Guardar
                        </button>
@@ -6242,7 +6869,7 @@ export default function App() {
                 {/* Cash Transactions Logs inside card */}
                 <div className="md:col-span-4 p-4 rounded-2xl border h-[110px] overflow-y-auto text-[10px] space-y-1.5 font-mono" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 40%, black)', borderColor: 'color-mix(in srgb, var(--brand-dark) 30%, transparent)' }}>
                   <p className="font-bold tracking-wider uppercase pb-0.5" style={{ color: 'color-mix(in srgb, var(--brand-primary) 45%, white)', borderBottom: '1px solid color-mix(in srgb, var(--brand-dark) 30%, transparent)' }}>Auditoría rápida de movimientos</p>
-                  {cashRegister.transactions.map((tx, idx) => (
+                  {currentShiftTransactions.map((tx, idx) => (
                     <div key={idx} className="flex justify-between items-center text-white/80 gap-2">
                       <span className="truncate">{tx.time} - {tx.description}</span>
                       <span className={`font-bold ${tx.type === 'Ingreso' || tx.type === 'Venta' ? 'text-emerald-400' : tx.type === 'Transferencia' ? 'text-sky-300' : 'text-pink-400'}`}>
@@ -6276,11 +6903,12 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleDownloadMonthlyCutPdf}
+                      disabled={isHistoricalLoading}
                       className="px-4 py-2.5 text-white font-black text-xs rounded-xl shadow-md flex items-center space-x-2 transition cursor-pointer whitespace-nowrap"
                       style={{ backgroundColor: 'var(--brand-primary)' }}
                     >
                       <Download className="w-3.5 h-3.5" />
-                      <span>Descargar PDF</span>
+                      <span>{isHistoricalLoading ? 'Cargando período…' : 'Descargar PDF'}</span>
                     </button>
                   </div>
                 </div>
@@ -6353,7 +6981,7 @@ export default function App() {
                               <span className="text-xs font-black text-slate-800 bg-slate-100 border px-2.5 py-1 rounded-md">{sale.id}</span>
                               <span className="text-xs text-slate-500 font-medium">{sale.timestamp}</span>
                               {sale.folio && (
-                                <span className="text-[10px] font-bold bg-amber-50 text-indigo-805 border border-indigo-200 px-2 py-0.5 rounded-md">
+                                <span className="text-[10px] font-bold bg-amber-50 text-indigo-800 border border-indigo-200 px-2 py-0.5 rounded-md">
                                   Folio: {sale.folio}
                                 </span>
                               )}
@@ -6378,9 +7006,9 @@ export default function App() {
                             <div className="space-y-1">
                               <p className="text-[10px] text-slate-400 font-extrabold uppercase">Artículos Incluidos</p>
                               {sale.items.map((it, idx) => (
-                                <div key={idx} className="flex justify-between text-xs text-slate-700 font-semibold">
-                                  <span>{it.quantity}x {it.name}</span>
-                                  <span className="text-slate-500">{formatMXN(it.salePrice * it.quantity)}</span>
+                                <div key={idx} className="flex justify-between gap-2 text-xs text-slate-700 font-semibold">
+                                  <span className="min-w-0 break-words">{it.quantity}x {it.name}</span>
+                                  <span className="text-slate-500 shrink-0">{formatMXN(it.salePrice * it.quantity)}</span>
                                 </div>
                               ))}
                             </div>
@@ -6403,7 +7031,7 @@ export default function App() {
                                 <button
                                   type="button"
                                   onClick={() => handleRefundSale(sale.id)}
-                                  className="mt-2.5 px-3 py-1 text-[10px] hover:bg-pink-650 hover:text-white border border-pink-200 rounded text-pink-600 font-bold cursor-pointer transition align-middle"
+                                  className="mt-2.5 px-3 py-1 text-[10px] hover:bg-pink-600 hover:text-white border border-pink-200 rounded text-pink-600 font-bold cursor-pointer transition align-middle"
                                 >
                                   Devolución / Reembolso
                                 </button>
@@ -6446,7 +7074,7 @@ export default function App() {
                                   {tx.type === 'Venta' ? <Receipt className="w-4 h-4" /> : tx.type === 'Ingreso' ? <Download className="w-4 h-4" /> : isTransfer ? <RotateCcw className="w-4 h-4" /> : <Upload className="w-4 h-4" />}
                                 </span>
                                 <div>
-                                  <p className="text-xs font-bold text-slate-805">{tx.description}</p>
+                                  <p className="text-xs font-bold text-slate-800">{tx.description}</p>
                                   <div className="flex items-center space-x-2 text-[10px] text-slate-400 font-semibold mt-0.5">
                                     <span>Hora: {tx.time}</span>
                                     <span>•</span>
@@ -6549,7 +7177,7 @@ export default function App() {
               {/* Core Analytics Header with Download button */}
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white border border-slate-200 p-6 rounded-3xl shadow-xs text-left">
                 <div>
-                  <h2 className="text-lg font-black text-slate-805 tracking-tight flex items-center gap-2">
+                  <h2 className="text-lg font-black text-slate-800 tracking-tight flex items-center gap-2">
                     <BarChart3 className="w-5 h-5" style={{ color: 'var(--brand-primary)' }} /> Centro de Estadísticas de {userCompanies[activeCompanyId || '']?.name || 'Mi Comercio'}
                   </h2>
                   <p className="text-xs text-slate-500">Métricas completas, ganancias aproximadas y tickets logrados por mes.</p>
@@ -6587,6 +7215,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={handleDownloadDailyCutPdf}
+                      disabled={isHistoricalLoading}
                       className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl shadow-md flex items-center justify-center gap-2 transition cursor-pointer"
                     >
                       <Download className="w-3.5 h-3.5" /><span>Descargar Corte del Día (PDF)</span>
@@ -6612,7 +7241,7 @@ export default function App() {
                     <TrendingUp className="w-4 h-4 text-emerald-500" />
                   </div>
                   <p className="text-2xl font-extrabold text-slate-800 mt-2">{formatMXN(stats.grossRevenue)}</p>
-                  <p className="text-[10px] text-slate-550 mt-2">Ventas finalizadas con éxito</p>
+                  <p className="text-[10px] text-slate-600 mt-2">Ventas finalizadas con éxito</p>
                 </div>
 
                 <div className="bg-white rounded-2xl p-4 border shadow-sm">
@@ -6717,7 +7346,7 @@ export default function App() {
                         const pctWidth = maxVal > 0 ? (numVal / maxVal) * 100 : 0;
                         return (
                           <div key={cat} className="space-y-1">
-                            <div className="flex justify-between text-xs font-bold text-slate-705">
+                            <div className="flex justify-between text-xs font-bold text-slate-700">
                               <span>{cat}</span>
                               <span className="text-indigo-600">{val} uds. vendidas</span>
                             </div>
@@ -6737,7 +7366,7 @@ export default function App() {
                 {/* List Low Stock Alerts with action shortcut */}
                 <div className="bg-white rounded-2xl border p-5 shadow-sm space-y-4">
                   <div>
-                    <h3 className="font-extrabold text-purple-650 text-sm flex items-center">
+                    <h3 className="font-extrabold text-purple-600 text-sm flex items-center">
                       <AlertCircle className="w-4 h-4 mr-1 text-purple-500 animate-bounce" />
                       Alertas de Reabastecimiento Crítico
                     </h3>
@@ -6751,7 +7380,7 @@ export default function App() {
                       {stats.lowStockItems.map(p => (
                         <div key={p.id} className="bg-slate-50 border border-slate-100 flex justify-between items-center p-2.5 rounded-xl">
                           <div>
-                            <p className="text-xs font-bold text-slate-850">{p.name}</p>
+                            <p className="text-xs font-bold text-slate-800">{p.name}</p>
                             <p className="text-[9px] text-slate-400">Mínimo sugerido: {p.minStock}</p>
                           </div>
                           <div className="text-right">
@@ -6784,16 +7413,16 @@ export default function App() {
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-3xl border shadow-sm">
                 <div>
                   <h2 className="text-xl font-black text-slate-800 tracking-tight flex items-center">
-                    <Store className="w-5 h-5 mr-2 text-teal-650" />
+                    <Store className="w-5 h-5 mr-2 text-teal-600" />
                     Control de Sucursales y Oficinas
                   </h2>
                   <p className="text-slate-500 text-xs mt-1">
                     Administra múltiples ubicaciones físicas o móviles, asigna gerentes, y monitorea el rendimiento individual.
                   </p>
                 </div>
-                {activeCompanyRole !== 'employee' && (
+                {isOwnerOrAdminRole && (
                   <div className="flex gap-2.5 w-full md:w-auto self-start flex-wrap">
-                    {branches.length > 1 && (
+                    {canTransferStock && branches.length > 1 && (
                       <button
                         type="button"
                         onClick={() => handleOpenTransferModal()}
@@ -6829,7 +7458,7 @@ export default function App() {
                       }`}
                     >
                       {isActive && (
-                        <span className="absolute top-4 right-4 bg-teal-100 border border-teal-200 text-teal-850 text-[9px] font-black uppercase px-2 py-0.5 rounded-full select-none">
+                        <span className="absolute top-4 right-4 bg-teal-100 border border-teal-200 text-teal-800 text-[9px] font-black uppercase px-2 py-0.5 rounded-full select-none">
                           Trabajando Aquí
                         </span>
                       )}
@@ -6839,24 +7468,24 @@ export default function App() {
                           <div className={`p-2.5 rounded-2xl ${isActive ? 'bg-teal-50 text-teal-700' : 'bg-slate-100 text-slate-500'}`}>
                             <Building2 className="w-5 h-5" />
                           </div>
-                          <div>
-                            <h3 className="font-extrabold text-slate-800 text-sm group-hover:text-teal-700 transition">{branch.name}</h3>
-                            <p className="text-slate-400 text-[10px] mt-0.5 font-mono">ID: {branch.id}</p>
+                          <div className="min-w-0 flex-1">
+                            <h3 className="font-extrabold text-slate-800 text-sm group-hover:text-teal-700 transition break-words">{branch.name}</h3>
+                            <p className="text-slate-400 text-[10px] mt-0.5 font-mono truncate" title={`ID: ${branch.id}`}>ID: {branch.id}</p>
                           </div>
                         </div>
 
                         <div className="space-y-2 border-t border-slate-100 pt-3 text-xs leading-relaxed">
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Dirección:</span>
-                            <span className="font-semibold text-slate-705 max-w-[150px] truncate" title={branch.address}>{branch.address || 'Sin registrar'}</span>
+                            <span className="font-semibold text-slate-700 max-w-[150px] truncate" title={branch.address}>{branch.address || 'Sin registrar'}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Teléfono:</span>
-                            <span className="font-semibold text-slate-705">{branch.phone || 'Sin registrar'}</span>
+                            <span className="font-semibold text-slate-700 max-w-[150px] truncate" title={branch.phone}>{branch.phone || 'Sin registrar'}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Gerente / Resp:</span>
-                            <span className="font-semibold text-teal-700">{branch.manager || 'No asignado'}</span>
+                            <span className="font-semibold text-teal-700 max-w-[150px] truncate" title={branch.manager}>{branch.manager || 'No asignado'}</span>
                           </div>
                         </div>
 
@@ -6880,7 +7509,7 @@ export default function App() {
                         {!isActive && !isBranchLocked ? (
                           <button
                             onClick={() => handleSelectBranch(branch.id)}
-                            className="px-3 py-1.5 bg-slate-100 hover:bg-teal-50 hover:text-teal-700 border border-slate-250 hover:border-teal-200 text-slate-700 font-bold rounded-lg cursor-pointer transition text-[10px]"
+                            className="px-3 py-1.5 bg-slate-100 hover:bg-teal-50 hover:text-teal-700 border border-slate-200 hover:border-teal-200 text-slate-700 font-bold rounded-lg cursor-pointer transition text-[10px]"
                           >
                             Hacer Activa
                           </button>
@@ -6894,7 +7523,7 @@ export default function App() {
                           </span>
                         )}
 
-                        {activeCompanyRole === 'owner' ? (
+                        {isOwnerOrAdminRole ? (
                           <div className="flex space-x-1">
                             <button
                               onClick={() => handleOpenBranchModal(branch)}
@@ -6902,13 +7531,15 @@ export default function App() {
                             >
                               Editar
                             </button>
-                            <button
-                              onClick={() => handleDeleteBranch(branch.id)}
-                              className="p-1 px-2 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-md transition font-semibold text-[10px]"
-                              title="Eliminar Sucursal"
-                            >
-                              Eliminar
-                            </button>
+                            {activeCompanyRole === 'owner' && (
+                              <button
+                                onClick={() => handleDeleteBranch(branch.id)}
+                                className="p-1 px-2 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-md transition font-semibold text-[10px]"
+                                title="Eliminar Sucursal"
+                              >
+                                Eliminar
+                              </button>
+                            )}
                           </div>
                         ) : (
                           <span className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1">
@@ -6929,7 +7560,7 @@ export default function App() {
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-3xl border shadow-sm">
                 <div>
                   <h2 className="text-xl font-black text-slate-800 tracking-tight flex items-center">
-                    <Truck className="w-5 h-5 mr-2 text-amber-653 animate-bounce" />
+                    <Truck className="w-5 h-5 mr-2 text-amber-600 animate-bounce" />
                     Catálogo de Proveedores de Insumos
                   </h2>
                   <p className="text-slate-500 text-xs mt-1">
@@ -6937,14 +7568,14 @@ export default function App() {
                   </p>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
-                  <button
+                  {canManageSuppliers && <button
                     onClick={() => handleOpenRestock()}
                     className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2"
                   >
                     <ArrowLeft className="w-4 h-4 rotate-180" />
                     <span>Reabastecer / Surtir Almacén</span>
-                  </button>
-                  {activeCompanyRole !== 'employee' && (
+                  </button>}
+                  {canManageSuppliers && (
                     <button
                       onClick={() => handleOpenSupplierModal()}
                       className="px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2"
@@ -6969,21 +7600,21 @@ export default function App() {
                             <div className="p-2.5 bg-amber-50 text-amber-700 rounded-2xl group-hover:bg-amber-100 transition">
                               <Truck className="w-5 h-5" />
                             </div>
-                            <div>
-                              <h3 className="font-extrabold text-slate-800 text-sm group-hover:text-amber-700 transition">{supplier.name}</h3>
-                              <p className="text-slate-400 text-[9px] font-mono mt-0.5">Categoría: <span className="text-amber-700 font-bold bg-amber-50 border border-amber-100 px-1.5 py-0.2 rounded-md">{supplier.category}</span></p>
+                            <div className="min-w-0 flex-1">
+                              <h3 className="font-extrabold text-slate-800 text-sm group-hover:text-amber-700 transition break-words">{supplier.name}</h3>
+                              <p className="text-slate-400 text-[9px] font-mono mt-0.5">Categoría: <span className="text-amber-700 font-bold bg-amber-50 border border-amber-100 px-1.5 py-0.5 rounded-md">{supplier.category}</span></p>
                             </div>
                           </div>
                         </div>
 
-                        <div className="space-y-2 border-t border-slate-105 pt-3 text-xs leading-relaxed">
+                        <div className="space-y-2 border-t border-slate-100 pt-3 text-xs leading-relaxed">
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Contacto:</span>
-                            <span className="font-semibold text-slate-705">{supplier.contactName || 'Sin registrar'}</span>
+                            <span className="font-semibold text-slate-700 max-w-[150px] truncate" title={supplier.contactName}>{supplier.contactName || 'Sin registrar'}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Teléfono:</span>
-                            <span className="font-semibold text-slate-705 font-mono">{supplier.phone || 'Sin registrar'}</span>
+                            <span className="font-semibold text-slate-700 font-mono max-w-[150px] truncate" title={supplier.phone}>{supplier.phone || 'Sin registrar'}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Email:</span>
@@ -6991,13 +7622,13 @@ export default function App() {
                           </div>
                           <div className="flex justify-between">
                             <span className="text-slate-400 font-bold uppercase text-[9px]">Dirección:</span>
-                            <span className="font-semibold text-slate-705 max-w-[150px] truncate" title={supplier.address}>{supplier.address || 'Sin registrar'}</span>
+                            <span className="font-semibold text-slate-700 max-w-[150px] truncate" title={supplier.address}>{supplier.address || 'Sin registrar'}</span>
                           </div>
                         </div>
 
                         {/* Associated Products metrics */}
-                        <div className="bg-amber-50/20 border border-amber-105/40 p-3 rounded-2xl">
-                          <div className="flex justify-between items-center text-xs font-bold text-slate-705">
+                        <div className="bg-amber-50/20 border border-amber-100/40 p-3 rounded-2xl">
+                          <div className="flex justify-between items-center text-xs font-bold text-slate-700">
                             <span>Productos Surtidos:</span>
                             <span className="text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full text-[10px] font-black">{linkedProducts.length} artículos</span>
                           </div>
@@ -7007,9 +7638,9 @@ export default function App() {
                               {linkedProducts.slice(0, 3).map(p => {
                                 const displayStock = getProductStock(p, selectedBranchId, products);
                                 return (
-                                <div key={p.id} className="flex justify-between font-medium">
-                                  <span>{p.name}</span>
-                                  <span className={`font-mono font-bold ${displayStock <= p.minStock ? 'text-orange-500' : 'text-slate-700'}`}>Stock: {displayStock}</span>
+                                <div key={p.id} className="flex justify-between gap-2 font-medium min-w-0">
+                                  <span className="min-w-0 truncate" title={p.name}>{p.name}</span>
+                                  <span className={`font-mono font-bold shrink-0 ${displayStock <= p.minStock ? 'text-orange-500' : 'text-slate-700'}`}>Stock: {displayStock}</span>
                                 </div>
                               );})}
                               {linkedProducts.length > 3 && (
@@ -7021,7 +7652,7 @@ export default function App() {
                       </div>
 
                       <div className="mt-5 pt-3 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
-                        <button
+                        {canManageSuppliers && <button
                           onClick={() => {
                             if (linkedProducts.length === 0) {
                               alert('Registre o vincule productos a este proveedor en el Inventario antes de reabastecer.');
@@ -7032,9 +7663,9 @@ export default function App() {
                           className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 font-bold rounded-lg text-white cursor-pointer transition text-[10px] shadow-sm"
                         >
                           Surtir Productos
-                        </button>
+                        </button>}
 
-                        {activeCompanyRole !== 'employee' ? (
+                        {canManageSuppliers ? (
                           <div className="flex space-x-1">
                             <button
                               onClick={() => handleOpenSupplierModal(supplier)}
@@ -7193,7 +7824,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         // Allow choosing / creating a company - clear any storage and let screen display selection
-                        localStorage.removeItem(`logic_active_company_${user.uid}`);
+                        safeLocalStorageRemove(`logic_active_company_${user.uid}`);
                         setActiveCompanyId(null);
                       }}
                       className="px-6 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-sm rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2 mx-auto"
@@ -7215,7 +7846,7 @@ export default function App() {
                           window.location.reload();
                         }
                       }}
-                      className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-250 text-slate-600 hover:text-slate-800 text-xs font-bold rounded-lg cursor-pointer transition"
+                      className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-800 text-xs font-bold rounded-lg cursor-pointer transition"
                     >
                       Restablecer Base de Datos Local
                     </button>
@@ -7231,7 +7862,7 @@ export default function App() {
                 currentUserId={user.uid}
                 userAvailableCompanies={userCompanies}
                 onSwitchCompany={(id) => {
-                  localStorage.setItem(`logic_active_company_${user.uid}`, id);
+                  safeLocalStorageSet(`logic_active_company_${user.uid}`, id);
                   setActiveCompanyId(id);
                   setActiveTab('pos');
                 }}
@@ -7444,7 +8075,7 @@ export default function App() {
                           setProdForm({ ...prodForm, category: e.target.value });
                         }
                       }}
-                      className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-55 font-bold text-slate-700"
+                      className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-50 font-bold text-slate-700"
                     >
                       {!prodForm.category && <option value="">-- Seleccionar Categoría --</option>}
                       {selectCategoriesList.map(cat => (
@@ -7724,7 +8355,7 @@ export default function App() {
                 <label className="text-xs font-bold text-slate-500 block">Presentaciones (lo que se vende) *</label>
                 {bulkForm.presentations.map((pres, idx) => (
                   <div key={idx} className="border border-slate-200 rounded-xl p-3 space-y-2">
-                    <div className="grid grid-cols-[1fr_1fr_70px_auto] gap-2 items-center">
+                    <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_90px_auto] gap-2 items-center">
                       <input
                         type="text"
                         placeholder="Nombre de esta presentación"
@@ -7734,7 +8365,7 @@ export default function App() {
                           next[idx] = { ...next[idx], suffix: e.target.value };
                           setBulkForm({ ...bulkForm, presentations: next });
                         }}
-                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                        className="w-full min-w-0 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
                       />
                       <input
                         type="number"
@@ -7746,7 +8377,7 @@ export default function App() {
                           next[idx] = { ...next[idx], price: e.target.value };
                           setBulkForm({ ...bulkForm, presentations: next });
                         }}
-                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                        className="w-full min-w-0 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
                       />
                       <input
                         type="number"
@@ -7759,7 +8390,7 @@ export default function App() {
                           next[idx] = { ...next[idx], factor: e.target.value };
                           setBulkForm({ ...bulkForm, presentations: next });
                         }}
-                        className="text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
+                        className="w-full min-w-0 text-xs bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-violet-500"
                       />
                       <button
                         type="button"
@@ -7770,7 +8401,7 @@ export default function App() {
                         <X className="w-3.5 h-3.5" />
                       </button>
                     </div>
-                    <div className="grid grid-cols-3 gap-2 items-center">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 items-center">
                       <input
                         type="number"
                         step="0.01"
@@ -7923,7 +8554,7 @@ export default function App() {
               </h3>
               <button
                 onClick={() => { setIsTransferModalOpen(false); setTransferProductSearch(''); }}
-                className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -7987,7 +8618,7 @@ export default function App() {
                       <div
                         key={p.id}
                         onClick={() => inList ? removeTransferItem(p.id) : addTransferItem(p.id)}
-                        className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer transition ${inList ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-150 hover:bg-slate-50'}`}
+                        className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer transition ${inList ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}
                       >
                         <input type="checkbox" checked={!!inList} readOnly className="pointer-events-none accent-indigo-600" />
                         <div className="flex-1 min-w-0">
@@ -8075,12 +8706,12 @@ export default function App() {
           <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4">
             <div className="flex justify-between items-center pb-2 border-b">
               <h3 className="font-extrabold text-lg text-slate-800 flex items-center">
-                <Store className="w-5 h-5 mr-2 text-teal-650" />
+                <Store className="w-5 h-5 mr-2 text-teal-600" />
                 {editingBranch ? 'Modificar Sucursal' : 'Registrar Nueva Sucursal'}
               </h3>
               <button 
                 onClick={() => setIsBranchModalOpen(false)} 
-                className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -8184,12 +8815,12 @@ export default function App() {
           <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex justify-between items-center pb-2 border-b">
               <h3 className="font-extrabold text-lg text-slate-800 flex items-center">
-                <Truck className="w-5 h-5 mr-2 text-amber-653" />
+                <Truck className="w-5 h-5 mr-2 text-amber-600" />
                 {editingSupplier ? 'Modificar Proveedor' : 'Registrar Nuevo Proveedor'}
               </h3>
               <button 
                 onClick={() => setIsSupplierModalOpen(false)} 
-                className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -8291,7 +8922,7 @@ export default function App() {
                                   setSupplierProductIds(prev => [...prev, prod.id]);
                                 }
                               }}
-                              className="rounded border-slate-305 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
                             />
                             <span>{prod.name} (Stock: {getProductStock(prod, selectedBranchId, products)})</span>
                           </label>
@@ -8336,7 +8967,7 @@ export default function App() {
               </h3>
               <button 
                 onClick={() => setIsRestockOpen(false)} 
-                className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-105 hover:bg-slate-200 rounded-full transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -8432,7 +9063,7 @@ export default function App() {
                   <div className="bg-indigo-50 border border-indigo-100 p-3 rounded-xl space-y-1">
                     <div className="flex justify-between items-center text-xs font-bold text-indigo-900">
                       <span>Total Egreso en Caja:</span>
-                      <span className="text-sm font-black text-indigo-650">
+                      <span className="text-sm font-black text-indigo-600">
                         {formatMXN(parseInt(restockForm.qty) * parseFloat(restockForm.cost))}
                       </span>
                     </div>
@@ -8451,9 +9082,10 @@ export default function App() {
                 </button>
                 <button 
                   type="submit"
-                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg cursor-pointer shadow-md"
+                  disabled={isSavingRestock}
+                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded-lg cursor-pointer disabled:cursor-not-allowed shadow-md"
                 >
-                  Confirmar Egreso y Surtido
+                  {isSavingRestock ? 'Confirmando...' : 'Confirmar Egreso y Surtido'}
                 </button>
               </div>
             </form>
@@ -8473,7 +9105,7 @@ export default function App() {
               <button 
                 type="button"
                 onClick={() => setIsCategoryModalOpen(false)} 
-                className="p-1.5 text-slate-400 hover:text-slate-705 bg-slate-50 hover:bg-slate-100 rounded-full transition cursor-pointer"
+                className="p-1.5 text-slate-400 hover:text-slate-700 bg-slate-50 hover:bg-slate-100 rounded-full transition cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -8501,13 +9133,13 @@ export default function App() {
                 </div>
               </div>
 
-              <p className="text-slate-505 leading-relaxed font-semibold">
+              <p className="text-slate-500 leading-relaxed font-semibold">
                 Al renombrar una categoría, todos los artículos de tu catálogo pertenecientes a ella se actualizarán automáticamente.
               </p>
 
               <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
                 {selectCategoriesList.map(cat => (
-                  <div key={cat} className="p-2 bg-slate-50 border border-slate-150 rounded-xl">
+                  <div key={cat} className="p-2 bg-slate-50 border border-slate-200 rounded-xl">
                     <CategorySelectorRowItem
                       cat={cat}
                       onRename={(oldName, newName) => {
@@ -8555,20 +9187,20 @@ export default function App() {
             </div>
 
             {/* Micro compact ticket receipt section */}
-            <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl text-xs space-y-2.5 font-mono">
+            <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl text-xs space-y-2.5 font-mono">
               <div className="flex justify-between font-bold border-b border-dashed pb-2">
                 <span>Artículos</span>
                 <span>Subtotal</span>
               </div>
               <div className="space-y-1 select-text max-h-24 overflow-y-auto pr-1">
                 {lastCompletedSale.items.map((it, idx) => (
-                  <div key={idx} className="flex justify-between text-slate-600">
-                    <span>{it.quantity}x {it.name}</span>
-                    <span>{formatMXN(it.salePrice * it.quantity)}</span>
+                  <div key={idx} className="flex justify-between gap-2 text-slate-600">
+                    <span className="min-w-0 break-words">{it.quantity}x {it.name}</span>
+                    <span className="shrink-0">{formatMXN(it.salePrice * it.quantity)}</span>
                   </div>
                 ))}
               </div>
-              <div className="border-t border-dashed pt-2 space-y-1 text-slate-505">
+              <div className="border-t border-dashed pt-2 space-y-1 text-slate-500">
                 <div className="flex justify-between text-[11px]">
                   <span>Subtotal:</span>
                   <span>{formatMXN(lastCompletedSale.subtotal)}</span>
@@ -8637,7 +9269,7 @@ export default function App() {
                   })()}
                   target="_blank"
                   rel="noreferrer"
-                  className="p-2.5 bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-155"
+                  className="p-2.5 bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-150"
                 >
                   <MessageCircle className="w-3.5 h-3.5" /> WhatsApp
                 </a>
@@ -8656,7 +9288,7 @@ export default function App() {
                     body += `\n¡Gracias por preferir nuestros servicios!\n\n${businessName}`;
                     return `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
                   })()}
-                  className="p-2.5 bg-sky-50 hover:bg-sky-100/80 border border-sky-200 text-sky-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-155"
+                  className="p-2.5 bg-sky-50 hover:bg-sky-100/80 border border-sky-200 text-sky-800 rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-center duration-150"
                 >
                   <Mail className="w-3.5 h-3.5" /> Correo
                 </a>
@@ -8665,7 +9297,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => handlePrintReceipt(lastCompletedSale)}
-                className="w-full p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-250 text-indigo-700 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
+                className="w-full p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
               >
                 <Printer className="w-4 h-4" /> Imprimir Ticket / Guardar PDF
               </button>
@@ -8703,7 +9335,7 @@ export default function App() {
               )}
             </div>
 
-            <div className="bg-slate-50 border border-slate-150 p-4 rounded-2xl text-xs space-y-2.5 font-mono">
+            <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl text-xs space-y-2.5 font-mono">
               <div className="flex justify-between text-slate-600">
                 <span className="font-bold">Origen:</span>
                 <span className="text-right">{lastCompletedTransfer.sourceBranchName}</span>
@@ -8724,7 +9356,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => handlePrintTransferTicket(lastCompletedTransfer)}
-              className="w-full p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-250 text-indigo-700 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
+              className="w-full p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-extrabold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition"
             >
               <Printer className="w-4 h-4" /> Imprimir Ticket de Traspaso
             </button>
@@ -8758,14 +9390,14 @@ export default function App() {
             </div>
 
             <div className="space-y-3.5 text-xs font-semibold text-slate-700">
-              <div className="bg-slate-50 border border-slate-150 p-3 rounded-xl space-y-2">
+              <div className="bg-slate-50 border border-slate-200 p-3 rounded-xl space-y-2">
                 <div className="flex justify-between">
                   <span className="text-slate-500">Saldo Inicial:</span>
                   <span className="font-mono font-bold">{formatMXN(cashRegister.initialCash)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500">Efectivo Sugerido (Sistema):</span>
-                  <span className="font-mono text-indigo-750 font-extrabold">{formatMXN(cashRegister.currentCash)}</span>
+                  <span className="font-mono text-indigo-700 font-extrabold">{formatMXN(cashRegister.currentCash)}</span>
                 </div>
               </div>
 
@@ -8786,7 +9418,7 @@ export default function App() {
                   (parseFloat(realCashInput) - cashRegister.currentCash) === 0 
                   ? 'bg-emerald-50 border-emerald-100 text-emerald-800' 
                   : (parseFloat(realCashInput) - cashRegister.currentCash) > 0 
-                    ? 'bg-blue-50 border-blue-105 text-blue-800' 
+                    ? 'bg-blue-50 border-blue-100 text-blue-800'
                     : 'bg-rose-50 border-rose-100 text-rose-800'
                 }`}>
                   <p className="font-bold">Diferencia Contable:</p>
@@ -8855,7 +9487,7 @@ export default function App() {
                   step="0.01"
                   value={openingCashInput}
                   onChange={e => setOpeningCashInput(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-700"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700"
                 />
               </div>
             </div>
@@ -8889,7 +9521,7 @@ export default function App() {
           onCreateCompany={handleCreateCompany}
           onJoinWithCode={handleJoinCompanyWithCode}
           onSelectCompany={(id) => {
-            localStorage.setItem(`logic_active_company_${user.uid}`, id);
+            safeLocalStorageSet(`logic_active_company_${user.uid}`, id);
             setActiveCompanyId(id);
           }}
           onDeleteCompany={handleDeleteCompany}
@@ -9059,7 +9691,7 @@ const CategorySelectorRowItem = ({ cat, onRename }: { cat: string; onRename: (ol
           type="text"
           value={name}
           onChange={e => setName(e.target.value)}
-          className="flex-grow bg-white border border-slate-200 px-2.5 py-1 rounded-lg text-slate-750 font-bold focus:ring-1 focus:ring-indigo-505 outline-none text-xs"
+          className="flex-grow bg-white border border-slate-200 px-2.5 py-1 rounded-lg text-slate-700 font-bold focus:ring-1 focus:ring-indigo-500 outline-none text-xs"
         />
       ) : (
         <span className="font-bold text-slate-700 px-1">{cat}</span>
@@ -9089,7 +9721,7 @@ const CategorySelectorRowItem = ({ cat, onRename }: { cat: string; onRename: (ol
         ) : (
           <button
             onClick={() => setIsEditing(true)}
-            className="px-2 py-1 text-indigo-600 hover:bg-indigo-50 border border-indigo-150 rounded cursor-pointer transition"
+            className="px-2 py-1 text-indigo-600 hover:bg-indigo-50 border border-indigo-100 rounded cursor-pointer transition"
           >
             Renombrar
           </button>

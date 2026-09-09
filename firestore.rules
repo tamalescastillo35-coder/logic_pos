@@ -2,6 +2,16 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ===============================================================
+    // Affected data model (checkout/cash repair)
+    // ===============================================================
+    // sales/{saleId}: immutable completed sale; numeric createdAt + branchId are required for
+    // new cashier writes. Legacy owner/admin restores remain readable/updateable.
+    // cashRegisters/{branchId}: bounded current-shift state only. A legacy transactions list
+    // may remain, but every update must leave it untouched.
+    // cashRegisters/{branchId}/transactions/{transactionId}: append-only, creator-bound ledger.
+    // checkoutEvents/{eventId}: append-only attempt/outcome audit event.
+
     // Global Safety Net default catch-all
     match /{document=**} {
       allow read, write: if false;
@@ -25,8 +35,7 @@ service cloud.firestore {
     }
     
     function isVerifiedUser() {
-      // Note: rules language has no endsWith(); matches() is a full-string RE2 match
-      return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.email.matches('.*@logicpos\\.com'));
+      return isSignedIn() && request.auth.token.email_verified == true;
     }
 
     // Membership verification helper functions
@@ -46,12 +55,33 @@ service cloud.firestore {
       return isMemberOfCompany(companyId) && getMemberRole(companyId) == 'owner';
     }
 
+    // Credential employees use managed @logicpos.com identities that cannot verify an inbox.
+    // They may write only after the Owner has already provisioned their member document.
+    function canWriteCompany(companyId) {
+      return isVerifiedUser() || (
+        isSignedIn() && request.auth.token.email is string
+        && request.auth.token.email.matches('.*@logicpos\\.com')
+        && isMemberOfCompany(companyId)
+      );
+    }
+
     // A member's permissions array, used for fine-grained (non-admin) write access
     function hasPermission(companyId, perm) {
       return isOwnerOrAdmin(companyId) ||
         (isMemberOfCompany(companyId) &&
          'permissions' in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data &&
          perm in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.permissions);
+    }
+
+    function canUseBranch(companyId, branchId) {
+      return isMemberOfCompany(companyId) && (
+        getMemberRole(companyId) == 'owner'
+        || getMemberRole(companyId) == 'master_admin'
+        || (
+          'assignedBranchId' in get(memberPath(companyId, request.auth.uid)).data
+          && get(memberPath(companyId, request.auth.uid)).data.assignedBranchId == branchId
+        )
+      );
     }
 
     // Validation shape rules
@@ -77,14 +107,93 @@ service cloud.firestore {
           && data.name is string && data.name.size() <= 200
           && data.email is string && data.email.size() <= 200
           && data.role is string && (data.role == 'owner' || data.role == 'master_admin' || data.role == 'admin' || data.role == 'employee')
-          && (!('joinedAt' in data) || (data.joinedAt is string || data.joinedAt is timestamp));
+          && (!('joinedAt' in data) || (data.joinedAt is string || data.joinedAt is timestamp))
+          && (!('assignedBranchId' in data) || (data.assignedBranchId is string && data.assignedBranchId.size() <= 128))
+          && (!('customRoleName' in data) || (data.customRoleName is string && data.customRoleName.size() <= 100))
+          && (!('inviteCode' in data) || (data.inviteCode is string && data.inviteCode.size() <= 100))
+          && (!('isCredentialAccount' in data) || data.isCredentialAccount is bool)
+          && (!('permissions' in data) || (
+            data.permissions is list && data.permissions.size() <= 6
+            && data.permissions.hasOnly([
+              'sales_history', 'products_edit', 'stock_transfer',
+              'suppliers_restock', 'cash_close', 'apply_discount'
+            ])
+          ));
     }
 
     function isValidInvitationCode(data) {
-      return data.code is string && data.code.size() <= 100
+      return data.keys().hasOnly([
+            'code', 'companyId', 'companyName', 'role', 'usageType',
+            'createdAt', 'expiresAt', 'createdBy'
+          ])
+          && data.code is string && data.code.size() <= 100
           && data.companyId is string && data.companyId.size() <= 128
           && data.companyName is string && data.companyName.size() <= 200
-          && data.role is string && (data.role == 'employee' || data.role == 'admin' || data.role == 'master_admin');
+          && data.role is string && (data.role == 'employee' || data.role == 'admin' || data.role == 'master_admin')
+          && data.usageType is string && (data.usageType == 'single' || data.usageType == 'multiple')
+          && data.createdAt is timestamp
+          && data.expiresAt is timestamp && data.expiresAt > request.time
+          && data.expiresAt < request.time + duration.value(8, 'd')
+          && data.createdBy is string && data.createdBy == request.auth.uid;
+    }
+
+    function invitationPath(code) {
+      return /databases/$(database)/documents/invitationCodes/$(code);
+    }
+
+    function companyPath(companyId) {
+      return /databases/$(database)/documents/companies/$(companyId);
+    }
+
+    function memberPath(companyId, memberId) {
+      return /databases/$(database)/documents/companies/$(companyId)/members/$(memberId);
+    }
+
+    function isUsableInvitation(companyId, role, code) {
+      return code is string
+          && exists(invitationPath(code))
+          && get(invitationPath(code)).data.code == code
+          && get(invitationPath(code)).data.companyId == companyId
+          && get(invitationPath(code)).data.role == role
+          && get(invitationPath(code)).data.expiresAt is timestamp
+          && get(invitationPath(code)).data.expiresAt > request.time
+          && get(companyPath(companyId)).data.invitationCode == code
+          && (
+            get(invitationPath(code)).data.usageType == 'multiple'
+            || (
+              get(invitationPath(code)).data.usageType == 'single'
+              && !existsAfter(invitationPath(code))
+              && getAfter(companyPath(companyId)).data.invitationCode == null
+            )
+          );
+    }
+
+    function isConsumingSingleUseInvitation(companyId) {
+      return existing().invitationCode is string
+          && incoming().invitationCode == null
+          && incoming().diff(existing()).affectedKeys().hasOnly(['invitationCode'])
+          && exists(invitationPath(existing().invitationCode))
+          && get(invitationPath(existing().invitationCode)).data.companyId == companyId
+          && get(invitationPath(existing().invitationCode)).data.usageType == 'single'
+          && get(invitationPath(existing().invitationCode)).data.expiresAt > request.time
+          && !existsAfter(invitationPath(existing().invitationCode))
+          && existsAfter(memberPath(companyId, request.auth.uid))
+          && getAfter(memberPath(companyId, request.auth.uid)).data.inviteCode == existing().invitationCode;
+    }
+
+    function isTransferringOwnership(companyId) {
+      return isVerifiedUser()
+          && isOwner(companyId)
+          && existing().ownerId == request.auth.uid
+          && incoming().ownerId != existing().ownerId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['ownerId'])
+          && exists(memberPath(companyId, incoming().ownerId))
+          && (!('isCredentialAccount' in get(memberPath(companyId, incoming().ownerId)).data)
+            || get(memberPath(companyId, incoming().ownerId)).data.isCredentialAccount == false)
+          && getAfter(memberPath(companyId, incoming().ownerId)).data.userId == incoming().ownerId
+          && getAfter(memberPath(companyId, incoming().ownerId)).data.role == 'owner'
+          && getAfter(memberPath(companyId, existing().ownerId)).data.userId == existing().ownerId
+          && getAfter(memberPath(companyId, existing().ownerId)).data.role == 'master_admin';
     }
 
     function isValidProduct(data) {
@@ -93,8 +202,9 @@ service cloud.firestore {
           && data.category is string && data.category.size() <= 100
           && data.costPrice is number && data.costPrice >= 0.0
           && data.salePrice is number && data.salePrice >= 0.0
-          && data.stock is number && data.stock >= -1000 && data.stock <= 1000000
+          && data.stock is number && data.stock >= 0 && data.stock <= 1000000
           && data.minStock is int && data.minStock >= 0
+          && (!('branchStocks' in data) || data.branchStocks is map)
           && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 1000))
           && (!('sku' in data) || (data.sku is string && data.sku.size() <= 100))
           && (!('supplierId' in data) || (data.supplierId is string && data.supplierId.size() <= 128))
@@ -108,7 +218,7 @@ service cloud.firestore {
           && data.name is string && data.name.size() <= 200
           && (!('phone' in data) || (data.phone is string && data.phone.size() <= 50))
           && (!('email' in data) || (data.email is string && data.email.size() <= 200))
-          && (!('unpaidBalance' in data) || (data.unpaidBalance is number))
+          && (!('unpaidBalance' in data) || (data.unpaidBalance is number && data.unpaidBalance >= 0 && data.unpaidBalance <= 1000000000))
           && (!('registeredDate' in data) || (data.registeredDate is string && data.registeredDate.size() <= 100));
     }
 
@@ -133,21 +243,136 @@ service cloud.firestore {
     // Schema Validation Helpers
     function isValidSale(data) {
       return data.id is string && data.id.size() <= 128
-          && data.items is list && data.items.size() <= 500
+          && data.items is list && data.items.size() <= 450
+          && (!('subtotal' in data) || (data.subtotal is number && data.subtotal >= 0.0))
+          && (!('discount' in data) || (data.discount is number && data.discount >= 0.0))
+          && (!('tax' in data) || (data.tax is number && data.tax >= 0.0))
           && data.total is number && data.total >= 0.0
           && data.paymentMethod is string && (data.paymentMethod == 'Cash' || data.paymentMethod == 'Card' || data.paymentMethod == 'Debit' || data.paymentMethod == 'Transfer' || data.paymentMethod == 'Credit')
           && (!('customerId' in data) || (data.customerId is string && data.customerId.size() <= 128))
           && (!('customerName' in data) || (data.customerName is string && data.customerName.size() <= 200))
           && data.timestamp is string && data.timestamp.size() <= 100
           && data.status is string && (data.status == 'Completed' || data.status == 'Refunded')
-          && (!('branchId' in data) || (data.branchId is string && data.branchId.size() <= 128));
+          && (!('createdAt' in data) || data.createdAt is number)
+          && (!('branchId' in data) || (data.branchId is string && data.branchId.size() <= 128))
+          && (!('folio' in data) || (data.folio is string && data.folio.size() <= 200))
+          && (!('requiresInvoice' in data) || data.requiresInvoice is bool)
+          && (!('invoiceStatus' in data) || (data.invoiceStatus is string && (data.invoiceStatus == 'pending' || data.invoiceStatus == 'completed')))
+          && (!('employeeName' in data) || (data.employeeName is string && data.employeeName.size() <= 200));
+    }
+
+    function isValidNewSale(data) {
+      return isValidSale(data)
+          && data.items.size() > 0
+          && data.subtotal is number && data.subtotal >= 0
+          && data.discount is number && data.discount >= 0 && data.discount <= data.subtotal
+          && data.tax is number && data.tax >= 0
+          && data.total == data.subtotal - data.discount + data.tax
+          && data.createdAt is number
+          && data.branchId is string && data.branchId.size() > 0 && data.branchId.size() <= 128
+          && data.status == 'Completed';
     }
 
     function isValidCashRegister(data) {
       return data.isOpen is bool
           && data.initialCash is number && data.initialCash >= 0.0
           && data.currentCash is number
-          && (!('transactions' in data) || (data.transactions is list && data.transactions.size() <= 2000));
+          && (!('transactions' in data) || data.transactions is list)
+          && (!('lastOperationalDate' in data) || (data.lastOperationalDate is string && data.lastOperationalDate.size() <= 20))
+          && (!('currentShiftId' in data) || (data.currentShiftId is string && data.currentShiftId.size() <= 128))
+          && (!('openedAt' in data) || data.openedAt is number)
+          && (!('closedAt' in data) || data.closedAt is number)
+          && (!('lastTransactionId' in data) || (data.lastTransactionId is string && isValidId(data.lastTransactionId)))
+          && (!('updatedAt' in data) || data.updatedAt is number);
+    }
+
+    function isValidCashTransaction(data, registerId, transactionId) {
+      return data.keys().hasOnly([
+            'id', 'type', 'amount', 'cashDelta', 'description', 'time', 'timestamp',
+            'createdAt', 'branchId', 'shiftId', 'saleId', 'paymentMethod', 'createdBy',
+            'balanceAfter'
+          ])
+          && data.id is string && data.id == transactionId && isValidId(data.id)
+          && data.type is string && (
+            data.type == 'Ingreso' || data.type == 'Egreso' || data.type == 'Venta' ||
+            data.type == 'Transferencia' || data.type == 'Apertura' || data.type == 'Cierre'
+          )
+          && data.amount is number && data.amount >= 0.0 && data.amount <= 1000000000
+          && data.cashDelta is number && data.cashDelta >= -1000000000 && data.cashDelta <= 1000000000
+          && data.description is string && data.description.size() <= 1000
+          && data.time is string && data.time.size() <= 100
+          && data.timestamp is string && data.timestamp.size() <= 100
+          && data.createdAt is number
+          && data.branchId is string && data.branchId == registerId
+          && data.createdBy is string && data.createdBy == request.auth.uid
+          && (!('shiftId' in data) || (data.shiftId is string && data.shiftId.size() <= 128))
+          && (!('saleId' in data) || (data.saleId is string && data.saleId.size() <= 128))
+          && (!('paymentMethod' in data) || (data.paymentMethod is string && (
+            data.paymentMethod == 'Cash' || data.paymentMethod == 'Card' ||
+            data.paymentMethod == 'Transfer' || data.paymentMethod == 'Credit'
+          )))
+          && (
+            data.type != 'Venta'
+            || (
+              data.paymentMethod == 'Cash' && data.cashDelta == data.amount
+            )
+            || (
+              data.paymentMethod != 'Cash' && data.cashDelta == 0
+            )
+          )
+          && data.balanceAfter is number;
+    }
+
+    function cashLedgerPath(companyId, registerId, transactionId) {
+      return /databases/$(database)/documents/companies/$(companyId)/cashRegisters/$(registerId)/transactions/$(transactionId);
+    }
+
+    function hasMatchingCashLedger(companyId, registerId) {
+      return incoming().lastTransactionId is string
+          && existsAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId))
+          && getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.branchId == registerId
+          && getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.createdBy == request.auth.uid;
+    }
+
+    function isValidCashRegisterCreate(companyId, registerId) {
+      return isValidCashRegister(incoming())
+          && !('transactions' in incoming())
+          && incoming().isOpen == true
+          && hasMatchingCashLedger(companyId, registerId)
+          && getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.type == 'Apertura'
+          && incoming().currentCash == getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.amount;
+    }
+
+    function isValidCashRegisterUpdate(companyId, registerId) {
+      return isValidCashRegister(incoming())
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'isOpen', 'initialCash', 'currentCash', 'lastOperationalDate', 'currentShiftId',
+            'openedAt', 'closedAt', 'lastTransactionId', 'updatedAt'
+          ])
+          && hasMatchingCashLedger(companyId, registerId)
+          && (
+            (
+              getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.type == 'Apertura'
+              && incoming().isOpen == true
+              && incoming().currentCash == incoming().initialCash
+              && incoming().currentCash == getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.amount
+            )
+            ||
+            (
+              getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.type == 'Cierre'
+              && existing().isOpen == true && incoming().isOpen == false
+              && incoming().currentCash == getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.balanceAfter
+            )
+            ||
+            (
+              incoming().isOpen == existing().isOpen
+              && incoming().currentCash == existing().currentCash + getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.cashDelta
+              && (
+                incoming().initialCash == existing().initialCash
+                || isOwnerOrAdmin(companyId)
+              )
+            )
+          );
     }
 
     function isValidStockMovement(data) {
@@ -155,14 +380,25 @@ service cloud.firestore {
           && data.type is string && (data.type == 'surtido' || data.type == 'merma' || data.type == 'transfer_in' || data.type == 'transfer_out')
           && data.productId is string && data.productId.size() <= 128
           && data.productName is string && data.productName.size() <= 200
-          && data.quantity is number
+          && data.quantity is number && data.quantity > 0 && data.quantity <= 1000000
           && data.branchId is string && data.branchId.size() <= 128
+          && (!('branchName' in data) || (data.branchName is string && data.branchName.size() <= 200))
           && (!('counterpartBranchId' in data) || (data.counterpartBranchId is string && data.counterpartBranchId.size() <= 128))
-          && (!('createdAt' in data) || data.createdAt is number);
+          && (!('counterpartBranchName' in data) || (data.counterpartBranchName is string && data.counterpartBranchName.size() <= 200))
+          && (!('userName' in data) || (data.userName is string && data.userName.size() <= 200))
+          && data.timestamp is string && data.timestamp.size() <= 100
+          && data.createdAt is number
+          && (!('transferId' in data) || (data.transferId is string && data.transferId.size() <= 128))
+          && (!('unitPrice' in data) || (data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 1000000000));
     }
 
     function isValidCheckoutEvent(data) {
-      return data.id is string && data.id.size() <= 128
+      return data.keys().hasOnly([
+            'id', 'saleId', 'status', 'timestamp', 'createdAt', 'branchId', 'branchName',
+            'employeeName', 'userId', 'paymentMethod', 'total', 'itemCount', 'errorMessage',
+            'isSessionInvalid'
+          ])
+          && data.id is string && data.id.size() <= 128
           && data.saleId is string && data.saleId.size() <= 128
           && data.status is string && (
                data.status == 'started' || data.status == 'success' || data.status == 'failed' ||
@@ -174,7 +410,7 @@ service cloud.firestore {
           && (!('branchId' in data) || (data.branchId is string && data.branchId.size() <= 128))
           && (!('branchName' in data) || (data.branchName is string && data.branchName.size() <= 200))
           && (!('employeeName' in data) || (data.employeeName is string && data.employeeName.size() <= 200))
-          && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
+          && data.userId is string && data.userId == request.auth.uid
           && (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 20))
           && (!('total' in data) || data.total is number)
           && (!('itemCount' in data) || data.itemCount is number)
@@ -241,8 +477,13 @@ service cloud.firestore {
 
       match /cashRegisters/{registerId} {
         allow list: if isSignedIn() && request.auth.uid == userId;
-        allow get, create, update, delete: if isSignedIn() && request.auth.uid == userId && isValidId(registerId) &&
-          (request.method == 'get' || request.method == 'delete' || (isVerifiedUser() && isValidCashRegister(incoming())));
+        allow get, delete: if isSignedIn() && request.auth.uid == userId && isValidId(registerId);
+        allow create: if isVerifiedUser() && request.auth.uid == userId && isValidId(registerId)
+          && isValidCashRegister(incoming())
+          && (!('transactions' in incoming()) || incoming().transactions.size() <= 2000);
+        allow update: if isVerifiedUser() && request.auth.uid == userId && isValidId(registerId)
+          && isValidCashRegister(incoming())
+          && (!('transactions' in incoming()) || incoming().transactions == existing().transactions);
       }
     }
 
@@ -251,7 +492,13 @@ service cloud.firestore {
       allow get: if isSignedIn() && isMemberOfCompany(companyId);
       allow list: if isSignedIn() && isMemberOfCompany(companyId);
       allow create: if isVerifiedUser() && isValidCompany(incoming()) && incoming().id == companyId && incoming().ownerId == request.auth.uid;
-      allow update: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidCompany(incoming()) && incoming().id == companyId && incoming().ownerId == existing().ownerId;
+      allow update: if isValidCompany(incoming()) && incoming().id == companyId && (
+        (incoming().ownerId == existing().ownerId && (
+          (isVerifiedUser() && isOwnerOrAdmin(companyId))
+          || (isVerifiedUser() && isConsumingSingleUseInvitation(companyId))
+        ))
+        || isTransferringOwnership(companyId)
+      );
       allow delete: if isVerifiedUser() && isOwner(companyId);
 
       // Members Subcollection inside Company
@@ -269,17 +516,24 @@ service cloud.firestore {
             exists(/databases/$(database)/documents/companies/$(companyId)) &&
             get(/databases/$(database)/documents/companies/$(companyId)).data.ownerId == request.auth.uid)
           ||
-          (request.auth.uid == memberId && 'inviteCode' in incoming() && incoming().inviteCode is string &&
-            exists(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)) &&
-            get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.companyId == companyId &&
-            get(/databases/$(database)/documents/invitationCodes/$(incoming().inviteCode)).data.role == incoming().role)
+          (request.auth.uid == memberId && 'inviteCode' in incoming()
+            && isUsableInvitation(companyId, incoming().role, incoming().inviteCode))
           ||
           (request.auth.uid != memberId && isOwner(companyId))
         );
 
         // Updating a member (branch reassignment, role change, permissions) — owner-only.
         allow update: if isVerifiedUser() && isValidCompanyMember(incoming()) &&
-          incoming().userId == memberId && existing().userId == memberId && isOwner(companyId);
+          incoming().userId == memberId && existing().userId == memberId && isOwner(companyId)
+          && get(companyPath(companyId)).data.ownerId == request.auth.uid && (
+            (existing().role != 'owner' && incoming().role != 'owner')
+            || (existing().role == 'owner' && incoming().role == 'owner')
+            || (existing().role != 'owner' && incoming().role == 'owner'
+              && getAfter(companyPath(companyId)).data.ownerId == memberId)
+            || (existing().role == 'owner' && incoming().role == 'master_admin'
+              && memberId == request.auth.uid
+              && getAfter(companyPath(companyId)).data.ownerId != memberId)
+          );
 
         // Deleting/removing a member — owner-only.
         allow delete: if isVerifiedUser() && isOwner(companyId);
@@ -288,12 +542,12 @@ service cloud.firestore {
       // Products subcollection inside Company
       match /products/{productId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(productId) &&
+        allow create, delete: if canWriteCompany(companyId) && hasPermission(companyId, 'products_edit') && isValidId(productId) &&
           (request.method == 'delete' || (isValidProduct(incoming()) && incoming().id == productId));
         // Selling/transferring only ever touches stock/branchStocks — that's a basic right
         // of any cashier ringing up a sale. Changing any other field (price, cost, name,
         // sku, supplier...) is a catalogue edit and needs an explicit permission.
-        allow update: if isVerifiedUser() && isValidId(productId) &&
+        allow update: if canWriteCompany(companyId) && isValidId(productId) &&
           isValidProduct(incoming()) && incoming().id == productId && (
             (isMemberOfCompany(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks']))
             || hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'stock_transfer') || hasPermission(companyId, 'suppliers_restock')
@@ -303,54 +557,85 @@ service cloud.firestore {
       // Customers subcollection inside Company
       match /customers/{customerId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, update, delete: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(customerId) &&
+        allow create, update, delete: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(customerId) &&
           (request.method == 'delete' || (isValidCustomer(incoming()) && incoming().id == customerId));
       }
 
       // Branches subcollection inside Company
       match /branches/{branchId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, update, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(branchId) &&
-          (request.method == 'delete' || (isValidBranch(incoming()) && incoming().id == branchId));
+        allow create, update: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(branchId)
+          && isValidBranch(incoming()) && incoming().id == branchId;
+        allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(branchId);
       }
 
       // Suppliers subcollection inside Company
       match /suppliers/{supplierId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, update, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(supplierId) &&
+        allow create, update, delete: if canWriteCompany(companyId) && hasPermission(companyId, 'suppliers_restock') && isValidId(supplierId) &&
           (request.method == 'delete' || (isValidSupplier(incoming()) && incoming().id == supplierId));
       }
 
       // Sales subcollection inside Company
       match /sales/{saleId} {
-        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
         // Any member can ring up a new sale; only owner/admin can void a completed sale record
-        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(saleId) &&
-          isValidSale(incoming()) && incoming().id == saleId;
-        allow delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(saleId);
+        allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) &&
+          isValidSale(incoming()) && incoming().id == saleId &&
+          (isValidNewSale(incoming()) || isOwnerOrAdmin(companyId)) &&
+          canUseBranch(companyId, incoming().branchId) &&
+          (!('discount' in incoming()) || incoming().discount == 0 || hasPermission(companyId, 'apply_discount'));
+        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(saleId);
         // Status changes (refunds) require owner/admin approval; marking an invoice as
         // billed/pending is a routine bookkeeping action any member may perform
-        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
+        allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
           && (
             (isOwnerOrAdmin(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
-            || incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus'])
+            || (isOwnerOrAdmin(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus']))
           );
       }
 
       // Cash Registers subcollection inside Company
       match /cashRegisters/{registerId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        // Any member can update the running register (every sale touches currentCash)
-        allow update: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(registerId) && isValidCashRegister(incoming());
-        // Only owner/admin can create a new register doc or remove one entirely
-        allow create, delete: if isVerifiedUser() && isOwnerOrAdmin(companyId) && isValidId(registerId) &&
-          (request.method == 'delete' || isValidCashRegister(incoming()));
+        allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(registerId)
+          && canUseBranch(companyId, registerId) && isValidCashRegisterCreate(companyId, registerId);
+        allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(registerId)
+          && canUseBranch(companyId, registerId) && isValidCashRegisterUpdate(companyId, registerId)
+          && (getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.type != 'Cierre'
+              || hasPermission(companyId, 'cash_close'));
+        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(registerId);
+
+        // Append-only ledger. A sale entry must be committed with the matching sale document;
+        // manual/open/close entries remain branch- and creator-scoped and are immutable.
+        match /transactions/{transactionId} {
+          allow get: if isSignedIn() && isMemberOfCompany(companyId);
+          allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
+          allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId)
+            && canUseBranch(companyId, registerId) && isValidId(registerId) && isValidId(transactionId)
+            && isValidCashTransaction(incoming(), registerId, transactionId)
+            && (incoming().type != 'Cierre' || hasPermission(companyId, 'cash_close'))
+            && existsAfter(/databases/$(database)/documents/companies/$(companyId)/cashRegisters/$(registerId))
+            && getAfter(/databases/$(database)/documents/companies/$(companyId)/cashRegisters/$(registerId)).data.lastTransactionId == transactionId
+            && getAfter(/databases/$(database)/documents/companies/$(companyId)/cashRegisters/$(registerId)).data.currentCash == incoming().balanceAfter
+            && (
+              incoming().type != 'Venta'
+              || (
+                incoming().saleId is string
+                && existsAfter(/databases/$(database)/documents/companies/$(companyId)/sales/$(incoming().saleId))
+                && getAfter(/databases/$(database)/documents/companies/$(companyId)/sales/$(incoming().saleId)).data.branchId == registerId
+                && getAfter(/databases/$(database)/documents/companies/$(companyId)/sales/$(incoming().saleId)).data.total == incoming().amount
+              )
+            );
+          allow update, delete: if false;
+        }
       }
 
       // Settings subcollection (branding, config, etc.)
       match /settings/{settingId} {
         allow read: if isSignedIn() && isMemberOfCompany(companyId);
-        allow write: if isVerifiedUser() && isOwnerOrAdmin(companyId);
+        allow write: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId);
       }
 
       // Stock movements — append-only audit log of restocks ("surtido") and inter-branch
@@ -358,11 +643,26 @@ service cloud.firestore {
       // already allowed to make); nobody may edit/delete entries except owner/admin, so the
       // history can't be quietly rewritten.
       match /stockMovements/{movementId} {
-        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(movementId)
-          && isValidStockMovement(incoming()) && incoming().id == movementId;
+        allow get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
+        allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(movementId)
+          && (
+            canUseBranch(companyId, incoming().branchId)
+            || (
+              (incoming().type == 'transfer_in' || incoming().type == 'transfer_out')
+              && 'counterpartBranchId' in incoming()
+              && canUseBranch(companyId, incoming().counterpartBranchId)
+            )
+          )
+          && isValidStockMovement(incoming()) && incoming().id == movementId
+          && (
+            ((incoming().type == 'surtido' || incoming().type == 'merma')
+              && (hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'suppliers_restock')))
+            || ((incoming().type == 'transfer_in' || incoming().type == 'transfer_out')
+              && hasPermission(companyId, 'stock_transfer'))
+          );
         allow update: if false;
-        allow delete: if isVerifiedUser() && isOwnerOrAdmin(companyId);
+        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId);
       }
 
       // Checkout funnel audit log — best-effort, invisible record of every sale SAVE ATTEMPT
@@ -373,9 +673,16 @@ service cloud.firestore {
       // owner/admin — its only value is being a record that can't be quietly edited or
       // removed by exactly the people whose accountability it might be used to check.
       match /checkoutEvents/{eventId} {
-        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create: if isVerifiedUser() && isMemberOfCompany(companyId) && isValidId(eventId)
-          && isValidCheckoutEvent(incoming()) && incoming().id == eventId;
+        allow list, get: if isSignedIn() && hasPermission(companyId, 'sales_history');
+        allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(eventId)
+          && isValidCheckoutEvent(incoming()) && incoming().id == eventId
+          && (
+            incoming().status != 'success'
+            || (
+              existsAfter(/databases/$(database)/documents/companies/$(companyId)/sales/$(incoming().saleId))
+              && getAfter(/databases/$(database)/documents/companies/$(companyId)/sales/$(incoming().saleId)).data.branchId == incoming().branchId
+            )
+          );
         allow update: if false;
         allow delete: if false;
       }
@@ -383,14 +690,28 @@ service cloud.firestore {
 
     // Global Invitation Codes Collection
     match /invitationCodes/{code} {
-      allow get: if isSignedIn();
+      allow get: if isSignedIn()
+        && resource.data.code == code
+        && resource.data.expiresAt is timestamp
+        && resource.data.expiresAt > request.time
+        && get(companyPath(resource.data.companyId)).data.invitationCode == code;
       allow list: if false; // Deny standard listing for security
       // Only the Owner of the target company may mint or modify an invite for it — an
       // Encargado/Master Admin minting one would bypass the members-collection role-grant
       // restriction above (the invite's stored role is trusted as-is on self-join).
-      allow create, update: if isVerifiedUser() && isValidInvitationCode(incoming()) && incoming().code == code
+      allow create: if isVerifiedUser() && isValidInvitationCode(incoming()) && incoming().code == code
         && isOwner(incoming().companyId);
-      allow delete: if isVerifiedUser() && isOwner(resource.data.companyId);
+      allow update: if false;
+      allow delete: if isVerifiedUser() && (
+        isOwner(resource.data.companyId)
+        || (
+          resource.data.usageType == 'single'
+          && resource.data.expiresAt > request.time
+          && existsAfter(memberPath(resource.data.companyId, request.auth.uid))
+          && getAfter(memberPath(resource.data.companyId, request.auth.uid)).data.inviteCode == code
+          && getAfter(companyPath(resource.data.companyId)).data.invitationCode == null
+        )
+      );
     }
 
   }
