@@ -4,22 +4,81 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+concurrency:
+  group: logic-pos-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+  verify:
+    name: Verify release candidate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Run production verification
+        run: npm run verify:production
+
+  deploy:
+    name: Deploy verified build to VPS
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
 
     steps:
       - name: Deploy to VPS via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         with:
           host: 74.208.50.123
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
           script: |
+            set -e
             cd /var/www/logic-pos
-            git fetch --all
+            PREVIOUS_REVISION="$(git rev-parse HEAD)"
+            git fetch origin main
+            git checkout main
             git reset --hard origin/main
-            npm install
+            npm ci --include=dev
             npm run build
-            pm2 reload logic-pos
+            npm prune --omit=dev
+            pm2 reload logic-pos --update-env
+
+            HEALTH_URL="http://127.0.0.1:${PORT:-3000}/"
+            healthy=false
+            for attempt in $(seq 1 10); do
+              if curl --fail --silent --show-error --max-time 10 "$HEALTH_URL" > /dev/null; then
+                healthy=true
+                break
+              fi
+              echo "Health check attempt $attempt/10 failed; retrying..."
+              sleep 2
+            done
+
+            if [ "$healthy" != "true" ]; then
+              echo "Health check failed; restoring $PREVIOUS_REVISION"
+              git reset --hard "$PREVIOUS_REVISION"
+              npm ci --include=dev
+              npm run build
+              npm prune --omit=dev
+              pm2 reload logic-pos --update-env
+              exit 1
+            fi

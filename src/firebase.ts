@@ -13,13 +13,22 @@ const app = initializeApp(firebaseConfig);
 // harmless in production (this module only runs once per page load) but Vite's HMR re-runs
 // this file on every edit while the underlying app instance survives, so fall back to
 // getFirestore() (which just returns the already-initialized instance) in that case.
+// VITE_FIRESTORE_DATABASE_ID, when set, overrides only the database ID — never the rest of
+// firebaseConfig — so a local sandbox Firestore database can be used during development without
+// touching production. It's only ever defined in .env.development.local, a file that never
+// leaves the developer's machine (gitignored, and Vite loads .env.[mode].local only in that
+// mode), so production builds always fall back to firebaseConfig's real database ID unchanged.
+const firestoreDatabaseId =
+  (import.meta.env.VITE_FIRESTORE_DATABASE_ID as string | undefined) ||
+  (firebaseConfig as any).firestoreDatabaseId;
+
 let dbInstance;
 try {
   dbInstance = initializeFirestore(app, {
     localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
-  }, (firebaseConfig as any).firestoreDatabaseId);
+  }, firestoreDatabaseId);
 } catch {
-  dbInstance = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
+  dbInstance = getFirestore(app, firestoreDatabaseId);
 }
 export const db = dbInstance; /* CRITICAL: The app will break without this line */
 export const auth = getAuth(app);
@@ -80,40 +89,42 @@ export enum OperationType {
 
 export interface FirestoreErrorInfo {
   error: string;
+  code: string | null;
   operationType: OperationType;
   path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-    tenantId?: string | null;
-    providerInfo?: {
-      providerId?: string | null;
-      email?: string | null;
-    }[];
+}
+
+export class CloudOperationError extends Error {
+  readonly code: string | null;
+  readonly operationType: OperationType;
+  readonly path: string | null;
+
+  constructor(info: FirestoreErrorInfo, options?: ErrorOptions) {
+    super(info.error, options);
+    this.name = 'CloudOperationError';
+    this.code = info.code;
+    this.operationType = info.operationType;
+    this.path = info.path;
   }
 }
 
-export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+/**
+ * Records a sanitized Firestore failure and returns an Error for callers that need to
+ * propagate it. Authentication identifiers and email addresses are intentionally excluded:
+ * POS terminals are shared devices and their developer console must not become a PII log.
+ */
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): CloudOperationError {
+  const rawCode = typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : '';
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
-        providerId: provider.providerId,
-        email: provider.email,
-      })) || []
-    },
+    code: rawCode ? rawCode.replace(/^firestore\//, '') : null,
     operationType,
     path
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  console.error('Firestore operation failed:', errInfo);
+  return new CloudOperationError(errInfo, error instanceof Error ? { cause: error } : undefined);
 }
 
 // Thrown by the shared write helpers in App.tsx (saveAllData / applyStockDeltas /

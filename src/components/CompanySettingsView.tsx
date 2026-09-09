@@ -32,7 +32,9 @@ import {
   Lock
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType, createCredentialUser } from '../firebase';
-import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch, Timestamp } from 'firebase/firestore';
+import { createInvitationCode } from '../lib/ids';
+import { PERMISSION_OPTIONS } from '../lib/permissions';
 
 interface Member {
   userId: string;
@@ -768,31 +770,27 @@ export default function CompanySettingsView({
     }
     setIsUpdating(true);
     try {
-      // Create random alphanumeric code
-      const newCode = 'INV-' + Math.floor(Math.random() * 90000 + 10000);
-
-      // Save invitationCode globally with configured usageType
-      await setDoc(doc(db, 'invitationCodes', newCode), {
+      // Invitation codes are bearer credentials. Keep them high-entropy and short-lived;
+      // the write, old-code revocation and company pointer update commit as one unit.
+      const newCode = createInvitationCode();
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'invitationCodes', newCode), {
         code: newCode,
         companyId: companyId,
         companyName: companyName,
         role: 'employee',
-        usageType: selectedUsageType
+        usageType: selectedUsageType,
+        createdAt: Timestamp.now(),
+        expiresAt: Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        createdBy: currentUserId,
       });
-
-      // Delete the old code if existed
-      if (activeCode) {
-        try {
-          await deleteDoc(doc(db, 'invitationCodes', activeCode));
-        } catch (_) {}
-      }
-
-      // Update company record
-      await updateDoc(doc(db, 'companies', companyId), {
+      if (activeCode) batch.delete(doc(db, 'invitationCodes', activeCode));
+      batch.update(doc(db, 'companies', companyId), {
         invitationCode: newCode
       });
+      await batch.commit();
 
-      alert(`¡Se ha generado un nuevo código de acceso (${selectedUsageType === 'single' ? 'un solo uso' : 'varios usos'}): ${newCode}! Compártelo con tu equipo.`);
+      alert(`¡Se generó un código de acceso válido por 7 días (${selectedUsageType === 'single' ? 'un solo uso' : 'varios usos'}): ${newCode}! Compártelo con tu equipo.`);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `invitationCodes_creation`);
     } finally {
@@ -809,10 +807,12 @@ export default function CompanySettingsView({
     
     setIsUpdating(true);
     try {
-      await deleteDoc(doc(db, 'invitationCodes', activeCode));
-      await updateDoc(doc(db, 'companies', companyId), {
+      const batch = writeBatch(db);
+      batch.delete(doc(db, 'invitationCodes', activeCode));
+      batch.update(doc(db, 'companies', companyId), {
         invitationCode: null
       });
+      await batch.commit();
       alert('Código de invitación revocado con éxito.');
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `invitationCodes/${activeCode}`);
@@ -969,7 +969,7 @@ export default function CompanySettingsView({
               <Building2 className="w-6 h-6" />
             </div>
           )}
-          <h3 className="font-extrabold text-base text-slate-800 truncate">{companyName}</h3>
+          <h3 className="font-extrabold text-base text-slate-800 break-words">{companyName}</h3>
           <p className="text-[11px] font-bold uppercase text-indigo-500 py-0.5 px-2 bg-indigo-50 inline-block rounded mt-1">
             Rol: {currentUserRole === 'owner' ? 'Dueño / Creador' : currentUserRole === 'admin' ? 'Administrador' : 'Empleado'}
           </p>
@@ -1049,7 +1049,7 @@ export default function CompanySettingsView({
                   className={`w-full text-left p-2.5 rounded-xl border flex items-center justify-between text-xs transition ${
                     isActive
                        ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
-                       : 'bg-slate-50 border-slate-150 hover:bg-slate-100 text-slate-700 cursor-pointer'
+                       : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700 cursor-pointer'
                   }`}
                 >
                   <div className="truncate">
@@ -1072,7 +1072,7 @@ export default function CompanySettingsView({
       <div className="lg:col-span-8 bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden flex flex-col">
         
         {/* Dynamic header control tabs */}
-        <div className="relative border-b border-slate-150 bg-slate-50/50">
+        <div className="relative border-b border-slate-200 bg-slate-50/50">
         {!tabEdges.atStart && (
           <button
             type="button"
@@ -1181,7 +1181,7 @@ export default function CompanySettingsView({
 
               <div className="flex justify-between items-center">
                 <div>
-                  <h4 className="font-extrabold text-sm text-slate-850">Personal del Comercio</h4>
+                  <h4 className="font-extrabold text-sm text-slate-800">Personal del Comercio</h4>
                   <p className="text-[11px] text-slate-500">Lista de usuarios, roles personalizados y permisos del negocio {companyName}:</p>
                 </div>
                 {currentUserRole === 'owner' && (
@@ -1210,7 +1210,7 @@ export default function CompanySettingsView({
                 <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden bg-slate-50/40">
                   {members.map((member) => (
                     <div key={member.userId} className="flex flex-col lg:flex-row lg:items-center lg:justify-between p-5 gap-4 hover:bg-slate-100/50 transition">
-                      <div className="flex items-start lg:items-center space-x-3 text-left">
+                      <div className="flex items-start lg:items-center space-x-3 text-left min-w-0">
                         <div className={`w-10 h-10 shrink-0 rounded-full flex items-center justify-center font-black text-sm ${
                           member.role === 'owner' 
                             ? 'bg-indigo-100 text-indigo-700' 
@@ -1238,11 +1238,9 @@ export default function CompanySettingsView({
                           {member.permissions && member.permissions.length > 0 && (
                             <div className="flex flex-wrap gap-1 mt-1.5">
                               {member.permissions.map(p => {
-                                const labels: Record<string, string> = {
-                                  sales_history: 'Historial', products_edit: 'Catálogo',
-                                  stock_transfer: 'Transferir', suppliers_restock: 'Proveedores',
-                                  cash_close: 'Cierre caja', apply_discount: 'Descuentos'
-                                };
+                                const labels: Record<string, string> = Object.fromEntries(
+                                  PERMISSION_OPTIONS.map(permission => [permission.id, permission.label])
+                                );
                                 return (
                                   <span key={p} className="text-[9px] bg-indigo-50 text-indigo-700 font-bold px-1.5 py-0.5 rounded border border-indigo-100">
                                     +{labels[p] || p}
@@ -1381,8 +1379,8 @@ export default function CompanySettingsView({
           {activeSubTab === 'code' && (
             <div className="space-y-4 text-left">
               <div>
-                <h4 className="font-extrabold text-sm text-slate-850">Invitaciones para Cuentas Google</h4>
-                <p className="text-[11px] text-slate-500">Genera un código para que colaboradores con <strong>cuenta de Google</strong> se unan a '{companyName}'. Para empleados sin Google, usa "Crear Empleado" en la pestaña Equipo.</p>
+                <h4 className="font-extrabold text-sm text-slate-800">Invitaciones para Cuentas Google</h4>
+                <p className="text-[11px] text-slate-500 break-words">Genera un código para que colaboradores con <strong>cuenta de Google</strong> se unan a '{companyName}'. Para empleados sin Google, usa "Crear Empleado" en la pestaña Equipo.</p>
               </div>
 
               {currentUserRole !== 'owner' ? (
@@ -1433,8 +1431,8 @@ export default function CompanySettingsView({
                       {/* Code display row */}
                       <div>
                         <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Código de Acceso Corporativo</span>
-                        <div className="flex items-center justify-center space-x-3 mt-1 px-4">
-                          <span className="bg-white border text-center border-slate-200 rounded-xl px-5 py-3 font-mono text-2xl font-black text-indigo-700 tracking-wider shadow-inner select-all">
+                        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-2 sm:gap-3 mt-1 sm:px-4 min-w-0">
+                          <span className="bg-white border text-center border-slate-200 rounded-xl px-3 sm:px-5 py-3 font-mono text-base sm:text-2xl font-black text-indigo-700 tracking-wider shadow-inner select-all break-all min-w-0">
                             {activeCode}
                           </span>
                           <button
@@ -1451,12 +1449,12 @@ export default function CompanySettingsView({
                       {/* Direct LINK invitation row */}
                       <div className="border-t border-slate-200 pt-4 max-w-lg mx-auto text-left space-y-1.5">
                         <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest block text-center sm:text-left">Enlace Corto para Invitación Directa</span>
-                        <div className="flex items-stretch space-x-2">
+                        <div className="flex items-stretch gap-2 min-w-0">
                           <input
                             type="text"
                             readOnly
                             value={window.location.origin + "/?invite=" + activeCode}
-                            className="bg-white/80 border border-slate-250 rounded-xl px-3 py-2 font-mono text-xs text-slate-500 flex-grow select-all focus:outline-none"
+                            className="bg-white/80 border border-slate-200 rounded-xl px-3 py-2 font-mono text-xs text-slate-500 flex-grow min-w-0 select-all focus:outline-none"
                           />
                           <button
                             onClick={copyLinkToClipboard}
@@ -1503,11 +1501,11 @@ export default function CompanySettingsView({
                     </div>
                   ) : (
                     <div className="border border-dashed border-slate-300 rounded-2xl p-8 text-center space-y-4">
-                      <div className="mx-auto w-10 h-10 bg-indigo-50 border border-indigo-150 rounded-lg flex items-center justify-center text-indigo-600">
+                      <div className="mx-auto w-10 h-10 bg-indigo-50 border border-indigo-100 rounded-lg flex items-center justify-center text-indigo-600">
                         <Key className="w-5 h-5" />
                       </div>
                       <div>
-                        <h5 className="font-extrabold text-slate-850 text-sm">Sin Código de Invitación Activo</h5>
+                        <h5 className="font-extrabold text-slate-800 text-sm">Sin Código de Invitación Activo</h5>
                         <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1">
                           No has generado un código de invitación activo para este comercio. Configura tus opciones de acceso arriba y genera una a continuación:
                         </p>
@@ -1515,7 +1513,7 @@ export default function CompanySettingsView({
                       <button
                         onClick={handleGenerateInvoiceInvitationCode}
                         disabled={isUpdating}
-                        className="mx-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-750 text-white font-black text-xs rounded-xl shadow cursor-pointer transition flex items-center space-x-2"
+                        className="mx-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs rounded-xl shadow cursor-pointer transition flex items-center space-x-2"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${isUpdating ? 'animate-spin' : ''}`} />
                         <span>Generar Código con las Opciones Seleccionadas</span>
@@ -1531,7 +1529,7 @@ export default function CompanySettingsView({
           {activeSubTab === 'info' && (
             <div className="space-y-4 text-left">
               <div>
-                <h4 className="font-extrabold text-sm text-slate-850">Ajustes de la Empresa</h4>
+                <h4 className="font-extrabold text-sm text-slate-800">Ajustes de la Empresa</h4>
                 <p className="text-[11px] text-slate-500">Configuración general de datos corporatorios de {companyName}:</p>
               </div>
 
@@ -1562,7 +1560,7 @@ export default function CompanySettingsView({
                   <button
                     type="submit"
                     disabled={isUpdating || !editedCompanyName.trim() || editedCompanyName === companyName}
-                    className="px-4 py-2.5 bg-indigo-650 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition flex items-center space-x-2 disabled:opacity-50"
+                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition flex items-center space-x-2 disabled:opacity-50"
                   >
                     <span>Guardar Cambios</span>
                   </button>
@@ -1942,7 +1940,7 @@ export default function CompanySettingsView({
           {activeSubTab === 'backup' && (
             <div className="space-y-4 text-left">
               <div>
-                <h4 className="font-extrabold text-sm text-slate-850">Respaldo en la Nube (Google Drive)</h4>
+                <h4 className="font-extrabold text-sm text-slate-800">Respaldo en la Nube (Google Drive)</h4>
                 <p className="text-[11px] text-slate-500">
                   Exporta e importa los datos de tus ventas, catálogo de productos, sucursales y clientes utilizando tu cuenta de Google Drive asociada.
                 </p>
@@ -2015,7 +2013,7 @@ export default function CompanySettingsView({
         {isRoleModalOpen && selectedRoleMember && (
           <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-[2px] flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl border border-slate-200 w-full max-w-md p-6 shadow-xl space-y-5 text-left transition duration-200">
-              <div className="flex justify-between items-center pb-3 border-b border-slate-150">
+              <div className="flex justify-between items-center pb-3 border-b border-slate-200">
                 <div>
                   <h3 className="text-base font-black text-slate-800">Tareas Adicionales</h3>
                   <p className="text-[11px] text-slate-500 font-medium">
@@ -2036,14 +2034,7 @@ export default function CompanySettingsView({
               </p>
 
               <div className="space-y-1.5">
-                {[
-                  { id: 'sales_history', label: 'Ver Historial de Ventas', desc: 'Puede consultar las ventas registradas en su sucursal' },
-                  { id: 'products_edit', label: 'Registrar y Editar Productos', desc: 'Puede agregar o modificar productos del catálogo' },
-                  { id: 'stock_transfer', label: 'Transferir Mercancía', desc: 'Puede redistribuir stock entre sucursales' },
-                  { id: 'suppliers_restock', label: 'Gestión de Proveedores', desc: 'Puede registrar compras y gestionar proveedores' },
-                  { id: 'cash_close', label: 'Cierre de Caja', desc: 'Puede realizar el corte y cierre de caja' },
-                  { id: 'apply_discount', label: 'Aplicar Descuentos', desc: 'Puede aplicar descuentos en ventas' }
-                ].map(perm => {
+                {PERMISSION_OPTIONS.map(perm => {
                   const isChecked = editedPermissions.includes(perm.id);
                   return (
                     <label key={perm.id} className="flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer hover:bg-indigo-50 hover:border-indigo-200 transition">
@@ -2072,7 +2063,7 @@ export default function CompanySettingsView({
                 <button
                   type="button"
                   onClick={() => setIsRoleModalOpen(false)}
-                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-705 font-bold text-xs rounded-xl cursor-pointer transition text-center"
+                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer transition text-center"
                 >
                   Cancelar
                 </button>
@@ -2092,7 +2083,7 @@ export default function CompanySettingsView({
         {/* Modal for Programmatic Credential Creation (No Google Required) */}
         {isCredModalOpen && (
           <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-[2px] flex items-center justify-center p-4">
-            <div className="bg-white rounded-2xl border border-slate-200 w-full max-w-md p-6 shadow-xl space-y-5 text-left transition duration-205">
+            <div className="bg-white rounded-2xl border border-slate-200 w-full max-w-md p-6 shadow-xl space-y-5 text-left transition duration-200">
               
               {createdCredentialsShow ? (
                 // SUCCESS STATE: Show created credentials to copy safely
@@ -2101,7 +2092,7 @@ export default function CompanySettingsView({
                     <div className="w-12 h-12 bg-emerald-100 border border-emerald-200 text-emerald-600 rounded-full flex items-center justify-center mx-auto animate-bounce">
                       <Check className="w-6 h-6" />
                     </div>
-                    <h3 className="text-base font-black text-slate-805">¡Cuenta Creada Con Éxito!</h3>
+                    <h3 className="text-base font-black text-slate-800">¡Cuenta Creada Con Éxito!</h3>
                     <p className="text-[11px] text-slate-500 font-medium">Guarda estos datos y envíaselos a tu colaborador <strong>{createdCredentialsShow.name}</strong> para que pueda iniciar sesión.</p>
                   </div>
 
@@ -2157,12 +2148,12 @@ export default function CompanySettingsView({
                           Copiar
                         </button>
                       </div>
-                      <p className="font-mono text-teal-750 bg-teal-50 border border-teal-100 px-2.5 py-1.5 rounded-lg font-black tracking-wider break-all">{createdCredentialsShow.password}</p>
+                      <p className="font-mono text-teal-700 bg-teal-50 border border-teal-100 px-2.5 py-1.5 rounded-lg font-black tracking-wider break-all">{createdCredentialsShow.password}</p>
                     </div>
                   </div>
 
                   {copiedCredNotify && (
-                    <div className="bg-emerald-50 text-emerald-700 border border-emerald-150 p-2 rounded-lg text-center font-bold text-[10px] animate-fade-in">
+                    <div className="bg-emerald-50 text-emerald-700 border border-emerald-100 p-2 rounded-lg text-center font-bold text-[10px] animate-fade-in">
                       <Check className="w-3.5 h-3.5 inline mr-1" />¡Copiado al portapapeles!
                     </div>
                   )}
@@ -2215,7 +2206,7 @@ export default function CompanySettingsView({
               ) : (
                 // FORM STATE: To capture new account info
                 <form onSubmit={handleCreateCredentialEmployee} className="space-y-4">
-                  <div className="flex justify-between items-center pb-2 border-b border-slate-150">
+                  <div className="flex justify-between items-center pb-2 border-b border-slate-200">
                     <div>
                       <h3 className="text-base font-black text-slate-800 flex items-center gap-1.5">Registrar Cuenta Sin Google <Key className="w-3.5 h-3.5" /></h3>
                       <p className="text-[11px] text-slate-500 font-medium">Crea cuentas de acceso directo (usuario + contraseña) para tus colaboradores.</p>
@@ -2244,7 +2235,7 @@ export default function CompanySettingsView({
                         placeholder="Ej: Juan Pérez"
                         value={credName}
                         onChange={(e) => setCredName(e.target.value)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700"
                       />
                     </div>
 
@@ -2259,7 +2250,7 @@ export default function CompanySettingsView({
                           setCredUsername(e.target.value);
                           setCredPassword(e.target.value);
                         }}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 font-mono"
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 font-mono"
                       />
                       <p className="text-[9px] text-slate-400 leading-tight">Este número es el acceso. Se usa con el Código de Comercio para entrar al sistema.</p>
                     </div>
@@ -2271,7 +2262,7 @@ export default function CompanySettingsView({
                           value={credRole}
                           disabled={currentUserRole !== 'owner'}
                           onChange={(e) => setCredRole(e.target.value as 'master_admin' | 'admin' | 'employee')}
-                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         >
                           <option value="employee">Cajero / Empleado</option>
                           {currentUserRole === 'owner' && <option value="admin">Encargado / Gerente</option>}
@@ -2286,7 +2277,7 @@ export default function CompanySettingsView({
                         <select
                           value={credBranchId}
                           onChange={(e) => setCredBranchId(e.target.value)}
-                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-505 font-bold text-slate-705 cursor-pointer"
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 cursor-pointer"
                         >
                           <option value="">Matriz / General</option>
                           {branches.map(b => (
@@ -2301,7 +2292,7 @@ export default function CompanySettingsView({
                     <button
                       type="button"
                       onClick={() => setIsCredModalOpen(false)}
-                      className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-705 font-bold text-xs rounded-xl cursor-pointer transition text-center"
+                      className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer transition text-center"
                     >
                       Cancelar
                     </button>

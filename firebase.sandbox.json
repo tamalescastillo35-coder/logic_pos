@@ -1,0 +1,8 @@
+{
+  "firestore": {
+    "database": "sandbox-pruebas",
+    "location": "us-east1",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}
