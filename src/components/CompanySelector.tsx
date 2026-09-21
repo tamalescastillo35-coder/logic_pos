@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { Building2, Sparkles, LogOut, Check, ArrowRight, Key, Trash2 } from 'lucide-react';
+import type { CompanyRole } from '../lib/permissions';
 
 interface Company {
   id: string;
   name: string;
-  role: 'owner' | 'master_admin' | 'admin' | 'employee';
+  role: CompanyRole;
 }
 
 interface CompanySelectorProps {
@@ -158,7 +159,7 @@ export default function CompanySelector({
                       <div className="flex-1 min-w-0">
                         <h4 className="font-extrabold text-sm text-slate-200 truncate">{company.name}</h4>
                         <span className="text-[10px] text-indigo-400 font-bold uppercase py-0.5 px-2 bg-indigo-950 border border-indigo-900/50 rounded mt-1 inline-block truncate max-w-full">
-                          {company.role === 'owner' ? 'Propietario' : company.role === 'master_admin' ? 'Master Admin' : company.role === 'admin' ? 'Administrador' : 'Empleado'}
+                          {company.role === 'owner' ? 'Propietario' : company.role === 'admin' ? 'Administrador' : 'Empleado'}
                         </span>
                       </div>
                     </button>

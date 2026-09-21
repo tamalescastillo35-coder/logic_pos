@@ -76,7 +76,7 @@ import {
   safeLocalStorageSet,
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
-import { hasAppPermission } from './lib/permissions';
+import { hasAppPermission, type CompanyRole } from './lib/permissions';
 
 const isNativePlatform = Capacitor.isNativePlatform();
 
@@ -330,7 +330,7 @@ interface Member {
   userId: string;
   name: string;
   email: string;
-  role: 'owner' | 'master_admin' | 'admin' | 'employee';
+  role: CompanyRole;
   joinedAt?: string;
   assignedBranchId?: string;
   permissions?: string[];
@@ -720,7 +720,7 @@ export default function App() {
 
   // Multi-Company States
   const [activeCompanyId, setActiveCompanyId] = useState<string | null>(null);
-  const [userCompanies, setUserCompanies] = useState<{ [id: string]: { id: string; name: string; role: 'owner' | 'master_admin' | 'admin' | 'employee' } }>({});
+  const [userCompanies, setUserCompanies] = useState<{ [id: string]: { id: string; name: string; role: CompanyRole } }>({});
 
   // Shared "which business is this" resolver — same fallback chain already used by the
   // printed receipt (ticketBusinessName) and the header, reused here for the browser tab
@@ -908,9 +908,9 @@ export default function App() {
 
   const activeCompanyRole = user && activeCompanyId ? (userCompanies[activeCompanyId]?.role || 'employee') : 'owner';
   // Mirrors firestore.rules isOwnerOrAdmin() — refunds/voids require this client-side too
-  const isOwnerOrAdminRole = activeCompanyRole === 'owner' || activeCompanyRole === 'master_admin' || activeCompanyRole === 'admin';
+  const isOwnerOrAdminRole = activeCompanyRole === 'owner' || activeCompanyRole === 'admin';
   // Encargados (admin) manage a single sucursal, same as Cajeros (employee) — only
-  // Owner/master_admin can see/switch between every sucursal of the company. The Owner
+  // Owner can see/switch between every sucursal of the company. The Owner
   // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
   // that change takes effect here automatically since currentUserMember is a live listener.
   const isBranchLocked = activeCompanyRole === 'employee' || activeCompanyRole === 'admin';
@@ -1516,7 +1516,7 @@ export default function App() {
   }, [user, activeCompanyId, userCompanies, branchSyncRetryTrigger]);
 
   // Lock the branch selector for employees and encargados (admin) — both manage a single
-  // sucursal; only owner/master_admin can roam across all of them. Re-runs whenever
+  // sucursal; only owner can roam across all of them. Re-runs whenever
   // currentUserMember changes, so an Owner reassigning this user's branch takes effect live.
   useEffect(() => {
     if (!user || !activeCompanyId) return;
@@ -5393,7 +5393,7 @@ export default function App() {
               </span>
               {user && activeCompanyId ? (
                 <span className="hidden md:inline-block px-2 py-0.5 text-white font-bold text-[10px] rounded-full shadow-sm uppercase shrink-0" style={{ backgroundColor: 'var(--brand-primary)' }}>
-                  {userCompanies[activeCompanyId]?.role === 'owner' ? 'Propietario' : userCompanies[activeCompanyId]?.role === 'master_admin' ? 'Master Admin' : userCompanies[activeCompanyId]?.role === 'admin' ? 'Admin' : 'Empleado'}
+                  {userCompanies[activeCompanyId]?.role === 'owner' ? 'Propietario' : userCompanies[activeCompanyId]?.role === 'admin' ? 'Admin' : 'Empleado'}
                 </span>
               ) : (
                 <span className="hidden md:inline-block px-2 py-0.5 text-white font-bold text-[10px] rounded-full shadow-sm shrink-0" style={{ backgroundColor: 'var(--brand-primary)' }}>TAMALES CASTILLO POS</span>
@@ -6815,7 +6815,7 @@ export default function App() {
                   ) : (
                     <div className="flex items-center gap-2 mt-2">
                       <p className="text-xs text-white/60">Monto de apertura: {formatMXN(cashRegister.initialCash)}</p>
-                      {(activeCompanyRole === 'owner' || activeCompanyRole === 'master_admin') && (
+                      {activeCompanyRole === 'owner' && (
                         <button
                           onClick={() => {
                             setEditInitialCashPrompt(true);
@@ -8761,12 +8761,12 @@ export default function App() {
                     className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 outline-none focus:border-teal-500 font-bold text-slate-700 cursor-pointer"
                   >
                     <option value="">-- Selecciona un Gerente --</option>
-                    {branchForm.manager && !members.filter(m => m.role === 'owner' || m.role === 'master_admin' || m.role === 'admin').some(m => m.name === branchForm.manager) && (
+                    {branchForm.manager && !members.filter(m => m.role === 'owner' || m.role === 'admin').some(m => m.name === branchForm.manager) && (
                       <option value={branchForm.manager}>{branchForm.manager}</option>
                     )}
-                    {members.filter(m => m.role === 'owner' || m.role === 'master_admin' || m.role === 'admin').map(member => (
+                    {members.filter(m => m.role === 'owner' || m.role === 'admin').map(member => (
                       <option key={member.userId} value={member.name}>
-                        {member.name} ({member.role === 'owner' ? 'Propietario' : member.role === 'master_admin' ? 'Master Admin' : 'Administrador'})
+                        {member.name} ({member.role === 'owner' ? 'Propietario' : 'Administrador'})
                       </option>
                     ))}
                   </select>

@@ -34,13 +34,15 @@ import {
 import { db, handleFirestoreError, OperationType, createCredentialUser } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch, Timestamp } from 'firebase/firestore';
 import { createInvitationCode } from '../lib/ids';
-import { PERMISSION_OPTIONS } from '../lib/permissions';
+import { PERMISSION_OPTIONS, type CompanyRole } from '../lib/permissions';
+
+type NonOwnerCompanyRole = Exclude<CompanyRole, 'owner'>;
 
 interface Member {
   userId: string;
   name: string;
   email: string;
-  role: 'owner' | 'master_admin' | 'admin' | 'employee';
+  role: CompanyRole;
   joinedAt?: string;
   assignedBranchId?: string;
   customRoleName?: string;
@@ -81,9 +83,9 @@ interface BluetoothPrinterDevice {
 interface CompanySettingsViewProps {
   companyId: string;
   companyName: string;
-  currentUserRole: 'owner' | 'master_admin' | 'admin' | 'employee';
+  currentUserRole: CompanyRole;
   currentUserId: string;
-  userAvailableCompanies: { [id: string]: { id: string; name: string; role: 'owner' | 'master_admin' | 'admin' | 'employee' } };
+  userAvailableCompanies: { [id: string]: { id: string; name: string; role: CompanyRole } };
   onSwitchCompany: (id: string) => void;
   onLogoutCompany: () => void;
   onCreateCompany?: (name: string) => Promise<void>;
@@ -199,7 +201,7 @@ export default function CompanySettingsView({
   const [isRoleModalOpen, setIsRoleModalOpen] = useState(false);
   const [selectedRoleMember, setSelectedRoleMember] = useState<Member | null>(null);
   const [editedCustomRoleName, setEditedCustomRoleName] = useState('');
-  const [editedRoleType, setEditedRoleType] = useState<'master_admin' | 'admin' | 'employee'>('employee');
+  const [editedRoleType, setEditedRoleType] = useState<NonOwnerCompanyRole>('employee');
   const [editedPermissions, setEditedPermissions] = useState<string[]>([]);
 
   // States for Programmatic Credential Creation (No Google Required)
@@ -207,7 +209,7 @@ export default function CompanySettingsView({
   const [credName, setCredName] = useState('');
   const [credUsername, setCredUsername] = useState('');
   const [credPassword, setCredPassword] = useState('');
-  const [credRole, setCredRole] = useState<'master_admin' | 'admin' | 'employee'>('employee');
+  const [credRole, setCredRole] = useState<NonOwnerCompanyRole>('employee');
   const [credBranchId, setCredBranchId] = useState('');
   const [isCreatingCred, setIsCreatingCred] = useState(false);
   const [createdCredentialsShow, setCreatedCredentialsShow] = useState<{ companyId: string, name: string, username: string, password: string } | null>(null);
@@ -853,7 +855,7 @@ export default function CompanySettingsView({
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
-  const handleChangeMemberRole = async (memberUserId: string, memberName: string, newRole: 'master_admin' | 'admin' | 'employee') => {
+  const handleChangeMemberRole = async (memberUserId: string, memberName: string, newRole: NonOwnerCompanyRole) => {
     if (currentUserRole !== 'owner') {
       alert("Solo el Dueño puede modificar roles.");
       return;
@@ -871,7 +873,7 @@ export default function CompanySettingsView({
       await updateDoc(doc(db, 'companies', companyId, 'members', memberUserId), {
         role: newRole
       });
-      const roleLabel = newRole === 'master_admin' ? 'Master Admin' : newRole === 'admin' ? 'Administrador' : 'Empleado';
+      const roleLabel = newRole === 'admin' ? 'Administrador' : 'Empleado';
       alert(`Rol de ${memberName} actualizado exitosamente a ${roleLabel}.`);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `companies/${companyId}/members/${memberUserId}`);
@@ -938,8 +940,8 @@ export default function CompanySettingsView({
       // Target member role becomes owner
       batch.update(targetMemberRef, { role: 'owner' });
       
-      // Current user role becomes master_admin
-      batch.update(currentMemberRef, { role: 'master_admin' });
+      // The previous owner remains an administrator after the transfer.
+      batch.update(currentMemberRef, { role: 'admin' });
 
       await batch.commit();
 
@@ -1130,7 +1132,7 @@ export default function CompanySettingsView({
             Ajustes
           </button>
 
-          {(currentUserRole === 'owner' || currentUserRole === 'master_admin') && (
+          {currentUserRole === 'owner' && (
             <button
               onClick={() => setActiveSubTab('branding')}
               className={`shrink-0 px-3 py-2.5 text-xs font-bold rounded-xl transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
@@ -1144,7 +1146,7 @@ export default function CompanySettingsView({
             </button>
           )}
 
-          {(currentUserRole === 'owner' || currentUserRole === 'master_admin') && (
+          {currentUserRole === 'owner' && (
             <button
               onClick={() => setActiveSubTab('print')}
               className={`shrink-0 px-3 py-2.5 text-xs font-bold rounded-xl transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
@@ -1314,13 +1316,11 @@ export default function CompanySettingsView({
                         ) : (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className={`text-[11px] font-black uppercase py-1.5 px-3 rounded-full border shadow-sm shrink-0 inline-flex items-center gap-1 ${
-                              member.role === 'master_admin'
-                                ? 'bg-purple-50 border-purple-200 text-purple-700'
-                                : member.role === 'admin'
+                              member.role === 'admin'
                                 ? 'bg-emerald-50 border-emerald-300 text-emerald-700'
                                 : 'bg-slate-50 border-slate-300 text-slate-700'
                             }`}>
-                              {member.role === 'master_admin' ? <><Sparkle className="w-3 h-3" /> Master Admin</> : member.role === 'admin' ? <><ShieldCheck className="w-3 h-3" /> Admin</> : <><Briefcase className="w-3 h-3" /> Empleado</>}
+                              {member.role === 'admin' ? <><ShieldCheck className="w-3 h-3" /> Admin</> : <><Briefcase className="w-3 h-3" /> Empleado</>}
                             </span>
                           </div>
                         )}
@@ -2261,7 +2261,7 @@ export default function CompanySettingsView({
                         <select
                           value={credRole}
                           disabled={currentUserRole !== 'owner'}
-                          onChange={(e) => setCredRole(e.target.value as 'master_admin' | 'admin' | 'employee')}
+                          onChange={(e) => setCredRole(e.target.value as NonOwnerCompanyRole)}
                           className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 cursor-pointer disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         >
                           <option value="employee">Cajero / Empleado</option>
