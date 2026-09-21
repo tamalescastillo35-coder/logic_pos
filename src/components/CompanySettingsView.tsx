@@ -917,7 +917,7 @@ export default function CompanySettingsView({
     }
 
     const firstConfirm = confirm(
-      `¡ALERTA DE SEGURIDAD MÁXIMA!\n\n¿Estás seguro de que deseas transferir la propiedad del comercio "${companyName}" a ${targetMember.name} (${targetMember.email})?\n\nAl hacer esto:\n- Perderás el control absoluto de la empresa.\n- Pasarás a ser un Administrador Master.\n- No podrás revertir esta acción ni eliminar este comercio.\n\n¿Deseas continuar?`
+      `¡ALERTA DE SEGURIDAD MÁXIMA!\n\n¿Estás seguro de que deseas transferir la propiedad del comercio "${companyName}" a ${targetMember.name} (${targetMember.email})?\n\nAl hacer esto:\n- Perderás el control absoluto de la empresa.\n- Pasarás a ser un Administrador.\n- No podrás revertir esta acción ni eliminar este comercio.\n\n¿Deseas continuar?`
     );
     if (!firstConfirm) return;
 
