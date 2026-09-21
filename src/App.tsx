@@ -76,7 +76,7 @@ import {
   safeLocalStorageSet,
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
-import { hasAppPermission, type CompanyRole } from './lib/permissions';
+import { hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
 
 const isNativePlatform = Capacitor.isNativePlatform();
 
@@ -907,28 +907,37 @@ export default function App() {
   const [distQuantities, setDistQuantities] = useState<{[prodId: string]: number}>({});
 
   const activeCompanyRole = user && activeCompanyId ? (userCompanies[activeCompanyId]?.role || 'employee') : 'owner';
-  // Mirrors firestore.rules isOwnerOrAdmin() — refunds/voids require this client-side too
-  const isOwnerOrAdminRole = activeCompanyRole === 'owner' || activeCompanyRole === 'admin';
+  const isOwner = isOwnerRole(activeCompanyRole);
   // Encargados (admin) manage a single sucursal, same as Cajeros (employee) — only
   // Owner can see/switch between every sucursal of the company. The Owner
   // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
   // that change takes effect here automatically since currentUserMember is a live listener.
   const isBranchLocked = activeCompanyRole === 'employee' || activeCompanyRole === 'admin';
+  const assignedBranchId = currentUserMember?.assignedBranchId?.trim() || '';
+  // Every branch-scoped operation uses this value. A non-owner never inherits a stale
+  // localStorage/header branch while their member document is loading or malformed.
+  const operationalBranchId = isOwner ? selectedBranchId : assignedBranchId;
   const canViewSalesHistory = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'sales_history');
   const canEditProducts = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'products_edit');
   const canTransferStock = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'stock_transfer');
+  const canRestock = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'stock_restock');
   const canManageSuppliers = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'suppliers_restock');
   const canCloseCash = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'cash_close');
   const canApplyDiscount = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'apply_discount');
+  const canCreateCompany = !activeCompanyId
+    ? Object.keys(userCompanies).length === 0 || Object.values(userCompanies).some((company: { role: CompanyRole }) => isOwnerRole(company.role))
+    : isOwner;
+  const canViewSuppliers = canManageSuppliers || canRestock;
 
   useEffect(() => {
     const lacksSelectedModule =
       ((activeTab === 'history' || activeTab === 'analytics') && !canViewSalesHistory)
-      || (activeTab === 'branches' && !isOwnerOrAdminRole)
-      || (activeTab === 'suppliers' && !canManageSuppliers)
-      || (activeTab === 'invoicing' && !isOwnerOrAdminRole);
+      || (activeTab === 'branches' && !isOwner)
+      || (activeTab === 'suppliers' && !canViewSuppliers)
+      || (activeTab === 'invoicing' && !isOwner)
+      || (activeTab === 'settings' && !isOwner);
     if (lacksSelectedModule) setActiveTab('pos');
-  }, [activeTab, canManageSuppliers, canViewSalesHistory, isOwnerOrAdminRole]);
+  }, [activeTab, canManageSuppliers, canRestock, canViewSalesHistory, canViewSuppliers, isOwner]);
 
   useEffect(() => {
     if (!canApplyDiscount) setDiscountVal(0);
@@ -937,7 +946,10 @@ export default function App() {
   // yet from companies/{id}/members/{uid} — gates the whole POS (see the waiting screen near
   // the bottom of this component) so a sale/stock/cash entry can never be filed under a stale
   // or placeholder branchId while this is still settling right after login.
-  const branchSyncPending = !!activeCompanyId && isBranchLocked && (!currentUserMember || selectedBranchId !== currentUserMember.assignedBranchId);
+  const assignedBranchExists = branches.length > 0 && branches.some(branch => branch.id === assignedBranchId);
+  const branchSyncPending = !!activeCompanyId && isBranchLocked && (
+    !currentUserMember || !assignedBranchId || !assignedBranchExists || selectedBranchId !== assignedBranchId
+  );
 
   // True when the logged-in user authenticated with an employee code (virtual email), not Google
   const isCredentialEmployee = Boolean(user?.email?.includes('_') && user?.email?.endsWith('@logicpos.com'));
@@ -960,6 +972,10 @@ export default function App() {
   const handleCreateCompany = async (companyName: string) => {
     if (!companyName.trim()) return;
     if (!user) return;
+    if (!canCreateCompany) {
+      alert('Solo el Dueño puede crear una nueva empresa desde una sesión con membresías existentes.');
+      return;
+    }
 
     try {
       const companyId = createDocumentId('comp');
@@ -1010,6 +1026,7 @@ export default function App() {
   };
 
   const handleRestoreCompanyData = async (backupData: any, onProgress: (msg: string) => void) => {
+    if (!isOwner) throw new Error('Solo el Dueño puede restaurar los datos de la empresa.');
     if (!activeCompanyId) throw new Error("No hay un comercio seleccionado.");
     if (!backupData || typeof backupData !== 'object') {
       throw new Error("El archivo de respaldo no es válido o está corrupto.");
@@ -1104,6 +1121,13 @@ export default function App() {
       const compId = inviteData.companyId;
       const compName = inviteData.companyName || "Empresa Invitada";
       const userRole = inviteData.role || "employee";
+      const assignedBranchId = typeof inviteData.assignedBranchId === 'string'
+        ? inviteData.assignedBranchId.trim()
+        : '';
+      if (!assignedBranchId) {
+        alert('Esta invitación no tiene una sucursal asignada. Solicita al Dueño que genere un código nuevo.');
+        return;
+      }
       const usageType = inviteData.usageType || 'multiple';
       const expiresAtMs = typeof inviteData.expiresAt?.toMillis === 'function'
         ? inviteData.expiresAt.toMillis()
@@ -1126,6 +1150,7 @@ export default function App() {
         name: user.displayName || 'Empleado',
         email: user.email || '',
         role: userRole,
+        assignedBranchId,
         joinedAt: new Date().toISOString(),
         inviteCode: cleanCode
       });
@@ -1174,13 +1199,17 @@ export default function App() {
 
   const handleDeleteCompany = async (companyId: string) => {
     if (!user) return;
+    if (!isOwnerRole(userCompanies[companyId]?.role || 'employee')) {
+      alert('Solo el Dueño puede eliminar una empresa.');
+      return;
+    }
     try {
       // 1. Delete the root company doc first, while the caller's own owner membership
       // doc still exists (companies.delete requires isOwner(), which reads that doc).
       await deleteDoc(doc(db, 'companies', companyId));
 
       // 2. Delete every subcollection doc. `members` must go last: every other
-      // subcollection's delete rule checks isMemberOfCompany/isOwnerOrAdmin, which reads
+      // subcollection's delete rule checks membership, which reads
       // the requester's own members/{uid} doc — deleting it earlier would lock the rest
       // of this cleanup out partway through. Leaving stray subcollection docs behind
       // (as the old root-doc-only delete did) meant former members kept full read/write
@@ -1521,10 +1550,11 @@ export default function App() {
   useEffect(() => {
     if (!user || !activeCompanyId) return;
 
-    if (isBranchLocked && currentUserMember?.assignedBranchId) {
-      if (selectedBranchId !== currentUserMember.assignedBranchId) {
-        setSelectedBranchId(currentUserMember.assignedBranchId);
-        safeLocalStorageSet(`logic_active_branch_${user.uid}`, currentUserMember.assignedBranchId);
+    const assigned = currentUserMember?.assignedBranchId?.trim() || '';
+    if (isBranchLocked && assigned) {
+      if (selectedBranchId !== assigned) {
+        setSelectedBranchId(assigned);
+        safeLocalStorageSet(`logic_active_branch_${user.uid}`, assigned);
       }
     }
   }, [currentUserMember, isBranchLocked, selectedBranchId, activeCompanyId, user]);
@@ -1681,9 +1711,9 @@ export default function App() {
   // Kept in its own effect (instead of the big listener effect above) so it re-subscribes
   // only when the branch actually changes, not on every unrelated company-level update.
   useEffect(() => {
-    if (!user || !activeCompanyId || !selectedBranchId) return;
+    if (!user || !activeCompanyId || !operationalBranchId) return;
     const compId = activeCompanyId;
-    const branchId = selectedBranchId;
+    const branchId = operationalBranchId;
     const currentMonthRange = getMonthRange(getCurrentMonthKey());
 
     setCashTransactions([]);
@@ -1730,7 +1760,7 @@ export default function App() {
       unsubCash();
       unsubCashTransactions();
     };
-  }, [user, activeCompanyId, selectedBranchId, canViewSalesHistory]);
+  }, [user, activeCompanyId, operationalBranchId, canViewSalesHistory]);
 
   // Sales and stock movements are the two largest, fastest-growing collections in the
   // company, so — like cashRegister above — they're scoped to the active branch's own
@@ -1741,13 +1771,13 @@ export default function App() {
   // Facturación, and reprinting a transfer from the receiving branch) fetch those separately
   // with a one-off getDocs query instead of depending on this live, branch-scoped stream.
   useEffect(() => {
-    if (!user || !activeCompanyId || !selectedBranchId || !canViewSalesHistory) {
+    if (!user || !activeCompanyId || !operationalBranchId || !canViewSalesHistory) {
       setSales([]);
       setStockMovements([]);
       return;
     }
     const compId = activeCompanyId;
-    const branchId = selectedBranchId;
+    const branchId = operationalBranchId;
     const currentMonthRange = getMonthRange(getCurrentMonthKey());
     if (!currentMonthRange) return;
 
@@ -1798,7 +1828,7 @@ export default function App() {
       unsubSales();
       unsubStockMovements();
     };
-  }, [user, activeCompanyId, selectedBranchId, canViewSalesHistory]);
+  }, [user, activeCompanyId, operationalBranchId, canViewSalesHistory]);
 
   const getTodayDateString = () => {
     const d = new Date();
@@ -1866,6 +1896,10 @@ export default function App() {
       alert('Tu cuenta no tiene permiso para cerrar la caja.');
       return;
     }
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
     const expected = cashRegister.currentCash;
     const diff = realCashValue - expected;
     const diffText = diff === 0
@@ -1895,7 +1929,7 @@ export default function App() {
     };
 
     try {
-      await writeCashRegisterForBranch(selectedBranchId, closedCash, newTx);
+      await writeCashRegisterForBranch(operationalBranchId, closedCash, newTx);
       setShowOvernightWarning(false);
       setIsCorteModalOpen(false);
       alert(`¡Caja cerrada correctamente! Total esperado: ${formatMXN(expected)} | Físico: ${formatMXN(realCashValue)} (${diffText}).`);
@@ -1907,6 +1941,14 @@ export default function App() {
   };
 
   const handleOpenCaja = async (initialCashValue: number) => {
+    if (!canCloseCash) {
+      alert('Tu cuenta no tiene permiso para abrir o cerrar la caja.');
+      return;
+    }
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
     const todayStr = getTodayDateString();
     const now = Date.now();
     const shiftId = `SHIFT-${now}-${crypto.randomUUID()}`;
@@ -1922,7 +1964,7 @@ export default function App() {
     };
 
     try {
-      await writeCashRegisterForBranch(selectedBranchId, newCash, {
+      await writeCashRegisterForBranch(operationalBranchId, newCash, {
         type: 'Apertura',
         amount: initialCashValue,
         cashDelta: initialCashValue,
@@ -2035,7 +2077,7 @@ export default function App() {
         createdAt: entry.createdAt ?? now,
         timestamp: entry.timestamp || new Date(entry.createdAt ?? now).toISOString(),
         createdBy: user.uid,
-        shiftId: entry.shiftId || (branchId === selectedBranchId ? cashRegister.currentShiftId : undefined),
+        shiftId: entry.shiftId || (branchId === operationalBranchId ? cashRegister.currentShiftId : undefined),
         cashDelta: entry.cashDelta ?? (index === txEntries.length - 1 ? amountDelta : 0),
       }));
       const lastEntry = normalizedEntries[normalizedEntries.length - 1];
@@ -2070,13 +2112,13 @@ export default function App() {
     if (!user || !activeCompanyId) {
       throw new SessionInvalidError('applyCustomerPaymentAtomically: sesión o empresa activa inválida');
     }
-    if (!selectedBranchId || requestedAmount <= 0) return 0;
+    if (!operationalBranchId || requestedAmount <= 0) return 0;
     const compId = activeCompanyId;
     const now = Date.now();
     const transactionId = `PAYMENT-${now}-${crypto.randomUUID()}`;
     const customerRef = doc(db, 'companies', compId, 'customers', customerId);
-    const registerRef = doc(db, 'companies', compId, 'cashRegisters', selectedBranchId);
-    const entryRef = doc(db, 'companies', compId, 'cashRegisters', selectedBranchId, 'transactions', transactionId);
+    const registerRef = doc(db, 'companies', compId, 'cashRegisters', operationalBranchId);
+    const entryRef = doc(db, 'companies', compId, 'cashRegisters', operationalBranchId, 'transactions', transactionId);
     let appliedAmount = 0;
 
     await runTransaction(db, async transaction => {
@@ -2104,7 +2146,7 @@ export default function App() {
         time: new Date(now).toLocaleTimeString(),
         timestamp: new Date(now).toISOString(),
         createdAt: now,
-        branchId: selectedBranchId,
+        branchId: operationalBranchId,
         shiftId: register.currentShiftId,
         createdBy: user.uid,
         balanceAfter: nextCash,
@@ -2335,7 +2377,7 @@ export default function App() {
   const refundSaleAtomically = async (sale: Sale): Promise<void> => {
     if (!user || !activeCompanyId) throw new SessionInvalidError('refundSaleAtomically: sesión inválida');
     const compId = activeCompanyId;
-    const branchId = sale.branchId || selectedBranchId;
+    const branchId = sale.branchId || operationalBranchId;
     const saleRef = doc(db, 'companies', compId, 'sales', sale.id);
     const registerRef = doc(db, 'companies', compId, 'cashRegisters', branchId);
     const aggregated = new Map<string, number>();
@@ -2519,6 +2561,10 @@ export default function App() {
   }, [products, customCategories]);
 
   const handleAddCategory = (newName: string) => {
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para administrar categorías.');
+      return;
+    }
     if (!newName.trim()) return;
     const clean = newName.trim();
     if (selectCategoriesList.includes(clean)) {
@@ -2533,6 +2579,10 @@ export default function App() {
   };
 
   const handleRenameCategory = async (oldName: string, newName: string) => {
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para administrar categorías.');
+      return;
+    }
     if (!newName.trim() || oldName === newName) return;
     const cleanNewName = newName.trim();
 
@@ -2573,10 +2623,10 @@ export default function App() {
       // Terminal POS only sells what's physically in the active branch: products at 0
       // stock are hidden so a cashier can't oversell. They reappear automatically once
       // stock is added (surtido / transfer). This is per-branch, not global.
-      const hasStock = getProductStock(p, selectedBranchId, products) >= 1;
+      const hasStock = getProductStock(p, operationalBranchId, products) >= 1;
       return matchesSearch && matchesCat && hasStock;
     });
-  }, [products, searchTerm, selectedCategory, selectedBranchId, linkedParentIds]);
+  }, [products, searchTerm, selectedCategory, operationalBranchId, linkedParentIds]);
 
   // Inventario's own search — unlike the Terminal POS list above, this must surface every
   // catalog item (including 0-stock ones, since managing stock is the whole point of this
@@ -2616,9 +2666,9 @@ export default function App() {
       const matchesSearch = p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
                             (p.category && p.category.toLowerCase().includes(searchTerm.toLowerCase()));
       const matchesCat = selectedCategory === 'Todos' || p.category === selectedCategory;
-      return matchesSearch && matchesCat && getProductStock(p, selectedBranchId, products) < 1;
+      return matchesSearch && matchesCat && getProductStock(p, operationalBranchId, products) < 1;
     }).length;
-  }, [products, searchTerm, selectedCategory, selectedBranchId, linkedParentIds]);
+  }, [products, searchTerm, selectedCategory, operationalBranchId, linkedParentIds]);
 
   // Cart helper functions.
   // Cart quantities are hard-capped at the active branch's available stock so a sale can
@@ -2632,7 +2682,7 @@ export default function App() {
   // of a single correctly-summed line. The functional form guarantees each update is
   // applied on top of the truly-latest state, in order.
   const addToCart = (product: Product) => {
-    const available = getProductStock(product, selectedBranchId, products);
+    const available = getProductStock(product, operationalBranchId, products);
     setCart(prevCart => {
       const idx = prevCart.findIndex(item => item.product.id === product.id);
       const currentQty = idx > -1 ? prevCart[idx].quantity : 0;
@@ -2659,7 +2709,7 @@ export default function App() {
       }
       if (val > 0) {
         const liveProduct = products.find(p => p.id === productId) || item.product;
-        const available = getProductStock(liveProduct, selectedBranchId, products);
+        const available = getProductStock(liveProduct, operationalBranchId, products);
         if (newQty > available) {
           alert(`No hay stock suficiente de "${item.product.name}" en esta sucursal.\nDisponible: ${available} u.`);
           return prevCart;
@@ -2689,6 +2739,10 @@ export default function App() {
   const completeTransaction = async () => {
     if (isProcessingSaleRef.current) return;
     if (cart.length === 0) return;
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada. La venta NO se registró.');
+      return;
+    }
     if (firestoreConnectionState === 'checking') {
       alert('Firestore está reconectando y validando la sesión. Espera a que el indicador muestre “En línea” antes de cobrar.');
       return;
@@ -2724,7 +2778,7 @@ export default function App() {
     const insufficient = cart
       .map(item => {
         const liveProduct = products.find(p => p.id === item.product.id);
-        const available = liveProduct ? getProductStock(liveProduct, selectedBranchId, products) : 0;
+        const available = liveProduct ? getProductStock(liveProduct, operationalBranchId, products) : 0;
         return { name: item.product.name, requested: item.quantity, available };
       })
       .filter(x => x.requested > x.available);
@@ -2781,7 +2835,7 @@ export default function App() {
       timestamp: new Date().toLocaleString(),
       createdAt: Date.now(),
       status: 'Completed',
-      branchId: selectedBranchId, // Associate sale with the active branch!
+      branchId: operationalBranchId, // Associate sale with the resolved operational branch!
       folio: (paymentMethod === 'Card' || paymentMethod === 'Transfer') ? folioNumber.trim() : undefined,
       requiresInvoice,
       invoiceStatus: requiresInvoice ? 'pending' : undefined,
@@ -2814,7 +2868,7 @@ export default function App() {
     setIsProcessingSale(true);
     try {
       logCheckoutEvent({ ...checkoutEventBase, status: 'started' });
-      const activeBranch = branches.find(b => b.id === selectedBranchId);
+      const activeBranch = branches.find(b => b.id === operationalBranchId);
       const branchNameSuffix = activeBranch ? ` (${activeBranch.name})` : '';
       const paymentLabel = paymentMethod === 'Cash' ? 'Efectivo' : paymentMethod === 'Card' ? 'Tarjeta' : paymentMethod === 'Transfer' ? 'Transferencia' : 'Crédito';
       const descFolio = (paymentMethod === 'Card' || paymentMethod === 'Transfer') && folioNumber.trim() ? ` [Folio: ${folioNumber.trim()}]` : '';
@@ -2825,7 +2879,7 @@ export default function App() {
       await commitSaleAtomically(
         newSale,
         cart.map(item => resolveStockTarget(
-          item.product.id, selectedBranchId, -item.quantity,
+          item.product.id, operationalBranchId, -item.quantity,
           item.product.linkedStockProductId, item.product.stockConsumptionFactor
         )),
         checkoutEventBase,
@@ -2869,6 +2923,14 @@ export default function App() {
   };
 
   const handleSelectBranch = (branchId: string) => {
+    if (!isOwner) {
+      alert('Solo el Dueño puede cambiar la sucursal activa.');
+      return;
+    }
+    if (!branches.some(branch => branch.id === branchId)) {
+      alert('La sucursal seleccionada no está disponible.');
+      return;
+    }
     setSelectedBranchId(branchId);
     if (user) safeLocalStorageSet(`logic_active_branch_${user.uid}`, branchId);
   };
@@ -3516,6 +3578,10 @@ export default function App() {
       alert('Tu cuenta no tiene permiso para crear productos.');
       return;
     }
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
     const presentations = bulkForm.presentations.filter(p => p.suffix.trim() && p.price !== '' && p.factor !== '');
     if (!bulkForm.baseName.trim() || !bulkForm.category.trim() || presentations.length === 0) {
       alert('Nombre base, categoría, y al menos una presentación completa (nombre, precio y factor) son obligatorios.');
@@ -3540,7 +3606,7 @@ export default function App() {
       minStock: parseInt(bulkForm.minStock) || 0,
       sku: bulkForm.sku || createDocumentId('SKU'),
       supplierId: bulkForm.supplierId || undefined,
-      branchStocks: { [selectedBranchId]: initialStockNum },
+      branchStocks: { [operationalBranchId]: initialStockNum },
       isStockPool: true
     };
     const childProducts: Product[] = presentations.map((p, idx) => ({
@@ -3572,11 +3638,15 @@ export default function App() {
   const [isSavingQuickStock, setIsSavingQuickStock] = useState(false);
 
   const handleQuickAddStock = async () => {
-    if (!canEditProducts) {
-      alert('Tu cuenta no tiene permiso para ajustar existencias.');
+    if (!canRestock) {
+      alert('Tu cuenta no tiene permiso para surtir o ajustar existencias.');
       return;
     }
     if (!quickStockProduct) return;
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
     // parseFloat (not parseInt) so restocking a shared-stock "parent" pool in liters (e.g. 2.5)
     // isn't silently truncated — doesn't change anything for products restocked in whole units.
     const qty = parseFloat(quickStockAmount);
@@ -3606,14 +3676,14 @@ export default function App() {
     setIsSavingQuickStock(true);
     try {
       // Positive = surtido (entrada); negative = merma/ajuste. Per-branch + atomic.
-      const branchName = branches.find(b => b.id === selectedBranchId)?.name;
+      const branchName = branches.find(b => b.id === operationalBranchId)?.name;
       // Stock and its audit movement share one transaction: either both exist or neither does.
-      await applyStockDeltas([{ productId: targetProduct.id, branchId: selectedBranchId, qtyDelta: effectiveQty }], [{
+      await applyStockDeltas([{ productId: targetProduct.id, branchId: operationalBranchId, qtyDelta: effectiveQty }], [{
         type: effectiveQty > 0 ? 'surtido' : 'merma',
         productId: targetProduct.id,
         productName: targetProduct.name,
         quantity: Math.abs(effectiveQty),
-        branchId: selectedBranchId,
+        branchId: operationalBranchId,
         branchName,
       }]);
       setQuickStockProduct(null);
@@ -3639,7 +3709,7 @@ export default function App() {
         category: product.category,
         costPrice: product.costPrice.toString(),
         salePrice: product.salePrice.toString(),
-        stock: getProductStock(product, selectedBranchId, products).toString(),
+        stock: getProductStock(product, operationalBranchId, products).toString(),
         minStock: product.minStock.toString(),
         sku: product.sku || '',
         supplierId: product.supplierId || '',
@@ -3697,13 +3767,17 @@ export default function App() {
     // A "child" product's own stock isn't real (it's derived from the parent) — never overwrite
     // it here, so whatever was last stored just sits unused instead of drifting from reality.
     const isChild = !!linkedStockProductId;
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
 
     let updatedProducts: Product[];
     if (editingProduct) {
       updatedProducts = products.map(p => {
         if (p.id === editingProduct.id) {
           const branchStocks = { ...(p.branchStocks || {}) };
-          if (!isChild) branchStocks[selectedBranchId] = stockNum;
+          if (!isChild) branchStocks[operationalBranchId] = stockNum;
           return {
             ...p,
             name: prodForm.name,
@@ -3736,7 +3810,7 @@ export default function App() {
         minStock: minStockNum,
         sku: prodForm.sku || createDocumentId('SKU'),
         supplierId: prodForm.supplierId || undefined,
-        branchStocks: isChild ? {} : { [selectedBranchId]: stockNum },
+        branchStocks: isChild ? {} : { [operationalBranchId]: stockNum },
         linkedStockProductId,
         stockConsumptionFactor,
         isStockPool: prodForm.isStockPool || undefined
@@ -3883,13 +3957,13 @@ export default function App() {
       import('jspdf'),
       import('jspdf-autotable'),
     ]);
-    const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
-    const branchName = branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal';
+    const isSelectedMatriz = branches.find(b => b.id === operationalBranchId)?.isMatriz ?? false;
+    const branchName = branches.find(b => b.id === operationalBranchId)?.name || 'Sucursal';
     const companyName = branding.displayName || userCompanies[activeCompanyId || '']?.name || 'Mi Comercio';
 
     const monthSales = sales
       .filter(s =>
-        (s.branchId === selectedBranchId || (!s.branchId && isSelectedMatriz)) &&
+        (s.branchId === operationalBranchId || (!s.branchId && isSelectedMatriz)) &&
         getSaleMonthKey(s) === pdfCutMonth
       )
       .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
@@ -3929,7 +4003,7 @@ export default function App() {
 
     // Inventory movements (surtidos + transfers) for this branch and month.
     const monthStockMovements = stockMovements
-      .filter(m => m.branchId === selectedBranchId && msToMonthKey(m.createdAt) === pdfCutMonth)
+      .filter(m => m.branchId === operationalBranchId && msToMonthKey(m.createdAt) === pdfCutMonth)
       .sort((a, b) => a.createdAt - b.createdAt);
     const stockTypeLabel = (t: StockMovement['type']) =>
       t === 'surtido' ? 'Surtido' : t === 'merma' ? 'Merma/Ajuste' : t === 'transfer_in' ? 'Traspaso entrada' : 'Traspaso salida';
@@ -4061,13 +4135,13 @@ export default function App() {
       import('jspdf-autotable'),
     ]);
     if (!statsDay) return;
-    const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
-    const branchName = branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal';
+    const isSelectedMatriz = branches.find(b => b.id === operationalBranchId)?.isMatriz ?? false;
+    const branchName = branches.find(b => b.id === operationalBranchId)?.name || 'Sucursal';
     const companyName = branding.displayName || userCompanies[activeCompanyId || '']?.name || 'Mi Comercio';
 
     const daySales = sales
       .filter(s =>
-        (s.branchId === selectedBranchId || (!s.branchId && isSelectedMatriz)) &&
+        (s.branchId === operationalBranchId || (!s.branchId && isSelectedMatriz)) &&
         getSaleDayKey(s) === statsDay
       )
       .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
@@ -4098,7 +4172,7 @@ export default function App() {
     const totalEgresos = dayCashMovements.filter(t => t.type === 'Egreso').reduce((acc, t) => acc + t.amount, 0);
 
     const dayStockMovements = stockMovements
-      .filter(m => m.branchId === selectedBranchId && msToDayKey(m.createdAt) === statsDay)
+      .filter(m => m.branchId === operationalBranchId && msToDayKey(m.createdAt) === statsDay)
       .sort((a, b) => a.createdAt - b.createdAt);
     const stockTypeLabel = (t: StockMovement['type']) =>
       t === 'surtido' ? 'Surtido' : t === 'merma' ? 'Merma/Ajuste' : t === 'transfer_in' ? 'Traspaso entrada' : 'Traspaso salida';
@@ -4285,14 +4359,15 @@ export default function App() {
   // items at once) can search instead of scrolling every catalog item.
   const transferProductOptions = useMemo(() => {
     const term = transferProductSearch.trim().toLowerCase();
+    const sourceBranchId = isOwner ? transferSourceBranchId : operationalBranchId;
     return products.filter(p => {
       // Linked ("child") products have no stock of their own to transfer — only their parent pool does.
       if (p.linkedStockProductId) return false;
-      if (transferSourceBranchId && getProductStock(p, transferSourceBranchId, products) <= 0) return false;
+      if (sourceBranchId && getProductStock(p, sourceBranchId, products) <= 0) return false;
       if (!term) return true;
       return p.name.toLowerCase().includes(term) || (p.category && p.category.toLowerCase().includes(term));
     });
-  }, [products, transferProductSearch, transferSourceBranchId]);
+  }, [products, transferProductSearch, transferSourceBranchId, isOwner, operationalBranchId]);
 
   // The single branch flagged as Matriz, if exactly one is — deliberately undefined (not a
   // best-guess fallback) when zero or more than one branch has isMatriz set, since nothing
@@ -4312,13 +4387,17 @@ export default function App() {
       alert('Tu cuenta no tiene permiso para transferir existencias.');
       return;
     }
+    if (!operationalBranchId || !branches.some(branch => branch.id === operationalBranchId)) {
+      alert('No se puede continuar: tu sucursal operativa aún no está disponible.');
+      return;
+    }
     if (!matrizBranch) {
       alert('No se puede continuar: debe existir exactamente una sucursal marcada como "Matriz" en Sucursales. Revisa la configuración con el Dueño.');
       return;
     }
     const itemsToMove = products
       .filter(p => !p.linkedStockProductId) // linked ("child") products have no stock of their own to move
-      .map(p => ({ productId: p.id, quantity: getProductStock(p, selectedBranchId, products) }))
+      .map(p => ({ productId: p.id, quantity: getProductStock(p, operationalBranchId, products) }))
       .filter(it => it.quantity > 0);
     if (itemsToMove.length === 0) {
       alert('No hay stock en esta sucursal para mover a Matriz.');
@@ -4326,7 +4405,7 @@ export default function App() {
     }
     setTransferItems(itemsToMove);
     setTransferProductSearch('');
-    setTransferSourceBranchId(selectedBranchId);
+    setTransferSourceBranchId(operationalBranchId);
     setTransferTargetBranchId(matrizBranch.id);
     setIsTransferModalOpen(true);
   };
@@ -4336,16 +4415,22 @@ export default function App() {
       alert('Tu cuenta no tiene permiso para transferir existencias.');
       return;
     }
+    if (!operationalBranchId || !branches.some(branch => branch.id === operationalBranchId)) {
+      alert('No se puede transferir: tu sucursal operativa aún no está disponible.');
+      return;
+    }
     // Always overwrites the cart (never merges with a leftover cart from a cancelled
     // session), same as the single-product version used to fully overwrite transferProductId.
     setTransferItems(prodId ? [{ productId: prodId, quantity: 1 }] : []);
     setTransferProductSearch('');
-    // Default source to whatever branch this session is currently operating out of (the
-    // header branch selector) — not an arbitrary Matriz/first-branch guess — since that's
-    // almost always where the goods being transferred actually are. Falls back to Matriz/
-    // first branch only if the current selection isn't a valid branch (edge case).
+    // Default source to the resolved operational branch. Non-owners must never fall back to
+    // Matriz/first branch when their assigned branch is absent or stale.
     if (branches.length > 0) {
-      const current = branches.find(b => b.id === selectedBranchId) || branches.find(b => b.isMatriz) || branches[0];
+      const current = branches.find(b => b.id === operationalBranchId);
+      if (!current) {
+        alert('No se puede transferir: tu sucursal asignada aún no está disponible.');
+        return;
+      }
       setTransferSourceBranchId(current.id);
       const other = branches.find(b => b.id !== current.id) || branches[0];
       setTransferTargetBranchId(other.id);
@@ -4358,15 +4443,20 @@ export default function App() {
       alert('Tu cuenta no tiene permiso para transferir existencias.');
       return;
     }
+    if (!operationalBranchId || !branches.some(branch => branch.id === operationalBranchId)) {
+      alert('No se puede transferir: tu sucursal operativa aún no está disponible.');
+      return;
+    }
     if (transferItems.length === 0) {
       alert("Agrega al menos un producto a la transferencia.");
       return;
     }
-    if (!transferSourceBranchId || !transferTargetBranchId) {
+    const sourceBranchId = isOwner ? transferSourceBranchId : operationalBranchId;
+    if (!sourceBranchId || !transferTargetBranchId) {
       alert("Por favor selecciona la sucursal origen y la sucursal destino.");
       return;
     }
-    if (transferSourceBranchId === transferTargetBranchId) {
+    if (sourceBranchId === transferTargetBranchId) {
       alert("La sucursal de origen y destino no pueden ser la misma.");
       return;
     }
@@ -4394,7 +4484,7 @@ export default function App() {
     }
 
     const insufficient = lines
-      .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, transferSourceBranchId, products) }))
+      .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, sourceBranchId, products) }))
       .filter(l => l.requested > l.available);
     if (insufficient.length > 0) {
       alert(
@@ -4407,7 +4497,7 @@ export default function App() {
     // Timestamp-based for the same reason as sale ids — a plain 6-digit random repeats far
     // sooner than it looks, and a repeat here overwrites a past transfer record outright.
     const transferId = createDocumentId('T');
-    const sourceBranch = branches.find(b => b.id === transferSourceBranchId);
+    const sourceBranch = branches.find(b => b.id === sourceBranchId);
     const targetBranch = branches.find(b => b.id === transferTargetBranchId);
     const sourceBranchName = sourceBranch?.name || 'Sucursal';
     const targetBranchName = targetBranch?.name || 'Sucursal';
@@ -4416,7 +4506,7 @@ export default function App() {
       id: transferId,
       timestamp: new Date().toLocaleString(),
       createdAt: Date.now(),
-      sourceBranchId: transferSourceBranchId,
+      sourceBranchId,
       sourceBranchName,
       sourceBranchAddress: sourceBranch?.address || undefined,
       targetBranchId: transferTargetBranchId,
@@ -4431,7 +4521,7 @@ export default function App() {
         // Single Firestore transaction: decrements source + increments target for every
         // product together, reading the live documents instead of a possibly-stale local copy.
         const deltas = lines.flatMap(l => [
-          { productId: l.productId, branchId: transferSourceBranchId, qtyDelta: -l.quantity },
+          { productId: l.productId, branchId: sourceBranchId, qtyDelta: -l.quantity },
           { productId: l.productId, branchId: transferTargetBranchId, qtyDelta: l.quantity },
         ]);
         // Stock updates and both audit sides commit together. The 150-product guard keeps
@@ -4442,7 +4532,7 @@ export default function App() {
             productId: l.productId,
             productName: l.prod!.name,
             quantity: l.quantity,
-            branchId: transferSourceBranchId,
+            branchId: sourceBranchId,
             branchName: sourceBranchName,
             counterpartBranchId: transferTargetBranchId,
             counterpartBranchName: targetBranchName,
@@ -4456,7 +4546,7 @@ export default function App() {
             quantity: l.quantity,
             branchId: transferTargetBranchId,
             branchName: targetBranchName,
-            counterpartBranchId: transferSourceBranchId,
+            counterpartBranchId: sourceBranchId,
             counterpartBranchName: sourceBranchName,
             transferId,
             unitPrice: l.prod!.salePrice,
@@ -4477,8 +4567,8 @@ export default function App() {
   };
 
   const handleOpenBranchModal = (branch?: Branch) => {
-    if (!isOwnerOrAdminRole) {
-      alert('Solo el Dueño o un administrador puede administrar sucursales.');
+    if (!isOwner) {
+      alert('Solo el Dueño puede administrar sucursales.');
       return;
     }
     if (branch) {
@@ -4499,8 +4589,8 @@ export default function App() {
 
   const handleSaveBranch = async (e: FormEvent) => {
     e.preventDefault();
-    if (!isOwnerOrAdminRole) {
-      alert('Solo el Dueño o un administrador puede administrar sucursales.');
+    if (!isOwner) {
+      alert('Solo el Dueño puede administrar sucursales.');
       return;
     }
     if (!branchForm.name) {
@@ -4657,6 +4747,10 @@ export default function App() {
   // Updates one sale's invoiceStatus directly (not via saveAllData, which would replace the
   // branch-scoped `sales` state) and reflects it in the locally-fetched invoiceSales list.
   const handleSetInvoiceStatus = async (saleId: string, status: 'completed' | 'pending') => {
+    if (!isOwner) {
+      alert('Solo el Dueño puede gestionar la facturación.');
+      return;
+    }
     if (!user || !activeCompanyId) return;
     try {
       await updateDoc(doc(db, 'companies', activeCompanyId, 'sales', saleId), { invoiceStatus: status });
@@ -4797,7 +4891,7 @@ export default function App() {
   });
 
   const handleOpenRestock = (supplierId?: string, productId?: string) => {
-    if (!canManageSuppliers) {
+    if (!canRestock) {
       alert('Tu cuenta no tiene permiso para reabastecer productos.');
       return;
     }
@@ -4812,8 +4906,12 @@ export default function App() {
 
   const handleSaveRestock = async (e: FormEvent) => {
     e.preventDefault();
-    if (!canManageSuppliers) {
+    if (!canRestock) {
       alert('Tu cuenta no tiene permiso para reabastecer productos.');
+      return;
+    }
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
       return;
     }
     const { supplierId, productId, qty, cost } = restockForm;
@@ -4871,7 +4969,7 @@ export default function App() {
         purchasedQuantity: q,
         stockQuantity: effectiveQ,
         unitCost: c,
-        branchId: selectedBranchId,
+        branchId: operationalBranchId,
       });
       setIsRestockOpen(false);
       const stockMsg = targetProd.id === prod.id
@@ -4965,6 +5063,10 @@ export default function App() {
   // Refund Venta. Sale status, returned stock, customer credit and cash ledger are one
   // Firestore transaction, so a retry cannot duplicate a refund or leave partial state.
   const handleRefundSale = async (saleId: string) => {
+    if (!canViewSalesHistory) {
+      alert('Tu cuenta no tiene permiso para consultar el historial de ventas.');
+      return;
+    }
     if (!confirm('¿Está seguro de que desea REEMBOLSAR esta venta? Se restituirá el inventario.')) return;
     const sale = sales.find(s => s.id === saleId);
     if (!sale) return;
@@ -4998,7 +5100,7 @@ export default function App() {
   // Keep the real-time streams operational and small. Older months (or all history) are
   // fetched once only when a report screen requests them, then merged by document id.
   useEffect(() => {
-    if (!user || !activeCompanyId || !selectedBranchId) return;
+    if (!user || !activeCompanyId || !operationalBranchId) return;
     if (activeTab !== 'analytics' && activeTab !== 'history') return;
 
     const requestedKey = activeTab === 'history'
@@ -5011,7 +5113,7 @@ export default function App() {
         ? getDayRange(requestedKey)
         : getMonthRange(requestedKey);
     if (requestedKey !== 'all' && !range) return;
-    const isMatriz = branches.find(branch => branch.id === selectedBranchId)?.isMatriz ?? false;
+    const isMatriz = branches.find(branch => branch.id === operationalBranchId)?.isMatriz ?? false;
     setHistoricalLimitWarning(false);
     // The current-month live stream is enough for migrated branches. Matriz still performs
     // the compatibility read because old sales with no branchId cannot be expressed as a query.
@@ -5019,7 +5121,7 @@ export default function App() {
 
     let cancelled = false;
     const compId = activeCompanyId;
-    const branchId = selectedBranchId;
+    const branchId = operationalBranchId;
     setIsHistoricalLoading(true);
 
     const withPeriod = (collectionRef: ReturnType<typeof collection>, branchScoped: boolean) => {
@@ -5094,9 +5196,17 @@ export default function App() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeTab, user, activeCompanyId, selectedBranchId, pdfCutMonth, statsMonth, statsDay, branches]);
+  }, [activeTab, user, activeCompanyId, operationalBranchId, pdfCutMonth, statsMonth, statsDay, branches]);
   
   const handleRecordCashFlow = async (type: 'Ingreso' | 'Egreso') => {
+    if (!canCloseCash) {
+      alert('Tu cuenta no tiene permiso para registrar movimientos o cerrar la caja.');
+      return;
+    }
+    if (!operationalBranchId) {
+      alert('No hay una sucursal operativa confirmada.');
+      return;
+    }
     const val = parseFloat(cashFlowAmount);
     if (isNaN(val) || val <= 0) {
       alert('Ingresa un valor válido.');
@@ -5109,13 +5219,13 @@ export default function App() {
 
     const valueSigned = type === 'Ingreso' ? val : -val;
     try {
-      await applyCashDelta(selectedBranchId, valueSigned, [{
+      await applyCashDelta(operationalBranchId, valueSigned, [{
         type,
         amount: val,
         description: cashFlowDesc,
         time: new Date().toLocaleTimeString(),
         createdAt: Date.now(),
-        branchId: selectedBranchId
+        branchId: operationalBranchId
       }]);
       setCashFlowAmount('');
       setCashFlowDesc('');
@@ -5130,10 +5240,10 @@ export default function App() {
   // Sales/transactions scoped to the currently selected branch — shared by the POS
   // terminal's quick history, the Historial/Caja tab, and the analytics below, so
   // switching branches consistently filters everything derived from `sales`.
-  const isSelectedBranchMatriz = useMemo(() => branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false, [branches, selectedBranchId]);
+  const isSelectedBranchMatriz = useMemo(() => branches.find(b => b.id === operationalBranchId)?.isMatriz ?? false, [branches, operationalBranchId]);
   const branchScopedSales = useMemo(() =>
-    sales.filter(s => s.branchId === selectedBranchId || (!s.branchId && isSelectedBranchMatriz)),
-    [sales, selectedBranchId, isSelectedBranchMatriz]
+    sales.filter(s => s.branchId === operationalBranchId || (!s.branchId && isSelectedBranchMatriz)),
+    [sales, operationalBranchId, isSelectedBranchMatriz]
   );
   // `cashRegister` is now the selected branch's own document (see the dedicated
   // onSnapshot effect above), so every entry in it already belongs to this branch —
@@ -5150,8 +5260,8 @@ export default function App() {
 
   // Inventory movements (surtidos + transfers) that touch the active branch.
   const branchScopedStockMovements = useMemo(
-    () => stockMovements.filter(m => m.branchId === selectedBranchId),
-    [stockMovements, selectedBranchId]
+    () => stockMovements.filter(m => m.branchId === operationalBranchId),
+    [stockMovements, operationalBranchId]
   );
 
   // 'Transferencia' entries carry a unit count in `amount`, not a currency value —
@@ -5171,12 +5281,12 @@ export default function App() {
   }, [sales]);
 
   const stats = useMemo(() => {
-    const isSelectedMatriz = branches.find(b => b.id === selectedBranchId)?.isMatriz ?? false;
+    const isSelectedMatriz = branches.find(b => b.id === operationalBranchId)?.isMatriz ?? false;
     // Corte Diario: statsDay takes priority over statsMonth whenever it's set. Leaving it
     // empty ('') keeps the existing month/histórico behavior completely unchanged.
     const activeSales = sales.filter(s =>
       s.status === 'Completed' &&
-      (s.branchId === selectedBranchId || (!s.branchId && isSelectedMatriz)) &&
+      (s.branchId === operationalBranchId || (!s.branchId && isSelectedMatriz)) &&
       (statsDay ? getSaleDayKey(s) === statsDay : (statsMonth === 'all' || getSaleMonthKey(s) === statsMonth))
     );
     const grossRevenue = activeSales.reduce((acc, s) => acc + s.total, 0);
@@ -5198,7 +5308,7 @@ export default function App() {
     // viewed at a different scale, so counting the pool AND every child as separate "low stock"
     // alerts would inflate this number for one real shortage. The pool itself still shows up
     // when it crosses its own threshold, which is the actionable signal.
-    const lowStockItems = products.filter(p => !p.linkedStockProductId && getProductStock(p, selectedBranchId, products) <= p.minStock);
+    const lowStockItems = products.filter(p => !p.linkedStockProductId && getProductStock(p, operationalBranchId, products) <= p.minStock);
 
     // Group sales by Category
     const categoryPopularity: { [key: string]: number } = {};
@@ -5211,7 +5321,7 @@ export default function App() {
     });
 
     return { grossRevenue, profit, averageTicket, lowStockItems, categoryPopularity, activeSalesCount: activeSales.length, activeSales };
-  }, [sales, products, selectedBranchId, branches, statsMonth, statsDay]);
+  }, [sales, products, operationalBranchId, branches, statsMonth, statsDay]);
 
   // Corte Diario — manual cash movements (Ingreso/Egreso) for the selected day, from the
   // currently-displayed branch's register. Only computed when a day is actually selected.
@@ -5405,7 +5515,7 @@ export default function App() {
                 <span className="text-[9px] lg:text-[10px] font-extrabold uppercase tracking-wider hidden sm:block" style={{ color: 'color-mix(in srgb, var(--brand-primary) 65%, white)' }}>Sucursal:</span>
                 {isBranchLocked ? (
                   <span className="border rounded px-1.5 lg:px-2 py-0.5 text-[9px] lg:text-[10px] font-bold truncate text-white" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 80%, black)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
-                    <MapPin className="w-2.5 h-2.5 inline mr-0.5" />{branches.find(b => b.id === selectedBranchId)?.name || 'Sucursal Principal'}
+                    <MapPin className="w-2.5 h-2.5 inline mr-0.5" />{branches.find(b => b.id === operationalBranchId)?.name || 'Sucursal no asignada'}
                   </span>
                 ) : (
                   <select
@@ -5524,15 +5634,17 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center space-x-2.5 flex-shrink-0">
-            <button
-              onClick={() => {
-                setOpeningCashInput('500');
-                setIsOpeningCajaModalOpen(true);
-              }}
-              className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
-            >
-              Abrir Caja Ahora <Rocket className="w-3 h-3" />
-            </button>
+             {canCloseCash && (
+               <button
+                 onClick={() => {
+                   setOpeningCashInput('500');
+                   setIsOpeningCajaModalOpen(true);
+                 }}
+                 className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
+               >
+                 Abrir Caja Ahora <Rocket className="w-3 h-3" />
+               </button>
+             )}
             <button
               onClick={() => setShowClosedCajaBanner(false)}
               className="text-white hover:text-slate-100 font-bold p-1 hover:bg-white/10 rounded-full cursor-pointer"
@@ -5580,9 +5692,9 @@ export default function App() {
             { id: 'history',    label: 'Historial / Caja',    icon: <Receipt className="w-5 h-5" /> },
             { id: 'analytics',  label: 'Estadísticas',        icon: <BarChart3 className="w-5 h-5" /> },
           ].filter(item =>
-            item.id === 'branches' ? isOwnerOrAdminRole
-              : item.id === 'suppliers' ? canManageSuppliers
-                : item.id === 'invoicing' ? isOwnerOrAdminRole
+            item.id === 'branches' ? isOwner
+              : item.id === 'suppliers' ? canViewSuppliers
+                : item.id === 'invoicing' ? isOwner
                   : canViewSalesHistory
           ).map(({ id, label, icon }) => (
             <button key={id} id={`nav-${id}`}
@@ -5594,13 +5706,15 @@ export default function App() {
             </button>
           ))}
 
-          <button id="nav-settings"
-            onClick={() => { setActiveTab('settings'); setIsMobileMenuOpen(false); }}
-            className={activeTab === 'settings' ? navActiveClass : navInactiveClass}
-            style={activeTab === 'settings' ? navActiveStyle : {}}
-          >
-            <Settings className="w-5 h-5" /><span className="mt-1 md:mt-0">Mi Empresa / Equipo</span>
-          </button>
+          {isOwner && (
+            <button id="nav-settings"
+              onClick={() => { if (!isOwner) return; setActiveTab('settings'); setIsMobileMenuOpen(false); }}
+              className={activeTab === 'settings' ? navActiveClass : navInactiveClass}
+              style={activeTab === 'settings' ? navActiveStyle : {}}
+            >
+              <Settings className="w-5 h-5" /><span className="mt-1 md:mt-0">Mi Empresa / Equipo</span>
+            </button>
+          )}
         </nav>
 
         {/* Dynamic Frame Screen Views */}
@@ -5632,9 +5746,9 @@ export default function App() {
                   >
                     <ShoppingCart className="w-3.5 h-3.5 inline mr-1" /><span>Catálogo</span>
                   </button>
-                  <button
+                  {canViewSalesHistory && <button
                     type="button"
-                    onClick={() => setPosSubTab('history')}
+                    onClick={() => { if (canViewSalesHistory) setPosSubTab('history'); }}
                     className={`flex-1 py-2.5 text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-2 cursor-pointer ${
                       posSubTab === 'history'
                         ? 'bg-white text-slate-800 shadow-sm border border-slate-200'
@@ -5642,7 +5756,7 @@ export default function App() {
                     }`}
                   >
                     <History className="w-3.5 h-3.5" /><span>Historial ({branchScopedSales.length})</span>
-                  </button>
+                  </button>}
                   <button
                     type="button"
                     onClick={() => setPosSubTab('cashier')}
@@ -5754,11 +5868,11 @@ export default function App() {
                                   {prod.category}
                                 </span>
                                 <span className={`text-[9px] sm:text-[10px] font-bold px-1.5 sm:px-2 py-0.5 rounded-full shrink-0 ${
-                                  getProductStock(prod, selectedBranchId, products) <= prod.minStock
+                                  getProductStock(prod, operationalBranchId, products) <= prod.minStock
                                     ? 'bg-amber-100 text-amber-700 font-extrabold animate-pulse'
                                     : 'bg-slate-50 text-slate-600'
                                 }`}>
-                                  Stock: {getProductStock(prod, selectedBranchId, products)}
+                                  Stock: {getProductStock(prod, operationalBranchId, products)}
                                 </span>
                               </div>
 
@@ -5793,7 +5907,7 @@ export default function App() {
                       <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100 overflow-hidden">
                         {filteredProducts.map(prod => {
                           const inCartItem = cart.find(ci => ci.product.id === prod.id);
-                          const low = getProductStock(prod, selectedBranchId, products) <= prod.minStock;
+                          const low = getProductStock(prod, operationalBranchId, products) <= prod.minStock;
                           return (
                             <div
                               key={prod.id}
@@ -5808,7 +5922,7 @@ export default function App() {
                                 <div className="flex items-center gap-3 text-[11px] mt-0.5">
                                   <span className="font-extrabold" style={{ color: 'var(--brand-primary)' }}>{formatMXN(prod.salePrice)}</span>
                                   <span className={`font-bold ${low ? 'text-amber-600' : 'text-slate-500'}`}>
-                                    {low && <AlertCircle className="w-3 h-3 inline mr-0.5" />}Stock: {getProductStock(prod, selectedBranchId, products)}
+                                    {low && <AlertCircle className="w-3 h-3 inline mr-0.5" />}Stock: {getProductStock(prod, operationalBranchId, products)}
                                   </span>
                                 </div>
                               </div>
@@ -5829,7 +5943,7 @@ export default function App() {
                   </>
                 )}
 
-                {posSubTab === 'history' && (
+                {posSubTab === 'history' && canViewSalesHistory && (
                   /* Terminal-Integrated Sales History */
                   <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4">
                     <div className="flex justify-between items-center border-b pb-3">
@@ -5879,7 +5993,7 @@ export default function App() {
                             {/* Options block for completed terminal sale */}
                             <div className="pt-2 border-t border-slate-100 flex justify-between items-center gap-2">
                               {sale.status === 'Completed' ? (
-                                isOwnerOrAdminRole ? (
+                                (isOwner || activeCompanyRole === 'admin') ? (
                                   <button
                                     type="button"
                                     onClick={() => handleRefundSale(sale.id)}
@@ -5949,7 +6063,7 @@ export default function App() {
                         >
                           Corte de Caja (Cierre de Turno) <FileText className="w-3.5 h-3.5" />
                         </button>
-                      ) : !cashRegister.isOpen ? (
+                      ) : !cashRegister.isOpen && canCloseCash ? (
                         <button
                           type="button"
                           onClick={() => {
@@ -5965,7 +6079,7 @@ export default function App() {
                       )}
                     </div>
 
-                    {cashRegister.isOpen && (
+                    {cashRegister.isOpen && canCloseCash && (
                       <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-4 text-left">
                         <h4 className="font-extrabold text-slate-700 text-xs flex items-center gap-1"><DollarSign className="w-3.5 h-3.5" /> Movimiento de Caja Manual</h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -6165,7 +6279,14 @@ export default function App() {
                           type="number" 
                           min="0"
                           value={discountVal || ''}
-                          onChange={(e) => setDiscountVal(Math.max(0, parseFloat(e.target.value) || 0))}
+                          onChange={(e) => {
+                            if (!canApplyDiscount) {
+                              setDiscountVal(0);
+                              alert('Tu cuenta no tiene permiso para aplicar descuentos.');
+                              return;
+                            }
+                            setDiscountVal(Math.max(0, parseFloat(e.target.value) || 0));
+                          }}
                           placeholder={discountType === 'pct' ? "Porcentaje de descuento (ej. 10)" : "Valor del descuento (ej 5)"}
                           className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg p-2 outline-none focus:border-indigo-400"
                         />
@@ -6325,7 +6446,7 @@ export default function App() {
                       <List className="w-4 h-4" />
                     </button>
                   </div>
-                {(canEditProducts || canTransferStock || canViewSalesHistory) && (
+                {(canEditProducts || canRestock || canTransferStock || canViewSalesHistory) && (
                   <div className="flex gap-2 flex-wrap">
                     <button
                       onClick={handleExportProducts}
@@ -6343,7 +6464,7 @@ export default function App() {
                         Editar Categorías
                       </button>
                     )}
-                    {canTransferStock && selectedBranchId !== matrizBranch?.id && (
+                    {canTransferStock && operationalBranchId !== matrizBranch?.id && (
                       <button
                         type="button"
                         onClick={handleOpenMoveAllToMatrizModal}
@@ -6406,7 +6527,7 @@ export default function App() {
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
                           {prod.category}
                         </span>
-                        {getProductStock(prod, selectedBranchId, products) <= prod.minStock && (
+                        {getProductStock(prod, operationalBranchId, products) <= prod.minStock && (
                           <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200 flex items-center animate-pulse">
                             <AlertCircle className="w-3 h-3 mr-1" />
                             Stock en Alerta
@@ -6451,7 +6572,7 @@ export default function App() {
 
                       <div className="flex justify-between text-xs font-semibold text-slate-600 pt-1">
                         <span>Cant. en Inventario:</span>
-                        <span className={`font-bold ${getProductStock(prod, selectedBranchId, products) <= prod.minStock ? 'text-purple-600' : 'text-slate-800'}`}>{getProductStock(prod, selectedBranchId, products)} u.</span>
+                        <span className={`font-bold ${getProductStock(prod, operationalBranchId, products) <= prod.minStock ? 'text-purple-600' : 'text-slate-800'}`}>{getProductStock(prod, operationalBranchId, products)} u.</span>
                       </div>
 
                       {activeCompanyRole !== 'employee' && branches.length > 1 && (
@@ -6477,7 +6598,7 @@ export default function App() {
                             {getLinkedChildren(prod.id).map(child => (
                               <div key={child.id} className="flex justify-between items-center text-violet-700 font-bold gap-1.5">
                                 <span className="truncate flex-1">{child.name.replace(prod.name, '').trim() || child.name}:</span>
-                                <span className="shrink-0">{formatMXN(child.salePrice)} · {getProductStock(child, selectedBranchId, products)} u.</span>
+                                <span className="shrink-0">{formatMXN(child.salePrice)} · {getProductStock(child, operationalBranchId, products)} u.</span>
                                 {canEditProducts && (
                                   <button
                                     type="button"
@@ -6495,7 +6616,7 @@ export default function App() {
                       )}
                     </div>
 
-                    {(canEditProducts || canTransferStock) ? (
+                    {(canEditProducts || canRestock || canTransferStock) ? (
                       <div className="mt-4 pt-4 border-t border-slate-100">
                         {canTransferStock && branches.length > 1 && (
                           <button
@@ -6506,12 +6627,12 @@ export default function App() {
                             <Package className="w-3.5 h-3.5 inline mr-1" /><span>Transferir / Repartir Stock</span>
                           </button>
                         )}
-                        {canEditProducts && (
+                        {canRestock && (
                           <button
                             type="button"
                             onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
                             className="w-full py-2 mb-2 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 text-xs font-black rounded-xl cursor-pointer transition text-center flex items-center justify-center"
-                            title={`Sumar unidades al stock de ${branches.find(b => b.id === selectedBranchId)?.name || 'esta sucursal'}`}
+                            title={`Sumar unidades al stock de ${branches.find(b => b.id === operationalBranchId)?.name || 'esta sucursal'}`}
                           >
                             <Plus className="w-3.5 h-3.5 inline mr-1" /><span>Surtir Stock</span>
                           </button>
@@ -6553,7 +6674,7 @@ export default function App() {
                   </p>
                 )}
                 {topLevelInventoryProducts.map(prod => {
-                  const branchStock = getProductStock(prod, selectedBranchId, products);
+                  const branchStock = getProductStock(prod, operationalBranchId, products);
                   const low = branchStock <= prod.minStock;
                   const linkedChildren = getLinkedChildren(prod.id);
                   return (
@@ -6574,13 +6695,13 @@ export default function App() {
                         </div>
                         {linkedChildren.length > 0 && (
                           <p className="text-[10px] text-violet-600 font-bold mt-0.5 truncate flex items-center gap-1">
-                            <Link2 className="w-2.5 h-2.5 shrink-0" /> {linkedChildren.map(child => `${child.name.replace(prod.name, '').trim() || child.name}: ${getProductStock(child, selectedBranchId, products)} u.`).join(' · ')}
+                            <Link2 className="w-2.5 h-2.5 shrink-0" /> {linkedChildren.map(child => `${child.name.replace(prod.name, '').trim() || child.name}: ${getProductStock(child, operationalBranchId, products)} u.`).join(' · ')}
                           </p>
                         )}
                       </div>
-                      {(canEditProducts || canTransferStock) && (
+                      {(canEditProducts || canRestock || canTransferStock) && (
                         <div className="flex items-center gap-1.5 shrink-0">
-                          {canEditProducts && (
+                          {canRestock && (
                             <button
                               type="button"
                               onClick={() => { setQuickStockProduct(prod); setQuickStockAmount(''); }}
@@ -6776,12 +6897,16 @@ export default function App() {
                          autoFocus
                        />
                        <button
-                          onClick={async () => {
-                            const val = parseFloat(newInitialCash);
+                           onClick={async () => {
+                             if (!isOwner || !canCloseCash || !operationalBranchId) {
+                               alert('Solo el Dueño con permiso de cierre puede ajustar la apertura de una sucursal asignada.');
+                               return;
+                             }
+                             const val = parseFloat(newInitialCash);
                             if (!isNaN(val) && val >= 0) {
                               const diff = val - cashRegister.initialCash;
                               try {
-                                await writeCashRegisterForBranch(selectedBranchId, {
+                                await writeCashRegisterForBranch(operationalBranchId, {
                                   ...cashRegister,
                                   initialCash: val,
                                   currentCash: cashRegister.currentCash + diff,
@@ -6815,7 +6940,7 @@ export default function App() {
                   ) : (
                     <div className="flex items-center gap-2 mt-2">
                       <p className="text-xs text-white/60">Monto de apertura: {formatMXN(cashRegister.initialCash)}</p>
-                      {activeCompanyRole === 'owner' && (
+                       {isOwner && canCloseCash && operationalBranchId && (
                         <button
                           onClick={() => {
                             setEditInitialCashPrompt(true);
@@ -7027,7 +7152,7 @@ export default function App() {
                                 <p className="text-base font-black text-slate-800 mt-1">Total Generado: {formatMXN(sale.total)}</p>
                               </div>
 
-                              {sale.status === 'Completed' && isOwnerOrAdminRole && (
+                              {sale.status === 'Completed' && (isOwner || activeCompanyRole === 'admin') && (
                                 <button
                                   type="button"
                                   onClick={() => handleRefundSale(sale.id)}
@@ -7151,7 +7276,7 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'analytics' && (
+          {activeTab === 'analytics' && canViewSalesHistory && (
             activeCompanyRole === 'employee' ? (
               <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-sm space-y-6 max-w-2xl mx-auto mt-6 text-center select-none">
                 <div className="w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center mx-auto border border-rose-100">
@@ -7385,7 +7510,7 @@ export default function App() {
                           </div>
                           <div className="text-right">
                             <span className="px-2 py-0.5 font-extrabold text-[10px] rounded-full text-white" style={{ backgroundColor: 'var(--brand-primary)' }}>
-                              Stock: {getProductStock(p, selectedBranchId, products)}
+                              Stock: {getProductStock(p, operationalBranchId, products)}
                             </span>
                             <button
                               onClick={() => handleOpenRestock(undefined, p.id)}
@@ -7408,7 +7533,7 @@ export default function App() {
           )}
 
           {/* SCREEN: SUCURSALES (BRANCH OFFICES) */}
-          {activeTab === 'branches' && (
+          {activeTab === 'branches' && isOwner && (
             <div className="space-y-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-white p-6 rounded-3xl border shadow-sm">
                 <div>
@@ -7420,7 +7545,7 @@ export default function App() {
                     Administra múltiples ubicaciones físicas o móviles, asigna gerentes, y monitorea el rendimiento individual.
                   </p>
                 </div>
-                {isOwnerOrAdminRole && (
+                {isOwner && (
                   <div className="flex gap-2.5 w-full md:w-auto self-start flex-wrap">
                     {canTransferStock && branches.length > 1 && (
                       <button
@@ -7523,7 +7648,7 @@ export default function App() {
                           </span>
                         )}
 
-                        {isOwnerOrAdminRole ? (
+                        {isOwner ? (
                           <div className="flex space-x-1">
                             <button
                               onClick={() => handleOpenBranchModal(branch)}
@@ -7568,7 +7693,7 @@ export default function App() {
                   </p>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-2 w-full md:w-auto">
-                  {canManageSuppliers && <button
+                  {canRestock && <button
                     onClick={() => handleOpenRestock()}
                     className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition flex items-center justify-center space-x-2"
                   >
@@ -7636,7 +7761,7 @@ export default function App() {
                             <div className="mt-2 text-[10px] text-slate-500 leading-tight space-y-1">
                               <p className="font-bold border-b border-amber-100 pb-1 uppercase text-[8px] text-slate-400">Existencias Actuales:</p>
                               {linkedProducts.slice(0, 3).map(p => {
-                                const displayStock = getProductStock(p, selectedBranchId, products);
+                                const displayStock = getProductStock(p, operationalBranchId, products);
                                 return (
                                 <div key={p.id} className="flex justify-between gap-2 font-medium min-w-0">
                                   <span className="min-w-0 truncate" title={p.name}>{p.name}</span>
@@ -7652,7 +7777,7 @@ export default function App() {
                       </div>
 
                       <div className="mt-5 pt-3 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
-                        {canManageSuppliers && <button
+                        {canRestock && <button
                           onClick={() => {
                             if (linkedProducts.length === 0) {
                               alert('Registre o vincule productos a este proveedor en el Inventario antes de reabastecer.');
@@ -7695,7 +7820,7 @@ export default function App() {
           )}
 
           {/* SCREEN: FACTURACION E HISTORIAL DE TICKETS (INVOICING) */}
-          {activeTab === 'invoicing' && (
+          {activeTab === 'invoicing' && isOwner && (
             <div className="bg-white p-4 lg:p-6 rounded-3xl shadow-xl border border-slate-100 flex-grow animate-in fade-in slide-in-from-bottom-4 relative mb-24 lg:mb-8 mx-auto w-full max-w-7xl">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b pb-5 mb-5 space-y-3 sm:space-y-0 relative z-10 w-full">
                 <div>
@@ -7780,7 +7905,7 @@ export default function App() {
           )}
 
           {/* SCREEN: EMPRESA Y EQUIPO (SETTINGS) */}
-          {activeTab === 'settings' && (
+          {activeTab === 'settings' && isOwner && (
             (!user || !activeCompanyId) ? (
               <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-sm space-y-6 max-w-2xl mx-auto mt-6 text-center">
                 <div className="w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center mx-auto border border-rose-100">
@@ -7953,10 +8078,10 @@ export default function App() {
             <div className="text-sm space-y-1">
               <p className="font-extrabold text-slate-800">{quickStockProduct.name}</p>
               <p className="text-xs text-slate-500">
-                Sucursal: <span className="font-bold text-slate-700">{branches.find(b => b.id === selectedBranchId)?.name || 'Actual'}</span>
+                Sucursal: <span className="font-bold text-slate-700">{branches.find(b => b.id === operationalBranchId)?.name || 'No asignada'}</span>
               </p>
               <p className="text-xs text-slate-500">
-                Stock actual: <span className="font-bold text-slate-700">{getProductStock(quickStockProduct, selectedBranchId, products)} u.</span>
+                Stock actual: <span className="font-bold text-slate-700">{getProductStock(quickStockProduct, operationalBranchId, products)} u.</span>
               </p>
             </div>
 
@@ -7977,7 +8102,7 @@ export default function App() {
 
             {quickStockAmount && !isNaN(parseFloat(quickStockAmount)) && parseFloat(quickStockAmount) !== 0 && (
               <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-2.5 text-center text-xs font-bold text-emerald-800">
-                Nuevo stock: {getProductStock(quickStockProduct, selectedBranchId, products)} → {Math.max(0, getProductStock(quickStockProduct, selectedBranchId, products) + parseFloat(quickStockAmount))} u.
+                Nuevo stock: {getProductStock(quickStockProduct, operationalBranchId, products)} → {Math.max(0, getProductStock(quickStockProduct, operationalBranchId, products) + parseFloat(quickStockAmount))} u.
               </div>
             )}
 
@@ -8564,18 +8689,24 @@ export default function App() {
               <div className="grid grid-cols-2 gap-3 text-left">
                 <div>
                   <label className="text-xs uppercase font-extrabold text-slate-500 tracking-wider block">Origen:</label>
-                  <select
-                    value={transferSourceBranchId}
-                    onChange={(e) => setTransferSourceBranchId(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition mt-1.5"
-                  >
-                    <option value="">Selecciona origen...</option>
-                    {branches.map(b => (
-                      <option key={b.id} value={b.id}>
-                        {b.name} {b.isMatriz ? '(Matriz)' : ''}
-                      </option>
-                    ))}
-                  </select>
+                  {isOwner ? (
+                    <select
+                      value={transferSourceBranchId}
+                      onChange={(e) => setTransferSourceBranchId(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-800 text-xs font-bold outline-none focus:border-indigo-500 transition mt-1.5"
+                    >
+                      <option value="">Selecciona origen...</option>
+                      {branches.map(b => (
+                        <option key={b.id} value={b.id}>
+                          {b.name} {b.isMatriz ? '(Matriz)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div className="w-full bg-slate-100 border border-slate-200 rounded-xl px-3 py-2.5 text-slate-700 text-xs font-bold mt-1.5">
+                      {branches.find(branch => branch.id === operationalBranchId)?.name || 'Sucursal no asignada'}
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -8924,7 +9055,7 @@ export default function App() {
                               }}
                               className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
                             />
-                            <span>{prod.name} (Stock: {getProductStock(prod, selectedBranchId, products)})</span>
+                            <span>{prod.name} (Stock: {getProductStock(prod, operationalBranchId, products)})</span>
                           </label>
                         );
                       })}
@@ -9020,7 +9151,7 @@ export default function App() {
                       : products
                     ).filter(p => !p.linkedStockProductId).map(p => (
                       <option key={p.id} value={p.id}>
-                        {p.name} (Stock Actual: {getProductStock(p, selectedBranchId, products)})
+                        {p.name} (Stock Actual: {getProductStock(p, operationalBranchId, products)})
                       </option>
                     ))}
                   </select>
@@ -9512,7 +9643,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Company Selector — only for Google-authenticated owners/admins */}
+      {/* Company Selector — available to authenticated users with company membership */}
       {user && !isAuthLoading && !activeCompanyId && !isCredentialEmployee && (
         <CompanySelector
           companies={userCompanies}

@@ -179,6 +179,7 @@ export default function CompanySettingsView({
       window.removeEventListener('resize', updateTabEdges);
     };
   }, [members.length, currentUserRole]);
+
   const scrollTabs = (dir: number) => tabsRef.current?.scrollBy({ left: dir * 150, behavior: 'smooth' });
   const [isLoadingMembers, setIsLoadingMembers] = useState(true);
 
@@ -186,6 +187,7 @@ export default function CompanySettingsView({
   const [deleteConfirmMemberId, setDeleteConfirmMemberId] = useState<string | null>(null);
   const [editedCompanyName, setEditedCompanyName] = useState(companyName);
   const [activeCode, setActiveCode] = useState<string | null>(null);
+  const [invitationBranchId, setInvitationBranchId] = useState('');
   const [isUpdating, setIsUpdating] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -219,6 +221,18 @@ export default function CompanySettingsView({
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
   const [restoreProgressMsg, setRestoreProgressMsg] = useState('');
+
+  const isOwner = currentUserRole === 'owner';
+
+  useEffect(() => {
+    if (branches.length === 1 && !invitationBranchId) {
+      setInvitationBranchId(branches[0].id);
+      return;
+    }
+    if (invitationBranchId && !branches.some(branch => branch.id === invitationBranchId)) {
+      setInvitationBranchId('');
+    }
+  }, [branches, invitationBranchId]);
 
   // Branding form state
   const [brandDisplayName, setBrandDisplayName] = useState(branding.displayName || '');
@@ -411,6 +425,10 @@ export default function CompanySettingsView({
 
   const handleSaveBranding = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isOwner) {
+      alert('Solo el Dueño puede actualizar la apariencia del comercio.');
+      return;
+    }
     if (!onSaveBranding) return;
     setIsSavingBranding(true);
     try {
@@ -437,6 +455,10 @@ export default function CompanySettingsView({
 
   const handleSavePrintConfig = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isOwner) {
+      alert('Solo el Dueño puede actualizar la configuración de impresión.');
+      return;
+    }
     if (!onSavePrintConfig) return;
     setIsSavingPrint(true);
     try {
@@ -455,7 +477,7 @@ export default function CompanySettingsView({
   };
 
   const handleBackupToDrive = async () => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede gestionar los respaldos de la nube.");
       return;
     }
@@ -509,7 +531,7 @@ export default function CompanySettingsView({
   };
 
   const handleRestoreFromDrive = async () => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede gestionar los respaldos de la nube.");
       return;
     }
@@ -578,8 +600,13 @@ export default function CompanySettingsView({
     // firestore.rules (members create/update are isOwner()-gated), which rejects this same
     // write server-side; this check just gives an immediate message instead of a generic
     // Firestore permission error.
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede registrar nuevas cuentas de equipo.");
+      return;
+    }
+    const assignedBranchId = credBranchId.trim();
+    if (!assignedBranchId || !branches.some(branch => branch.id === assignedBranchId)) {
+      alert('Selecciona una sucursal válida. Las cuentas de Admin y Empleado deben tener una sucursal asignada.');
       return;
     }
     const cleanUsername = credUsername.trim();
@@ -621,7 +648,7 @@ export default function CompanySettingsView({
         name: credName.trim(),
         email: virtualEmail,
         role: credRole,
-        assignedBranchId: credBranchId || '',
+        assignedBranchId,
         joinedAt: new Date().toISOString(),
         customRoleName: '',
         permissions: [],
@@ -655,6 +682,10 @@ export default function CompanySettingsView({
   };
 
   const handleOpenRoleModal = (member: Member) => {
+    if (!isOwner || member.role === 'owner') {
+      alert('Solo el Dueño puede asignar tareas a miembros no propietarios.');
+      return;
+    }
     setSelectedRoleMember(member);
     setEditedPermissions(member.permissions || []);
     setIsRoleModalOpen(true);
@@ -662,7 +693,7 @@ export default function CompanySettingsView({
 
   const handleSaveRoleAndPermissions = async () => {
     if (!selectedRoleMember) return;
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede asignar tareas adicionales.");
       return;
     }
@@ -735,8 +766,8 @@ export default function CompanySettingsView({
   const handleUpdateCompanyName = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editedCompanyName.trim() || isUpdating) return;
-    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
-      alert("Solo el Propietario o Administrador puede renombrar la empresa.");
+    if (!isOwner) {
+      alert("Solo el Dueño puede renombrar la empresa.");
       return;
     }
 
@@ -766,8 +797,12 @@ export default function CompanySettingsView({
   };
 
   const handleGenerateInvoiceInvitationCode = async () => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede generar códigos de invitación.");
+      return;
+    }
+    if (!invitationBranchId || !branches.some(branch => branch.id === invitationBranchId)) {
+      alert('Selecciona una sucursal válida antes de generar una invitación. Cada cuenta debe operar en una sucursal asignada.');
       return;
     }
     setIsUpdating(true);
@@ -781,6 +816,7 @@ export default function CompanySettingsView({
         companyId: companyId,
         companyName: companyName,
         role: 'employee',
+        assignedBranchId: invitationBranchId,
         usageType: selectedUsageType,
         createdAt: Timestamp.now(),
         expiresAt: Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000),
@@ -801,7 +837,7 @@ export default function CompanySettingsView({
   };
 
   const handleRevokeInvitationCode = async () => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       return;
     }
     if (!activeCode) return;
@@ -825,6 +861,10 @@ export default function CompanySettingsView({
 
   const handleInlineCreateCompany = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isOwner) {
+      alert('Solo el Dueño puede crear otra empresa.');
+      return;
+    }
     if (!newInlineCompanyName.trim() || !onCreateCompany || isCreatingInline) return;
     setIsCreatingInline(true);
     try {
@@ -856,7 +896,7 @@ export default function CompanySettingsView({
   };
 
   const handleChangeMemberRole = async (memberUserId: string, memberName: string, newRole: NonOwnerCompanyRole) => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede modificar roles.");
       return;
     }
@@ -865,6 +905,10 @@ export default function CompanySettingsView({
     if (!memberToUpdate) return;
     if (memberToUpdate.role === 'owner') {
       alert("No se puede editar el rol del propietario del comercio.");
+      return;
+    }
+    if (!memberToUpdate.assignedBranchId?.trim() || !branches.some(branch => branch.id === memberToUpdate.assignedBranchId?.trim())) {
+      alert('Asigna una sucursal antes de guardar un rol de Admin o Empleado.');
       return;
     }
 
@@ -884,8 +928,14 @@ export default function CompanySettingsView({
   };
 
   const handleChangeMemberBranch = async (memberUserId: string, memberName: string, newBranchId: string) => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el Dueño puede asignar sucursales.");
+      return;
+    }
+
+    const assignedBranchId = newBranchId.trim();
+    if (!assignedBranchId || !branches.some(branch => branch.id === assignedBranchId)) {
+      alert('Selecciona una sucursal válida. Los miembros Admin y Empleado no pueden quedar sin sucursal.');
       return;
     }
 
@@ -895,7 +945,7 @@ export default function CompanySettingsView({
     setIsUpdating(true);
     try {
       await updateDoc(doc(db, 'companies', companyId, 'members', memberUserId), {
-        assignedBranchId: newBranchId || null
+        assignedBranchId
       });
       alert(`Sucursal de ${memberName} actualizada exitosamente.`);
     } catch (err) {
@@ -907,7 +957,7 @@ export default function CompanySettingsView({
   };
 
   const handleTransferOwnership = async (targetMember: Member) => {
-    if (currentUserRole !== 'owner') {
+    if (!isOwner) {
       alert("Solo el propietario actual puede transferir la propiedad del comercio.");
       return;
     }
@@ -953,6 +1003,16 @@ export default function CompanySettingsView({
       setIsUpdating(false);
     }
   };
+
+  if (!isOwner) {
+    return (
+      <div className="bg-white rounded-3xl border border-rose-200 p-8 shadow-sm max-w-2xl mx-auto mt-6 text-center">
+        <Lock className="w-10 h-10 text-rose-500 mx-auto mb-3" />
+        <h3 className="text-lg font-black text-slate-800">Acceso restringido</h3>
+        <p className="text-sm text-slate-500 mt-2">Solo el Dueño puede administrar la empresa, sus sucursales y su equipo.</p>
+      </div>
+    );
+  }
 
   return (
     <div id="company-settings-section" className="grid grid-cols-1 lg:grid-cols-12 gap-6 select-none">
@@ -1262,16 +1322,16 @@ export default function CompanySettingsView({
                                 onChange={(e) => handleChangeMemberBranch(member.userId, member.name, e.target.value)}
                                 className="flex-1 min-w-0 max-w-[180px] text-[11px] bg-white border border-slate-300 hover:border-indigo-400 rounded px-1.5 py-0.5 outline-none font-bold text-slate-700 cursor-pointer truncate"
                               >
-                                <option value="">(Sin asignar - matriz default)</option>
+                                <option value="" disabled>(Asignación requerida)</option>
                                 {branches.map(b => (
                                   <option key={b.id} value={b.id}>{b.name}</option>
                                 ))}
                               </select>
                             </div>
                           ) : member.assignedBranchId ? (
-                            <p className="text-[11px] text-indigo-600 font-extrabold mt-2 bg-indigo-50 border border-indigo-100 rounded-lg p-1.5 max-w-full break-words">Sucursal: {branches.find(b => b.id === member.assignedBranchId)?.name || 'Matriz'}</p>
+                            <p className="text-[11px] text-indigo-600 font-extrabold mt-2 bg-indigo-50 border border-indigo-100 rounded-lg p-1.5 max-w-full break-words">Sucursal: {branches.find(b => b.id === member.assignedBranchId)?.name || 'Sucursal inválida — acceso bloqueado'}</p>
                           ) : (
-                            member.role !== 'owner' && <p className="text-[11px] text-slate-500 font-bold mt-2 bg-slate-100 border border-slate-200 rounded-lg p-1.5 w-fit">Matriz Principal</p>
+                            member.role !== 'owner' && <p className="text-[11px] text-rose-600 font-bold mt-2 bg-rose-50 border border-rose-200 rounded-lg p-1.5 w-fit">Sucursal requerida — acceso bloqueado</p>
                           )}
                         </div>
                       </div>
@@ -1331,6 +1391,10 @@ export default function CompanySettingsView({
                             <button
                               type="button"
                               onClick={async () => {
+                                if (!isOwner) {
+                                  alert('Solo el Dueño puede eliminar miembros.');
+                                  return;
+                                }
                                 try {
                                   await deleteDoc(doc(db, 'companies', companyId, 'members', member.userId));
                                   // Best-effort: also clear this company out of the departing
@@ -1359,7 +1423,13 @@ export default function CompanySettingsView({
                           ) : (
                             <button
                               type="button"
-                              onClick={() => setDeleteConfirmMemberId(member.userId)}
+                              onClick={() => {
+                                if (!isOwner) {
+                                  alert('Solo el Dueño puede eliminar miembros.');
+                                  return;
+                                }
+                                setDeleteConfirmMemberId(member.userId);
+                              }}
                               className="p-1.5 bg-white hover:bg-red-50 text-red-600 hover:text-red-700 rounded-lg cursor-pointer transition border border-slate-200 hover:border-red-200 shadow-sm shrink-0"
                               title="Remover de la Empresa"
                             >
@@ -1383,7 +1453,7 @@ export default function CompanySettingsView({
                 <p className="text-[11px] text-slate-500 break-words">Genera un código para que colaboradores con <strong>cuenta de Google</strong> se unan a '{companyName}'. Para empleados sin Google, usa "Crear Empleado" en la pestaña Equipo.</p>
               </div>
 
-              {currentUserRole !== 'owner' ? (
+              {!isOwner ? (
                 <div className="bg-red-50 border border-red-200/50 p-4 rounded-xl flex items-start space-x-3">
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div>
@@ -1409,6 +1479,23 @@ export default function CompanySettingsView({
                           <option value="multiple">Varios Usos (Ideal para registrar a todo tu personal con un solo código)</option>
                           <option value="single">Un Solo Uso (Expira y se auto-destruye automáticamente tras el primer ingreso exitoso)</option>
                         </select>
+                      </div>
+                      <div className="flex-1 space-y-1">
+                        <label className="text-[11px] font-bold text-slate-500 block">Sucursal asignada:</label>
+                        <select
+                          value={invitationBranchId}
+                          required
+                          onChange={(e) => setInvitationBranchId(e.target.value)}
+                          className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs font-bold rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+                        >
+                          <option value="" disabled>Selecciona una sucursal...</option>
+                          {branches.map(branch => (
+                            <option key={branch.id} value={branch.id}>{branch.name}</option>
+                          ))}
+                        </select>
+                        {branches.length === 0 && (
+                          <p className="text-[10px] text-rose-600 font-semibold">Registra una sucursal antes de invitar personal.</p>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1533,13 +1620,13 @@ export default function CompanySettingsView({
                 <p className="text-[11px] text-slate-500">Configuración general de datos corporatorios de {companyName}:</p>
               </div>
 
-              {currentUserRole !== 'owner' && currentUserRole !== 'admin' ? (
+              {!isOwner ? (
                 <div className="bg-red-50 border border-red-200/50 p-4 rounded-xl flex items-start space-x-3">
                   <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
                   <div>
                     <h5 className="font-extrabold text-xs text-red-800">Acceso Restringido</h5>
                     <p className="text-[11px] text-red-600">
-                      Solo el Propietario o Administrador de la tienda tiene privilegios para renombrar o configurar este comercio.
+                      Solo el Dueño de la tienda tiene privilegios para renombrar o configurar este comercio.
                     </p>
                   </div>
                 </div>
@@ -2273,13 +2360,14 @@ export default function CompanySettingsView({
                       </div>
 
                       <div className="space-y-1">
-                        <label className="text-slate-600 font-bold block">Sucursal Asignada</label>
+                        <label className="text-slate-600 font-bold block">Sucursal Asignada *</label>
                         <select
                           value={credBranchId}
+                          required
                           onChange={(e) => setCredBranchId(e.target.value)}
                           className="w-full bg-white border border-slate-200 rounded-lg p-2.5 outline-none focus:border-indigo-500 font-bold text-slate-700 cursor-pointer"
                         >
-                          <option value="">Matriz / General</option>
+                          <option value="" disabled>Selecciona una sucursal...</option>
                           {branches.map(b => (
                             <option key={b.id} value={b.id}>{b.name}</option>
                           ))}

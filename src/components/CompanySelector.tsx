@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Building2, Sparkles, LogOut, Check, ArrowRight, Key, Trash2 } from 'lucide-react';
-import type { CompanyRole } from '../lib/permissions';
+import { isOwnerRole, type CompanyRole } from '../lib/permissions';
 
 interface Company {
   id: string;
@@ -34,7 +34,22 @@ export default function CompanySelector({
   const [inviteCode, setInviteCode] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
+  const companyList = Object.values(companies);
+  const canCreateCompany = companyList.length === 0 || companyList.some(company => isOwnerRole(company.role));
+
+  useEffect(() => {
+    if (companyList.length === 0 && activeTab === 'select') {
+      setActiveTab('create');
+    } else if (!canCreateCompany && activeTab === 'create') {
+      setActiveTab(companyList.length > 0 ? 'select' : 'join');
+    }
+  }, [activeTab, canCreateCompany, companyList.length]);
+
   const handleDeleteClick = async (id: string, name: string) => {
+    if (!isOwnerRole(companies[id]?.role || 'employee')) {
+      window.alert('Solo el Dueño puede eliminar una empresa.');
+      return;
+    }
     const firstConfirm = window.confirm(`ADVERTENCIA\n¿Estás seguro de que deseas eliminar permanentemente la empresa "${name}"? Esta acción borrará de manera irreversible todos los productos, registros de inventario, ventas y cierres de caja.`);
     if (!firstConfirm) return;
 
@@ -53,15 +68,12 @@ export default function CompanySelector({
     }
   };
 
-  const companyList = Object.values(companies);
-
-  // Auto fallback if there are no companies, point to create tab
-  if (companyList.length === 0 && activeTab === 'select') {
-    setActiveTab('create');
-  }
-
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canCreateCompany) {
+      window.alert('Solo el Dueño puede crear una nueva empresa desde una membresía existente.');
+      return;
+    }
     if (!companyName.trim()) return;
     setIsSubmitting(true);
     try {
@@ -115,16 +127,18 @@ export default function CompanySelector({
               Mis Empresas
             </button>
           )}
-          <button
-            onClick={() => setActiveTab('create')}
-            className={`flex-1 text-center py-3.5 text-xs font-black uppercase tracking-wider transition cursor-pointer ${
-              activeTab === 'create'
-                ? 'border-b-2 border-indigo-500 text-slate-100'
-                : 'text-slate-500 hover:text-slate-300'
-            }`}
-          >
-            Nueva Empresa
-          </button>
+          {canCreateCompany && (
+            <button
+              onClick={() => setActiveTab('create')}
+              className={`flex-1 text-center py-3.5 text-xs font-black uppercase tracking-wider transition cursor-pointer ${
+                activeTab === 'create'
+                  ? 'border-b-2 border-indigo-500 text-slate-100'
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+            >
+              Nueva Empresa
+            </button>
+          )}
           <button
             onClick={() => setActiveTab('join')}
             className={`flex-1 text-center py-3.5 text-xs font-black uppercase tracking-wider transition cursor-pointer ${
@@ -193,7 +207,7 @@ export default function CompanySelector({
             </div>
           )}
 
-          {activeTab === 'create' && (
+          {activeTab === 'create' && canCreateCompany && (
             <form onSubmit={handleCreateSubmit} className="space-y-4">
               <div className="space-y-1.5 text-left">
                 <label className="text-xs text-slate-300 font-bold">Nombre de la Empresa / Comercio</label>
