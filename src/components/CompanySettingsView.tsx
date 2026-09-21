@@ -34,7 +34,7 @@ import {
 import { db, handleFirestoreError, OperationType, createCredentialUser } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch, Timestamp } from 'firebase/firestore';
 import { createInvitationCode } from '../lib/ids';
-import { PERMISSION_OPTIONS, type CompanyRole } from '../lib/permissions';
+import { PERMISSION_OPTIONS, resolveAssignedBranchId, type CompanyRole } from '../lib/permissions';
 
 type NonOwnerCompanyRole = Exclude<CompanyRole, 'owner'>;
 
@@ -961,8 +961,17 @@ export default function CompanySettingsView({
       alert("Solo el propietario actual puede transferir la propiedad del comercio.");
       return;
     }
+    if (targetMember.role === 'owner') {
+      alert('El miembro seleccionado ya es propietario del comercio.');
+      return;
+    }
     if (targetMember.isCredentialAccount) {
       alert("No se puede transferir la propiedad del comercio a un usuario sin cuenta de Google.");
+      return;
+    }
+    const formerOwnerBranchId = resolveAssignedBranchId(targetMember.assignedBranchId, branches);
+    if (!formerOwnerBranchId) {
+      alert('No se puede transferir la propiedad: el nuevo propietario debe tener una sucursal asignada y válida. Asigna una sucursal antes de continuar.');
       return;
     }
 
@@ -991,7 +1000,7 @@ export default function CompanySettingsView({
       batch.update(targetMemberRef, { role: 'owner' });
       
       // The previous owner remains an administrator after the transfer.
-      batch.update(currentMemberRef, { role: 'admin' });
+      batch.update(currentMemberRef, { role: 'admin', assignedBranchId: formerOwnerBranchId });
 
       await batch.commit();
 

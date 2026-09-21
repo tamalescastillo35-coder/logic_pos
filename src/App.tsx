@@ -76,7 +76,7 @@ import {
   safeLocalStorageSet,
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
-import { hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
+import { getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
 
 const isNativePlatform = Capacitor.isNativePlatform();
 
@@ -1941,10 +1941,6 @@ export default function App() {
   };
 
   const handleOpenCaja = async (initialCashValue: number) => {
-    if (!canCloseCash) {
-      alert('Tu cuenta no tiene permiso para abrir o cerrar la caja.');
-      return;
-    }
     if (!operationalBranchId) {
       alert('No hay una sucursal operativa confirmada.');
       return;
@@ -3911,6 +3907,15 @@ export default function App() {
   };
 
   const handleExportProducts = async () => {
+    if (!canEditProducts) {
+      alert('Tu cuenta no tiene permiso para exportar el catálogo e inventario.');
+      return;
+    }
+    const exportBranches = getInventoryExportBranches<Branch>(activeCompanyRole, operationalBranchId, branches);
+    if (!isOwner && exportBranches.length === 0) {
+      alert('No se puede exportar: tu sucursal operativa aún no está disponible.');
+      return;
+    }
     let csvContent = "\uFEFF";
     csvContent += "REPORTE DE CATALOGO E INVENTARIO GENERAL\n";
     csvContent += `Fecha de exportacion: ${new Date().toLocaleDateString()}\n`;
@@ -3918,7 +3923,7 @@ export default function App() {
 
     // Headers with specific Branch stocks
     let headers = "ID,Nombre,Categoria,PRECIO COMPRA (Costo),PRECIO VENTA,STOCK TOTAL,ALERTA MINIMA,SKU,FONDO COMPARTIDO (VINCULADO A)";
-    branches.forEach(b => {
+    exportBranches.forEach(b => {
       headers += `,Stock - ${b.name.replace(/,/g, ' ')}`;
     });
     csvContent += headers + "\n";
@@ -3926,7 +3931,7 @@ export default function App() {
     products.forEach(p => {
       // getProductStock (not p.stock/p.branchStocks directly) so a linked "child" product shows
       // its real derived availability instead of its own unused/stale stock field.
-      const branchVals = branches.map(b => getProductStock(p, b.id, products));
+      const branchVals = exportBranches.map(b => getProductStock(p, b.id, products));
       const totalStock = branchVals.reduce((sum, v) => sum + v, 0);
       // A linked product's STOCK TOTAL is the SAME underlying pool viewed at a different scale
       // as its parent's — this column makes that explicit so nobody sums this row's total
@@ -4669,7 +4674,7 @@ export default function App() {
   // Skip refetching if the last successful fetch was less than 10 minutes ago.
   const branchRevenueFetchedAtRef = useRef(0);
   useEffect(() => {
-    if (activeTab !== 'branches' || !user || !activeCompanyId || branches.length === 0) return;
+    if (!isOwner || activeTab !== 'branches' || !user || !activeCompanyId || branches.length === 0) return;
     if (Date.now() - branchRevenueFetchedAtRef.current < 10 * 60 * 1000) return;
     branchRevenueFetchedAtRef.current = Date.now(); // set before the fetch, not after, so two rapid re-fires can't both slip past the throttle check
     let cancelled = false;
@@ -4713,7 +4718,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [activeTab, user, activeCompanyId, branches]);
+  }, [activeTab, user, activeCompanyId, branches, isOwner]);
 
   // Facturación (CFDI) lists invoices from every branch at once, so — same reasoning as
   // branchRevenueStats above — it keeps its own state fetched on demand instead of reading
@@ -4726,7 +4731,7 @@ export default function App() {
   // invoice-flagged sales just from someone checking back and forth.
   const invoiceSalesFetchedAtRef = useRef(0);
   useEffect(() => {
-    if (activeTab !== 'invoicing' || !user || !activeCompanyId) return;
+    if (!isOwner || activeTab !== 'invoicing' || !user || !activeCompanyId) return;
     if (Date.now() - invoiceSalesFetchedAtRef.current < 10 * 60 * 1000) return;
     invoiceSalesFetchedAtRef.current = Date.now();
     let cancelled = false;
@@ -4742,7 +4747,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [activeTab, user, activeCompanyId]);
+  }, [activeTab, user, activeCompanyId, isOwner]);
 
   // Updates one sale's invoiceStatus directly (not via saveAllData, which would replace the
   // branch-scoped `sales` state) and reflects it in the locally-fetched invoiceSales list.
@@ -5634,17 +5639,15 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center space-x-2.5 flex-shrink-0">
-             {canCloseCash && (
-               <button
-                 onClick={() => {
-                   setOpeningCashInput('500');
-                   setIsOpeningCajaModalOpen(true);
-                 }}
-                 className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
-               >
-                 Abrir Caja Ahora <Rocket className="w-3 h-3" />
-               </button>
-             )}
+             <button
+               onClick={() => {
+                 setOpeningCashInput('500');
+                 setIsOpeningCajaModalOpen(true);
+               }}
+               className="bg-white text-amber-900 hover:bg-amber-50 font-extrabold text-[10px] px-3.5 py-1.5 rounded-lg shadow-sm cursor-pointer border border-amber-200 transition uppercase tracking-wider inline-flex items-center gap-1"
+             >
+               Abrir Caja Ahora <Rocket className="w-3 h-3" />
+             </button>
             <button
               onClick={() => setShowClosedCajaBanner(false)}
               className="text-white hover:text-slate-100 font-bold p-1 hover:bg-white/10 rounded-full cursor-pointer"
@@ -6063,7 +6066,7 @@ export default function App() {
                         >
                           Corte de Caja (Cierre de Turno) <FileText className="w-3.5 h-3.5" />
                         </button>
-                      ) : !cashRegister.isOpen && canCloseCash ? (
+                      ) : !cashRegister.isOpen ? (
                         <button
                           type="button"
                           onClick={() => {
@@ -6448,13 +6451,15 @@ export default function App() {
                   </div>
                 {(canEditProducts || canRestock || canTransferStock || canViewSalesHistory) && (
                   <div className="flex gap-2 flex-wrap">
-                    <button
-                      onClick={handleExportProducts}
-                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
-                      title="Exportar catálogo completo con existencias multisuccursal a CSV"
-                    >
-                      <Download className="w-4 h-4" /> Exportar Inventario (CSV)
-                    </button>
+                    {canEditProducts && (
+                      <button
+                        onClick={handleExportProducts}
+                        className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-sm px-4 py-2.5 rounded-xl flex items-center whitespace-nowrap gap-2 cursor-pointer shadow-sm transition"
+                        title={isOwner ? 'Exportar catálogo completo con existencias multisuccursal a CSV' : 'Exportar catálogo con existencias de tu sucursal a CSV'}
+                      >
+                        <Download className="w-4 h-4" /> Exportar Inventario (CSV)
+                      </button>
+                    )}
                     {canEditProducts && (
                       <button
                         onClick={() => setIsCategoryModalOpen(true)}

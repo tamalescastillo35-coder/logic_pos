@@ -48,3 +48,21 @@ export function hasAppPermission(
 export function isOwnerRole(role: CompanyRole): boolean {
   return role === 'owner';
 }
+
+export function resolveAssignedBranchId(
+  candidate: unknown,
+  branches: readonly { id: string }[],
+): string | null {
+  const branchId = typeof candidate === 'string' ? candidate.trim() : '';
+  return branchId && branches.some(branch => branch.id === branchId) ? branchId : null;
+}
+
+export function getInventoryExportBranches<T extends { id: string }>(
+  role: CompanyRole,
+  assignedBranchId: unknown,
+  branches: readonly T[],
+): readonly T[] {
+  if (isOwnerRole(role)) return branches;
+  const branchId = resolveAssignedBranchId(assignedBranchId, branches);
+  return branchId ? branches.filter(branch => branch.id === branchId) : [];
+}
