@@ -227,3 +227,75 @@ export const describeCheckoutError = (error: unknown): CheckoutErrorDescription 
     retryable: true,
   };
 };
+
+export class MatrixConfigurationError extends Error {
+  constructor(message: string = 'Configuración de Matriz inválida') {
+    super(message);
+    this.name = 'MatrixConfigurationError';
+  }
+}
+
+export interface StockOperationErrorDescription {
+  kind: 'permission' | 'offline' | 'contention' | 'stock' | 'invalid-data' | 'session' | 'matrix-config' | 'unknown';
+  message: string;
+  retryable: boolean;
+}
+
+export const describeStockOperationError = (error: unknown): StockOperationErrorDescription => {
+  if (error instanceof MatrixConfigurationError) {
+    return {
+      kind: 'matrix-config',
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (error instanceof StockUnavailableError) {
+    return {
+      kind: 'stock',
+      message: error.message,
+      retryable: true,
+    };
+  }
+
+  const code = normalizeFirebaseCode(error);
+  if (code === 'permission-denied') {
+    return {
+      kind: 'permission',
+      message: 'No tienes permisos suficientes o la transferencia viola las reglas de sucursal. Solicita autorización al Propietario.',
+      retryable: false,
+    };
+  }
+  if (code === 'unauthenticated') {
+    return {
+      kind: 'session',
+      message: 'La sesión ya no es válida. La operación NO se aplicó; vuelve a iniciar sesión.',
+      retryable: false,
+    };
+  }
+  if (code === 'unavailable' || code === 'deadline-exceeded' || code === 'cancelled') {
+    return {
+      kind: 'offline',
+      message: 'No fue posible confirmar la operación con Firestore. Los datos se conservaron; reintenta cuando la conexión se estabilice.',
+      retryable: true,
+    };
+  }
+  if (code === 'aborted' || code === 'failed-precondition') {
+    return {
+      kind: 'contention',
+      message: 'Otra terminal modificó el inventario al mismo tiempo. La operación NO se aplicó; revisa las existencias e intenta de nuevo.',
+      retryable: true,
+    };
+  }
+  if (code === 'invalid-argument' || code === 'out-of-range' || code === 'data-loss') {
+    return {
+      kind: 'invalid-data',
+      message: 'Datos de la operación inválidos. Revisa las cantidades y sucursales seleccionadas.',
+      retryable: false,
+    };
+  }
+  return {
+    kind: 'unknown',
+    message: 'Ocurrió un error inesperado al aplicar la operación de stock. Los datos se conservaron.',
+    retryable: true,
+  };
+};

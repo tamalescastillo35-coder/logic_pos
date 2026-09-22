@@ -49,7 +49,8 @@ import {
   MessageCircle,
   Mail,
   Share2,
-  Pencil
+  Pencil,
+  RefreshCw,
 } from 'lucide-react';
 // Firebase integrations
 import { auth, db, googleProvider, driveGoogleProvider, OperationType, handleFirestoreError, getCachedAccessToken, setCachedAccessToken, SessionInvalidError, isSessionInvalidError } from './firebase';
@@ -66,7 +67,9 @@ import { Share } from '@capacitor/share';
 import {
   CashRegisterClosedError,
   StockUnavailableError,
+  MatrixConfigurationError,
   describeCheckoutError,
+  describeStockOperationError,
   getDayRange,
   getMonthRange,
   getRecordDayKey,
@@ -77,6 +80,7 @@ import {
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
 import { getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
+import { FirestoreConnectionController } from './lib/firestoreConnection';
 
 const isNativePlatform = Capacitor.isNativePlatform();
 
@@ -834,6 +838,23 @@ export default function App() {
   // that before the next sale is rung up instead of after it silently fails to save.
   const [sessionExpired, setSessionExpired] = useState(false);
   const [firestoreConnectionState, setFirestoreConnectionState] = useState<'checking' | 'ready' | 'offline' | 'error'>('checking');
+  const connectionController = useMemo(
+    () =>
+      new FirestoreConnectionController({
+        probeFn: async (companyId) => {
+          await getDocFromServer(doc(db, 'companies', companyId));
+        },
+        probeTimeoutMs: 8000,
+      }),
+    []
+  );
+
+  useEffect(() => {
+    return connectionController.subscribe((state) => {
+      setFirestoreConnectionState(state.status);
+    });
+  }, [connectionController]);
+
   const [folioNumber, setFolioNumber] = useState('');
 
   // Hard States
@@ -1279,82 +1300,36 @@ export default function App() {
     };
   }, [user]);
 
-  // Capacitor's Network status is only a signal that a transport exists. Firestore is marked
-  // ready only after an explicit server read succeeds, which covers stale sockets after Android
-  // background/resume without calling a slow request "offline" after an arbitrary timeout.
+  // Generation-aware connection controller: validates Firestore access via server-read probe.
+  // Mono-increasing generation prevents stale probes, network fluctuations, or company switches
+  // from leaving the POS in permanent checking state or falsely marking an old company ready.
   useEffect(() => {
-    if (!user || !activeCompanyId) {
-      setFirestoreConnectionState('checking');
-      return;
-    }
+    connectionController.setCompanyId(user && activeCompanyId ? activeCompanyId : null);
+  }, [user, activeCompanyId, connectionController]);
 
-    let disposed = false;
+  useEffect(() => {
     let removeNetworkListener: (() => Promise<void>) | undefined;
-    let probeTimer: ReturnType<typeof setTimeout> | null = null;
-    let probeInFlight = false;
-    const compId = activeCompanyId;
-
-    const probeFirestore = async () => {
-      if (disposed || probeInFlight) return;
-      probeInFlight = true;
-      setFirestoreConnectionState('checking');
-      try {
-        // Firestore enables and restores its transport automatically. Calling enableNetwork()
-        // while the application's snapshot listeners are being registered can race their ADD/
-        // REMOVE target acknowledgements and crash the SDK with assertion ca9 (target count -1).
-        await getDocFromServer(doc(db, 'companies', compId));
-        if (!disposed) setFirestoreConnectionState('ready');
-      } catch (error: any) {
-        if (disposed) return;
-        const code = String(error?.code || '').replace(/^firestore\//, '');
-        setFirestoreConnectionState(
-          code === 'unavailable' || code === 'deadline-exceeded' || code === 'cancelled'
-            ? 'offline'
-            : 'error'
-        );
-      } finally {
-        probeInFlight = false;
-      }
-    };
-
-    const scheduleProbe = () => {
-      if (probeTimer) clearTimeout(probeTimer);
-      // Let the main real-time listeners finish registering before adding the one-shot
-      // server probe, and collapse duplicate initial Capacitor network notifications.
-      probeTimer = setTimeout(() => {
-        probeTimer = null;
-        void probeFirestore();
-      }, 750);
-    };
-
-    const applyNetworkSignal = (connected: boolean) => {
-      if (!connected) {
-        if (probeTimer) clearTimeout(probeTimer);
-        probeTimer = null;
-        setFirestoreConnectionState('offline');
-      } else {
-        scheduleProbe();
-      }
-    };
 
     void Network.getStatus()
-      .then(status => applyNetworkSignal(status.connected))
-      .catch(() => void probeFirestore());
-    void Network.addListener('networkStatusChange', status => applyNetworkSignal(status.connected))
-      .then(handle => { removeNetworkListener = () => handle.remove(); });
+      .then((status) => connectionController.notifyNetwork(status))
+      .catch(() => connectionController.notifyNetwork({ connected: false }));
+
+    void Network.addListener('networkStatusChange', (status) =>
+      connectionController.notifyNetwork(status)
+    ).then((handle) => {
+      removeNetworkListener = () => handle.remove();
+    });
 
     const onVisibilityChange = () => {
-      if (!document.hidden) scheduleProbe();
+      if (!document.hidden) connectionController.retry();
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
-      disposed = true;
-      if (probeTimer) clearTimeout(probeTimer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       if (removeNetworkListener) void removeNetworkListener();
     };
-  }, [user, activeCompanyId]);
+  }, [connectionController]);
 
   // Listen for direct URL invitation links (e.g. ?invite=INV-XXXXX)
   useEffect(() => {
@@ -4444,6 +4419,18 @@ export default function App() {
   };
 
   const handleExecuteTransfer = async () => {
+    if (!user || !activeCompanyId) {
+      alert('La sesión no está activa. El traspaso NO se aplicó; vuelve a iniciar sesión e inténtalo de nuevo.');
+      return;
+    }
+    if (firestoreConnectionState !== 'ready') {
+      alert(
+        firestoreConnectionState === 'checking'
+          ? 'Firestore está reconectando y validando la sesión. Espera a que el indicador muestre conexión lista antes de transferir.'
+          : 'No hay conexión confirmada con Firestore. El traspaso NO se aplicó; presiona "Reintentar conexión".'
+      );
+      return;
+    }
     if (!canTransferStock) {
       alert('Tu cuenta no tiene permiso para transferir existencias.');
       return;
@@ -4464,6 +4451,27 @@ export default function App() {
     if (sourceBranchId === transferTargetBranchId) {
       alert("La sucursal de origen y destino no pueden ser la misma.");
       return;
+    }
+
+    if (!isOwner) {
+      const matrixBranches = branches.filter(b => b.isMatriz);
+      if (matrixBranches.length === 0) {
+        const failure = describeStockOperationError(new MatrixConfigurationError('No existe una sucursal Matriz configurada en la empresa. El traspaso solo puede realizarse hacia o desde la Matriz.'));
+        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
+        return;
+      }
+      if (matrixBranches.length > 1) {
+        const failure = describeStockOperationError(new MatrixConfigurationError('Existe más de una sucursal configurada como Matriz. Contacta al Propietario para corregir la configuración.'));
+        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
+        return;
+      }
+      const isSourceMatrix = branches.find(b => b.id === sourceBranchId)?.isMatriz;
+      const isTargetMatrix = branches.find(b => b.id === transferTargetBranchId)?.isMatriz;
+      if (!isSourceMatrix && !isTargetMatrix) {
+        const failure = describeStockOperationError(new MatrixConfigurationError('Uno de los extremos del traspaso (origen o destino) debe ser la sucursal Matriz.'));
+        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
+        return;
+      }
     }
 
     // Aggregate by productId defensively (not just relying on the cart's merge-on-add).
@@ -4492,10 +4500,11 @@ export default function App() {
       .map(l => ({ name: l.prod!.name, requested: l.quantity, available: getProductStock(l.prod!, sourceBranchId, products) }))
       .filter(l => l.requested > l.available);
     if (insufficient.length > 0) {
-      alert(
+      const failure = describeStockOperationError(new StockUnavailableError(
         "Existencias insuficientes en la sucursal de origen:\n\n" +
         insufficient.map(x => `• ${x.name}: pides ${x.requested}, disponible ${x.available}`).join('\n')
-      );
+      ));
+      alert(`${failure.message}\n\nLos productos se conservan en la lista para corregir las cantidades.`);
       return;
     }
 
@@ -4521,53 +4530,51 @@ export default function App() {
       items: lines.map(l => ({ productId: l.productId, productName: l.prod!.name, quantity: l.quantity, salePrice: l.prod!.salePrice })),
     };
 
-    if (user && activeCompanyId) {
-      try {
-        // Single Firestore transaction: decrements source + increments target for every
-        // product together, reading the live documents instead of a possibly-stale local copy.
-        const deltas = lines.flatMap(l => [
-          { productId: l.productId, branchId: sourceBranchId, qtyDelta: -l.quantity },
-          { productId: l.productId, branchId: transferTargetBranchId, qtyDelta: l.quantity },
-        ]);
-        // Stock updates and both audit sides commit together. The 150-product guard keeps
-        // the request below Firestore's 500-write ceiling (3 writes per product).
-        const movements = lines.flatMap(l => [
-          {
-            type: 'transfer_out' as const,
-            productId: l.productId,
-            productName: l.prod!.name,
-            quantity: l.quantity,
-            branchId: sourceBranchId,
-            branchName: sourceBranchName,
-            counterpartBranchId: transferTargetBranchId,
-            counterpartBranchName: targetBranchName,
-            transferId,
-            unitPrice: l.prod!.salePrice,
-          },
-          {
-            type: 'transfer_in' as const,
-            productId: l.productId,
-            productName: l.prod!.name,
-            quantity: l.quantity,
-            branchId: transferTargetBranchId,
-            branchName: targetBranchName,
-            counterpartBranchId: sourceBranchId,
-            counterpartBranchName: sourceBranchName,
-            transferId,
-            unitPrice: l.prod!.salePrice,
-          },
-        ]);
-        await applyStockDeltas(deltas, movements);
+    try {
+      // Single Firestore transaction: decrements source + increments target for every
+      // product together, reading the live documents instead of a possibly-stale local copy.
+      const deltas = lines.flatMap(l => [
+        { productId: l.productId, branchId: sourceBranchId, qtyDelta: -l.quantity },
+        { productId: l.productId, branchId: transferTargetBranchId, qtyDelta: l.quantity },
+      ]);
+      // Stock updates and both audit sides commit together. The 150-product guard keeps
+      // the request below Firestore's 500-write ceiling (3 writes per product).
+      const movements = lines.flatMap(l => [
+        {
+          type: 'transfer_out' as const,
+          productId: l.productId,
+          productName: l.prod!.name,
+          quantity: l.quantity,
+          branchId: sourceBranchId,
+          branchName: sourceBranchName,
+          counterpartBranchId: transferTargetBranchId,
+          counterpartBranchName: targetBranchName,
+          transferId,
+          unitPrice: l.prod!.salePrice,
+        },
+        {
+          type: 'transfer_in' as const,
+          productId: l.productId,
+          productName: l.prod!.name,
+          quantity: l.quantity,
+          branchId: transferTargetBranchId,
+          branchName: targetBranchName,
+          counterpartBranchId: sourceBranchId,
+          counterpartBranchName: sourceBranchName,
+          transferId,
+          unitPrice: l.prod!.salePrice,
+        },
+      ]);
+      await applyStockDeltas(deltas, movements);
 
-        setIsTransferModalOpen(false);
-        setTransferItems([]);
-        setLastCompletedTransfer(completedTransfer);
-      } catch (err) {
-        console.error("Error executing branch transfer:", err);
-        alert("Ocurrió un error al guardar los cambios en la base de datos de Firebase.");
-      }
-    } else {
-      alert('La sesión no está activa. El traspaso NO se aplicó; vuelve a iniciar sesión e inténtalo de nuevo.');
+      setIsTransferModalOpen(false);
+      setTransferItems([]);
+      setTransferProductSearch('');
+      setLastCompletedTransfer(completedTransfer);
+    } catch (err) {
+      console.error("Error executing branch transfer:", err);
+      const failure = describeStockOperationError(err);
+      alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
     }
   };
 
@@ -5542,17 +5549,36 @@ export default function App() {
         {/* Real-time Clock and Auth on right */}
         <div className="flex items-center space-x-2 lg:space-x-4 flex-shrink-0">
           {firestoreConnectionState !== 'ready' && (
-            <span
-              className={`px-2 lg:px-2.5 py-1 rounded-md border font-bold text-[10px] lg:text-xs text-white flex items-center gap-1 flex-shrink-0 ${
-                firestoreConnectionState === 'checking'
-                  ? 'bg-amber-500 border-amber-300 animate-pulse'
-                  : 'bg-rose-600 border-rose-400'
-              }`}
-              title="El cobro se habilita únicamente después de confirmar acceso al servidor de Firestore."
-            >
-              <AlertCircle className="w-3 h-3" />
-              <span>{firestoreConnectionState === 'checking' ? 'Reconectando…' : firestoreConnectionState === 'offline' ? 'Sin conexión' : 'Revisar acceso'}</span>
-            </span>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <span
+                className={`px-2 lg:px-2.5 py-1 rounded-md border font-bold text-[10px] lg:text-xs text-white flex items-center gap-1 ${
+                  firestoreConnectionState === 'checking'
+                    ? 'bg-amber-500 border-amber-300 animate-pulse'
+                    : 'bg-rose-600 border-rose-400'
+                }`}
+                title="El cobro y las transferencias se habilitan únicamente después de confirmar acceso al servidor de Firestore."
+              >
+                <AlertCircle className="w-3 h-3" />
+                <span>
+                  {firestoreConnectionState === 'checking'
+                    ? 'Reconectando…'
+                    : firestoreConnectionState === 'offline'
+                    ? 'Sin conexión'
+                    : 'Revisar acceso'}
+                </span>
+              </span>
+              {firestoreConnectionState !== 'checking' && (
+                <button
+                  type="button"
+                  onClick={() => connectionController.retry()}
+                  className="px-2 py-1 text-[10px] lg:text-xs font-bold text-white bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-md shadow-sm transition flex items-center gap-1 cursor-pointer"
+                  title="Reintentar verificación de conexión con el servidor"
+                >
+                  <RefreshCw className="w-2.5 h-2.5" />
+                  <span>Reintentar conexión</span>
+                </button>
+              )}
+            </div>
           )}
           <div className="hidden lg:flex items-center space-x-2 text-sm font-medium opacity-90">
             <span className="px-2.5 py-1 rounded-md border font-bold text-white text-xs" style={{ backgroundColor: 'color-mix(in srgb, var(--brand-dark) 60%, transparent)', borderColor: 'color-mix(in srgb, var(--brand-primary) 30%, transparent)' }}>
@@ -8826,10 +8852,14 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleExecuteTransfer}
-                disabled={transferItems.length === 0}
+                disabled={transferItems.length === 0 || firestoreConnectionState !== 'ready'}
                 className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition text-center cursor-pointer shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Confirmar Traspaso
+                {firestoreConnectionState === 'checking'
+                  ? 'Verificando conexión...'
+                  : firestoreConnectionState !== 'ready'
+                  ? 'Sin conexión'
+                  : 'Confirmar Traspaso'}
               </button>
             </div>
           </div>
