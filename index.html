@@ -5,6 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>XAMU POS</title>
     <link rel="icon" type="image/png" href="/xamu_logo.png" />
+    <script>
+      window.addEventListener('error', function (e) {
+        console.error('Unhandled window error:', e);
+        var r = document.getElementById('root');
+        if (r && !r.hasChildNodes()) {
+          r.innerHTML = '<div style="padding:24px;font-family:sans-serif;color:#e11d48;background:#0f172a;min-height:100vh;display:flex;align-items:center;justify-content:center;"><div style="background:#1e293b;padding:24px;border-radius:16px;max-width:560px;border:1px solid #334155"><h3 style="margin-top:0;color:#f43f5e">Error al cargar POS</h3><p style="color:#cbd5e1;font-size:13px">' + (e.message || 'Error desconocido') + '</p><pre style="background:#020617;padding:12px;border-radius:8px;font-size:11px;overflow:auto;color:#fda4af">' + (e.error ? e.error.stack || e.error.message : '') + '</pre><button onclick="localStorage.clear();sessionStorage.clear();location.reload()" style="margin-top:12px;padding:8px 16px;background:#4f46e5;color:#fff;border:none;border-radius:8px;cursor:pointer;font-weight:bold">Limpiar caché y recargar</button></div></div>';
+        }
+      });
+    </script>
   </head>
   <body class="bg-slate-50 text-slate-900 select-none">
     <div id="root" class="font-sans"></div>

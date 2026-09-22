@@ -57,9 +57,9 @@ export class FirestoreConnectionController {
   constructor(options: ConnectionControllerOptions = {}) {
     this.probeFn = options.probeFn || (async () => {});
     this.probeTimeoutMs = options.probeTimeoutMs ?? 8000;
-    this.setTimeoutFn = options.setTimeoutFn || setTimeout;
-    this.clearTimeoutFn = options.clearTimeoutFn || clearTimeout;
-    this.nowFn = options.nowFn || Date.now;
+    this.setTimeoutFn = options.setTimeoutFn || ((fn, ms) => setTimeout(fn, ms));
+    this.clearTimeoutFn = options.clearTimeoutFn || ((id) => clearTimeout(id));
+    this.nowFn = options.nowFn || (() => Date.now());
 
     if (options.onStateChange) {
       this.listeners.add(options.onStateChange);
