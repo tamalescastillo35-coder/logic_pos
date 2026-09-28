@@ -174,6 +174,27 @@ service cloud.firestore {
       );
     }
 
+    // A restock legitimately records the purchase cost and supplier next to the stock
+    // increase (the client writes costPrice + supplierId in the same update). Allow those two
+    // catalogue fields only when the write is a genuine restock of the actor's own branch:
+    // stock_restock capability, exactly that map key changed, and its value went up. Any other
+    // catalogue field, or a cost/supplier change without a stock increase, still needs
+    // products_edit. canUpdateStock() is still evaluated on top of this by the update rule.
+    function isRestockCatalogueUpdate(companyId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      let before = ('branchStocks' in existing()) ? existing().branchStocks : {};
+      let after = ('branchStocks' in incoming()) ? incoming().branchStocks : {};
+      return hasPermission(companyId, 'stock_restock')
+        && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks', 'costPrice', 'supplierId'])
+        && incoming().diff(existing()).affectedKeys().hasAny(['branchStocks'])
+        && after.diff(before).affectedKeys().hasOnly([branch])
+        && (branch in after) && after[branch] is number
+        && ((branch in before && before[branch] is number) ? after[branch] > before[branch] : after[branch] > 0)
+        && incoming().costPrice is number && incoming().costPrice >= 0
+        && incoming().supplierId is string;
+    }
+
     function canCreateProductStock(companyId) {
       let member = get(memberPath(companyId, request.auth.uid)).data;
       let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
@@ -646,6 +667,7 @@ service cloud.firestore {
             isOwner(companyId)
             || (
               (incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks'])
+                || isRestockCatalogueUpdate(companyId)
                 || hasPermission(companyId, 'products_edit'))
               && canUseBranch(companyId, assignedBranch(companyId))
               && (!incoming().diff(existing()).affectedKeys().hasAny(['stock', 'branchStocks']) || canUpdateStock(companyId))
