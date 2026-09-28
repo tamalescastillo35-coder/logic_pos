@@ -929,6 +929,12 @@ export default function App() {
 
   const activeCompanyRole = user && activeCompanyId ? (userCompanies[activeCompanyId]?.role || 'employee') : 'owner';
   const isOwner = isOwnerRole(activeCompanyRole);
+  // A persisted role outside the three supported ones (e.g. a legacy master_admin that has not
+  // been converted yet) gets no defaults, no branch lock and no permissions, which would leave
+  // an inert POS full of "no branch" errors. Block it explicitly instead — see the
+  // role-migration gate near the bottom of this component.
+  const roleNeedsMigration = !!(user && activeCompanyId)
+    && !(['owner', 'admin', 'employee'] as string[]).includes(activeCompanyRole);
   // Encargados (admin) manage a single sucursal, same as Cajeros (employee) — only
   // Owner can see/switch between every sucursal of the company. The Owner
   // still reassigns an Encargado's branch from Mi Empresa/Equipo (Member.assignedBranchId);
@@ -9761,6 +9767,30 @@ export default function App() {
         </div>
       )}
 
+      {/* Role-migration gate: the member's persisted role is not owner/admin/employee (e.g. a
+          legacy master_admin not yet converted). Nothing below would work for them, so say
+          exactly what has to happen instead of rendering an inert POS. Sits above the
+          branch-sync gate because that one would otherwise show a misleading branch message. */}
+      {user && !isAuthLoading && roleNeedsMigration && (
+        <div className="fixed inset-0 z-[55] bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-amber-900/40 border border-amber-700/30 flex items-center justify-center mb-5">
+            <AlertCircle className="w-8 h-8 text-amber-400" />
+          </div>
+          <h2 className="text-xl font-black text-slate-100 mb-2">Tu rol necesita actualizarse</h2>
+          <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
+            Tu cuenta tiene un rol que ya no existe en esta versión del sistema. Pide al Propietario que te asigne
+            el rol de Encargado o Cajero y una sucursal desde Mi Empresa / Equipo. En cuanto lo haga, el punto de venta
+            se habilitará automáticamente.
+          </p>
+          <button
+            onClick={() => signOut(auth)}
+            className="text-xs text-slate-500 hover:text-slate-300 underline cursor-pointer transition"
+          >
+            Cerrar sesión
+          </button>
+        </div>
+      )}
+
       {/* Branch-sync gate: blocks the POS for branch-locked employees/admins until their real
           assigned branch is confirmed from companies/{id}/members/{uid} — prevents a sale/
           stock/cash entry from ever being filed under a stale or placeholder branchId while
@@ -9772,9 +9802,17 @@ export default function App() {
               <div className="w-16 h-16 rounded-2xl bg-rose-900/40 border border-rose-700/30 flex items-center justify-center mb-5">
                 <AlertCircle className="w-8 h-8 text-rose-400" />
               </div>
-              <h2 className="text-xl font-black text-slate-100 mb-2">No pudimos confirmar tu sucursal</h2>
+              <h2 className="text-xl font-black text-slate-100 mb-2">
+                {currentUserMember && !assignedBranchId
+                  ? 'Tu cuenta no tiene sucursal asignada'
+                  : currentUserMember && branches.length > 0 && !assignedBranchExists
+                    ? 'Tu sucursal asignada ya no existe'
+                    : 'No pudimos confirmar tu sucursal'}
+              </h2>
               <p className="text-slate-400 text-sm max-w-xs leading-relaxed mb-6">
-                Revisa tu conexión a internet e intenta de nuevo. Si el problema sigue, avisa a tu encargado.
+                {currentUserMember && (!assignedBranchId || (branches.length > 0 && !assignedBranchExists))
+                  ? 'Pide al Propietario que te asigne una sucursal válida desde Mi Empresa / Equipo. En cuanto lo haga, el punto de venta se habilitará automáticamente.'
+                  : 'Revisa tu conexión a internet e intenta de nuevo. Si el problema sigue, avisa a tu encargado.'}
               </p>
               <button
                 onClick={() => { setBranchSyncTimedOut(false); setBranchSyncRetryTrigger(n => n + 1); }}
