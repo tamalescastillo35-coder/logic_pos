@@ -123,6 +123,11 @@ export class FirestoreConnectionController {
 
   public retry(): void {
     if (this.isDisposed) return;
+    // A manual retry (or a resume from background) must be able to recover from a false
+    // "offline" report — e.g. Network.getStatus() resolving late with a stale value, or a lost
+    // networkStatusChange event. The probe itself verifies connectivity, so clear the flag and
+    // let it run instead of waiting for a "connected: true" event that may never arrive.
+    this.isNetworkConnected = true;
     this.startProbe({ force: true });
   }
 
@@ -200,6 +205,7 @@ export class FirestoreConnectionController {
             err !== null &&
             ('code' in err &&
               (err.code === 'unavailable' ||
+                err.code === 'firestore/unavailable' ||
                 err.code === 'deadline-exceeded' ||
                 err.code === 'failed-precondition')));
 
