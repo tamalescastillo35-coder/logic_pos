@@ -79,7 +79,7 @@ import {
   safeLocalStorageSet,
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
-import { getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
+import { canRefundSalesRole, getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
 import { FirestoreConnectionController } from './lib/firestoreConnection';
 
 const isNativePlatform = Capacitor.isNativePlatform();
@@ -951,6 +951,8 @@ export default function App() {
   const canManageSuppliers = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'suppliers_restock');
   const canCloseCash = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'cash_close');
   const canApplyDiscount = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'apply_discount');
+  // Owner refunds in any branch; an Encargado (admin) only in its assigned branch.
+  const canRefundSales = canRefundSalesRole(activeCompanyRole);
   const canCreateCompany = !activeCompanyId
     ? Object.keys(userCompanies).length === 0 || Object.values(userCompanies).some((company: { role: CompanyRole }) => isOwnerRole(company.role))
     : isOwner;
@@ -5081,13 +5083,23 @@ export default function App() {
   // Refund Venta. Sale status, returned stock, customer credit and cash ledger are one
   // Firestore transaction, so a retry cannot duplicate a refund or leave partial state.
   const handleRefundSale = async (saleId: string) => {
+    if (!canRefundSales) {
+      alert('Solo el Propietario o el Encargado de la sucursal puede reembolsar ventas.');
+      return;
+    }
     if (!canViewSalesHistory) {
       alert('Tu cuenta no tiene permiso para consultar el historial de ventas.');
       return;
     }
-    if (!confirm('¿Está seguro de que desea REEMBOLSAR esta venta? Se restituirá el inventario.')) return;
     const sale = sales.find(s => s.id === saleId);
     if (!sale) return;
+    // An Encargado refunds only sales of its own branch (the rules enforce the same limit);
+    // the owner may refund in any branch.
+    if (!isOwner && sale.branchId !== operationalBranchId) {
+      alert('Solo puedes reembolsar ventas de tu sucursal asignada.');
+      return;
+    }
+    if (!confirm('¿Está seguro de que desea REEMBOLSAR esta venta? Se restituirá el inventario.')) return;
 
     try {
       await refundSaleAtomically(sale);
@@ -6028,7 +6040,7 @@ export default function App() {
                             {/* Options block for completed terminal sale */}
                             <div className="pt-2 border-t border-slate-100 flex justify-between items-center gap-2">
                               {sale.status === 'Completed' ? (
-                                (isOwner || activeCompanyRole === 'admin') ? (
+                                canRefundSales ? (
                                   <button
                                     type="button"
                                     onClick={() => handleRefundSale(sale.id)}
@@ -7189,7 +7201,7 @@ export default function App() {
                                 <p className="text-base font-black text-slate-800 mt-1">Total Generado: {formatMXN(sale.total)}</p>
                               </div>
 
-                              {sale.status === 'Completed' && (isOwner || activeCompanyRole === 'admin') && (
+                              {sale.status === 'Completed' && canRefundSales && (
                                 <button
                                   type="button"
                                   onClick={() => handleRefundSale(sale.id)}

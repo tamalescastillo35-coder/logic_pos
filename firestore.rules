@@ -195,6 +195,20 @@ service cloud.firestore {
         && incoming().supplierId is string;
     }
 
+    // Refunding a sale flips its status to Refunded. The owner may do that for any sale (and
+    // also runs global invoicing); an admin (Encargado) may refund a Completed sale that
+    // belongs to their own assigned branch, and nothing else about the sale. The stock, cash
+    // and customer-balance writes that accompany a refund already pass the branch-scoped rules
+    // for products, cash registers and customers, so they need no extra exception here.
+    function canAdminRefundSale(companyId) {
+      return getMemberData(companyId).role == 'admin'
+        && ('branchId' in existing())
+        && canUseBranch(companyId, existing().branchId)
+        && existing().status == 'Completed'
+        && incoming().status == 'Refunded'
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+    }
+
     function canCreateProductStock(companyId) {
       let member = get(memberPath(companyId, request.auth.uid)).data;
       let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
@@ -708,9 +722,12 @@ service cloud.firestore {
           canUseBranch(companyId, incoming().branchId) &&
           (!('discount' in incoming()) || incoming().discount == 0 || hasPermission(companyId, 'apply_discount'));
         allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(saleId);
-        // Refunds and global invoicing are owner operations.
+        // Owner: refunds anywhere and global invoicing. Admin: refunds of its own branch only.
         allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
-          && isOwner(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'invoiceStatus']);
+          && (
+            (isOwner(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'invoiceStatus']))
+            || canAdminRefundSale(companyId)
+          );
       }
 
       // Cash Registers subcollection inside Company

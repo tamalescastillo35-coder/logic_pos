@@ -49,6 +49,14 @@ export function isOwnerRole(role: CompanyRole): boolean {
   return role === 'owner';
 }
 
+// Refunding a sale is a role capability, not a grantable permission: the owner refunds in any
+// branch and an admin (Encargado) refunds in its assigned branch. Reversing a sale also puts
+// stock back, which only owners and admins may do, so it is deliberately not offered as an
+// extra grant to employees. Mirrors canAdminRefundSale() in firestore.rules.
+export function canRefundSalesRole(role: CompanyRole): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
 export function resolveAssignedBranchId(
   candidate: unknown,
   branches: readonly { id: string }[],
