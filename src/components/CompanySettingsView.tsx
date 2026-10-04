@@ -34,7 +34,7 @@ import {
 import { db, handleFirestoreError, OperationType, createCredentialUser } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, setDoc, deleteDoc, writeBatch, Timestamp } from 'firebase/firestore';
 import { createInvitationCode } from '../lib/ids';
-import { PERMISSION_OPTIONS, resolveAssignedBranchId, type CompanyRole } from '../lib/permissions';
+import { PERMISSION_OPTIONS, getDefaultPermissions, resolveAssignedBranchId, type CompanyRole } from '../lib/permissions';
 
 type NonOwnerCompanyRole = Exclude<CompanyRole, 'owner'>;
 
@@ -2131,12 +2131,16 @@ export default function CompanySettingsView({
 
               <div className="space-y-1.5">
                 {PERMISSION_OPTIONS.map(perm => {
-                  const isChecked = editedPermissions.includes(perm.id);
+                  // Permissions the role already carries cannot be toggled here: they are shown
+                  // as included so the owner sees what an Encargado or Cajero really has.
+                  const includedByRole = getDefaultPermissions(selectedRoleMember.role as CompanyRole).includes(perm.id);
+                  const isChecked = includedByRole || editedPermissions.includes(perm.id);
                   return (
-                    <label key={perm.id} className="flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-xl cursor-pointer hover:bg-indigo-50 hover:border-indigo-200 transition">
+                    <label key={perm.id} className={`flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-xl transition ${includedByRole ? 'opacity-70 cursor-default' : 'cursor-pointer hover:bg-indigo-50 hover:border-indigo-200'}`}>
                       <input
                         type="checkbox"
                         checked={isChecked}
+                        disabled={includedByRole}
                         onChange={() => {
                           if (isChecked) {
                             setEditedPermissions(editedPermissions.filter(p => p !== perm.id));
@@ -2147,7 +2151,10 @@ export default function CompanySettingsView({
                         className="mt-0.5 accent-indigo-600 cursor-pointer w-4 h-4 shrink-0"
                       />
                       <div>
-                        <p className="text-[12px] font-extrabold text-slate-800 leading-tight">{perm.label}</p>
+                        <p className="text-[12px] font-extrabold text-slate-800 leading-tight">
+                          {perm.label}
+                          {includedByRole && <span className="ml-1.5 text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-1 py-0.5 align-middle">Incluido en su rol</span>}
+                        </p>
                         <p className="text-[10px] text-slate-400 font-medium mt-0.5">{perm.desc}</p>
                       </div>
                     </label>

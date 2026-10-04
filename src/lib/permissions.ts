@@ -25,10 +25,16 @@ export const PERMISSION_OPTIONS: ReadonlyArray<{
   { id: 'apply_discount', label: 'Aplicar Descuentos', desc: 'Puede aplicar descuentos en ventas' },
 ];
 
+// An Encargado (admin) runs its own branch end to end: history, cash close, discounts, transfers
+// and restock. Catalogue and supplier administration (products_edit, suppliers_restock) stay
+// with the owner and are only reachable through an explicit stored grant. A cashier (employee)
+// sells and reads its own branch's history. Branch scoping is enforced separately
+// (operationalBranchId in the client, canUseBranch in firestore.rules); these defaults must
+// mirror hasPermission() in firestore.rules.
 export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<CompanyRole, readonly AppPermission[]>> = {
   owner: APP_PERMISSIONS,
-  admin: ['stock_transfer', 'stock_restock'],
-  employee: [],
+  admin: ['sales_history', 'stock_transfer', 'stock_restock', 'cash_close', 'apply_discount'],
+  employee: ['sales_history'],
 };
 
 export function getDefaultPermissions(role: CompanyRole): readonly AppPermission[] {
@@ -54,6 +60,48 @@ export function isOwnerRole(role: CompanyRole): boolean {
 // stock back, which only owners and admins may do, so it is deliberately not offered as an
 // extra grant to employees. Mirrors canAdminRefundSale() in firestore.rules.
 export function canRefundSalesRole(role: CompanyRole): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
+export interface HistoryAccess {
+  /** Reads the sales of its own branch. */
+  canViewHistory: boolean;
+  /** Cash panel, cash audit log and monthly cut. */
+  canViewCashAudit: boolean;
+  /** Inventory movements log (restocks and transfers). */
+  canViewInventoryLog: boolean;
+  /** Statistics tab (it includes the estimated profit). */
+  canViewAnalytics: boolean;
+  /** How far back the live sales stream reaches: today only for a plain cashier. */
+  salesWindow: 'today' | 'month';
+}
+
+// What the history screens offer. A plain cashier (employee) reads the sales of its own branch
+// for today only: no statistics (they show profit), no cash audit, no inventory log and no older
+// periods, which also keeps its Firestore reads small (the heaviest streams stay closed). A
+// cashier explicitly granted cash_close or a stock permission gets the matching view back.
+// Everyone else (owner, Encargado) keeps the full month-long views.
+export function getHistoryAccess(
+  role: CompanyRole,
+  permissions: readonly string[] | undefined,
+): HistoryAccess {
+  const has = (permission: AppPermission) => hasAppPermission(role, permissions, permission);
+  const canViewHistory = has('sales_history');
+  const cashier = role === 'employee';
+  const canViewCashAudit = canViewHistory && (!cashier || has('cash_close'));
+  return {
+    canViewHistory,
+    canViewCashAudit,
+    canViewInventoryLog: canViewHistory
+      && (!cashier || has('stock_restock') || has('stock_transfer') || has('products_edit')),
+    canViewAnalytics: canViewHistory && !cashier,
+    salesWindow: cashier && !canViewCashAudit ? 'today' : 'month',
+  };
+}
+
+// Invoicing (Facturación): the owner manages every branch, an Encargado only the sales of its
+// own assigned branch. Mirrors canAdminInvoiceSale() in firestore.rules.
+export function canManageInvoicingRole(role: CompanyRole): boolean {
   return role === 'owner' || role === 'admin';
 }
 
