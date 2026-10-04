@@ -6,7 +6,7 @@ service cloud.firestore {
     // Affected data model (checkout/cash repair)
     // ===============================================================
     // sales/{saleId}: immutable completed sale; numeric createdAt + branchId are required for
-    // new cashier writes. Legacy owner/admin restores remain readable/updateable.
+    // new cashier writes. Legacy owner restores remain readable/updateable.
     // cashRegisters/{branchId}: bounded current-shift state only. A legacy transactions list
     // may remain, but every update must leave it untouched.
     // cashRegisters/{branchId}/transactions/{transactionId}: append-only, creator-bound ledger.
@@ -38,21 +38,43 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
+    // Path helper functions
+    function companyPath(companyId) {
+      return /databases/$(database)/documents/companies/$(companyId);
+    }
+
+    function memberPath(companyId, memberId) {
+      return /databases/$(database)/documents/companies/$(companyId)/members/$(memberId);
+    }
+
+    function branchPath(companyId, branchId) {
+      return /databases/$(database)/documents/companies/$(companyId)/branches/$(branchId);
+    }
+
+    function invitationPath(code) {
+      return /databases/$(database)/documents/invitationCodes/$(code);
+    }
+
     // Membership verification helper functions
-    function isMemberOfCompany(companyId) {
-      return exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid));
+    function getMemberData(companyId) {
+      return get(memberPath(companyId, request.auth.uid)).data;
     }
     
     function getMemberRole(companyId) {
-      return get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.role;
-    }
-    
-    function isOwnerOrAdmin(companyId) {
-      return isMemberOfCompany(companyId) && (getMemberRole(companyId) == 'owner' || getMemberRole(companyId) == 'master_admin' || getMemberRole(companyId) == 'admin');
+      return getMemberData(companyId).role;
     }
 
+    function isMemberOfCompany(companyId) {
+      return isSignedIn()
+        && exists(memberPath(companyId, request.auth.uid))
+        && getMemberData(companyId).role in ['owner', 'admin', 'employee'];
+    }
+    
     function isOwner(companyId) {
-      return isMemberOfCompany(companyId) && getMemberRole(companyId) == 'owner';
+      return isSignedIn()
+        && exists(memberPath(companyId, request.auth.uid))
+        && getMemberData(companyId).role == 'owner'
+        && get(companyPath(companyId)).data.ownerId == request.auth.uid;
     }
 
     // Credential employees use managed @logicpos.com identities that cannot verify an inbox.
@@ -65,22 +87,163 @@ service cloud.firestore {
       );
     }
 
-    // A member's permissions array, used for fine-grained (non-admin) write access
+    function allowedPermissions() {
+      return ['sales_history', 'products_edit', 'stock_transfer', 'stock_restock',
+        'suppliers_restock', 'cash_close', 'apply_discount'];
+    }
+
+    // Stored permissions add to the role defaults, which mirror DEFAULT_ROLE_PERMISSIONS in
+    // src/lib/permissions.ts. An Encargado (admin) runs its branch (history, transfers, restock,
+    // cash close, discounts) but never the catalogue or suppliers; a cashier (employee) reads its
+    // own branch history. Branch scope is enforced separately by canUseBranch(), and admin is
+    // never a blanket permission bypass.
     function hasPermission(companyId, perm) {
-      return isOwnerOrAdmin(companyId) ||
-        (isMemberOfCompany(companyId) &&
-         'permissions' in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data &&
-         perm in get(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)).data.permissions);
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      return perm in allowedPermissions() && (
+        (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
+        || (member.role == 'admin' && perm in ['sales_history', 'stock_transfer', 'stock_restock', 'cash_close', 'apply_discount'])
+        || (member.role == 'employee' && perm == 'sales_history')
+        || ('permissions' in member && member.permissions is list && perm in member.permissions)
+      );
+    }
+
+    function validBranch(companyId, branchId) {
+      return isValidId(branchId) && exists(branchPath(companyId, branchId));
+    }
+
+    function assignedBranch(companyId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      return 'assignedBranchId' in member ? member.assignedBranchId : '';
     }
 
     function canUseBranch(companyId, branchId) {
-      return isMemberOfCompany(companyId) && (
-        getMemberRole(companyId) == 'owner'
-        || getMemberRole(companyId) == 'master_admin'
-        || (
-          'assignedBranchId' in get(memberPath(companyId, request.auth.uid)).data
-          && get(memberPath(companyId, request.auth.uid)).data.assignedBranchId == branchId
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      return (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid) || (
+        member.role in ['admin', 'employee']
+        && ('assignedBranchId' in member && member.assignedBranchId == branchId)
+        && validBranch(companyId, branchId)
+      );
+    }
+
+    // A transfer pairs two existing, distinct branches. The owner may pair any two; any other
+    // member only a pair that includes its own assigned branch (the other end may be any branch,
+    // Matriz included). Used to read transfer records from either end.
+    function canTransferBetween(companyId, branchId, counterpartId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let userBranch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      return branchId != counterpartId && validBranch(companyId, branchId)
+        && validBranch(companyId, counterpartId) && (
+          (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
+          || (member.role in ['admin', 'employee'] && (userBranch == branchId || userBranch == counterpartId))
+        );
+    }
+
+    // Recording a transfer: stock may only be sent OUT of the user's own branch. transfer_out is
+    // written on the origin branch and transfer_in on the destination with the origin as
+    // counterpart, so the origin of either record must be the user's own branch (owner: any).
+    function canRecordTransfer(companyId, data) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let userBranch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      let origin = data.type == 'transfer_out' ? data.branchId : data.counterpartBranchId;
+      return canTransferBetween(companyId, data.branchId, data.counterpartBranchId) && (
+        (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
+        || userBranch == origin
+      );
+    }
+
+    function canReadMovement(companyId, data) {
+      return canUseBranch(companyId, data.branchId)
+        || (data.type in ['transfer_in', 'transfer_out']
+          && canTransferBetween(companyId, data.branchId, data.counterpartBranchId));
+    }
+
+    // Map diff restricts ordinary checkout/restock writes to the assigned key.
+    // Product documents have no movement/sale ID: getAfter cannot discover the randomly
+    // named audit writes. The two-key transfer exception therefore remains uncorrelated: it
+    // cannot prove which branch the second key belongs to (the stockMovements rules do bind the
+    // origin of the recorded transfer to the sender's own branch via canRecordTransfer). It does
+    // pin the direction: for a non-owner the own branch must go down and no branch key may be
+    // removed, so stock can only be sent out, never pulled in. See FIRESTORE_RULES_AUDIT.json.
+    function canUpdateStock(companyId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      let before = ('branchStocks' in existing()) ? existing().branchStocks : {};
+      let after = ('branchStocks' in incoming()) ? incoming().branchStocks : {};
+      let changed = after.diff(before).affectedKeys();
+      let perms = ('permissions' in member && member.permissions is list) ? member.permissions : [];
+      let canRestock = member.role == 'owner' || (member.role == 'admin') || ('stock_restock' in perms) || ('products_edit' in perms);
+      let canTransfer = member.role == 'owner' || (member.role == 'admin') || ('stock_transfer' in perms);
+      return (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid) || (
+        member.role in ['admin', 'employee']
+        && validBranch(companyId, branch)
+        && (branch in after) && after[branch] is number && after[branch] >= 0
+        && after[branch] <= 1000000
+        && (
+          (changed.hasOnly([branch])
+            && ((branch in before && after[branch] <= before[branch]) || canRestock))
+          || (canTransfer
+            && changed.size() == 2 && changed.hasAny([branch])
+            && (branch in before) && after[branch] < before[branch]
+            && after.diff(before).removedKeys().size() == 0
+            && incoming().stock == existing().stock)
         )
+      );
+    }
+
+    // A restock legitimately records the purchase cost and supplier next to the stock
+    // increase (the client writes costPrice + supplierId in the same update). Allow those two
+    // catalogue fields only when the write is a genuine restock of the actor's own branch:
+    // stock_restock capability, exactly that map key changed, and its value went up. Any other
+    // catalogue field, or a cost/supplier change without a stock increase, still needs
+    // products_edit. canUpdateStock() is still evaluated on top of this by the update rule.
+    function isRestockCatalogueUpdate(companyId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      let before = ('branchStocks' in existing()) ? existing().branchStocks : {};
+      let after = ('branchStocks' in incoming()) ? incoming().branchStocks : {};
+      return hasPermission(companyId, 'stock_restock')
+        && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks', 'costPrice', 'supplierId'])
+        && incoming().diff(existing()).affectedKeys().hasAny(['branchStocks'])
+        && after.diff(before).affectedKeys().hasOnly([branch])
+        && (branch in after) && after[branch] is number
+        && ((branch in before && before[branch] is number) ? after[branch] > before[branch] : after[branch] > 0)
+        && incoming().costPrice is number && incoming().costPrice >= 0
+        && incoming().supplierId is string;
+    }
+
+    // Refunding a sale flips its status to Refunded. The owner may do that for any sale (and
+    // also runs global invoicing); an admin (Encargado) may refund a Completed sale that
+    // belongs to their own assigned branch, and nothing else about the sale. The stock, cash
+    // and customer-balance writes that accompany a refund already pass the branch-scoped rules
+    // for products, cash registers and customers, so they need no extra exception here.
+    function canAdminRefundSale(companyId) {
+      return getMemberData(companyId).role == 'admin'
+        && ('branchId' in existing())
+        && canUseBranch(companyId, existing().branchId)
+        && existing().status == 'Completed'
+        && incoming().status == 'Refunded'
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+    }
+
+    // Invoicing (Facturación): an Encargado (admin) may flip invoiceStatus on a sale of its own
+    // assigned branch that was flagged to be invoiced, and change nothing else about the sale.
+    // The owner keeps company-wide invoicing through the owner clause of the update rule.
+    function canAdminInvoiceSale(companyId) {
+      return getMemberData(companyId).role == 'admin'
+        && ('branchId' in existing())
+        && canUseBranch(companyId, existing().branchId)
+        && ('requiresInvoice' in existing()) && existing().requiresInvoice == true
+        && incoming().invoiceStatus in ['pending', 'completed']
+        && incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus']);
+    }
+
+    function canCreateProductStock(companyId) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      return (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid) || (
+        member.role in ['admin', 'employee']
+        && validBranch(companyId, branch)
+        && (!('branchStocks' in incoming()) || incoming().branchStocks.keys().hasOnly([branch]))
       );
     }
 
@@ -102,34 +265,33 @@ service cloud.firestore {
           && (!('createdAt' in data) || (data.createdAt is string || data.createdAt is timestamp));
     }
 
-    function isValidCompanyMember(data) {
+    function isValidCompanyMember(companyId, data) {
       return data.userId is string && data.userId.size() <= 128
           && data.name is string && data.name.size() <= 200
           && data.email is string && data.email.size() <= 200
-          && data.role is string && (data.role == 'owner' || data.role == 'master_admin' || data.role == 'admin' || data.role == 'employee')
+          && data.role in ['owner', 'admin', 'employee']
           && (!('joinedAt' in data) || (data.joinedAt is string || data.joinedAt is timestamp))
           && (!('assignedBranchId' in data) || (data.assignedBranchId is string && data.assignedBranchId.size() <= 128))
+          && (data.role == 'owner' || ('assignedBranchId' in data && validBranch(companyId, data.assignedBranchId)))
           && (!('customRoleName' in data) || (data.customRoleName is string && data.customRoleName.size() <= 100))
           && (!('inviteCode' in data) || (data.inviteCode is string && data.inviteCode.size() <= 100))
           && (!('isCredentialAccount' in data) || data.isCredentialAccount is bool)
           && (!('permissions' in data) || (
-            data.permissions is list && data.permissions.size() <= 6
-            && data.permissions.hasOnly([
-              'sales_history', 'products_edit', 'stock_transfer',
-              'suppliers_restock', 'cash_close', 'apply_discount'
-            ])
+            data.permissions is list && data.permissions.size() <= 7
+            && data.permissions.hasOnly(allowedPermissions())
           ));
     }
 
     function isValidInvitationCode(data) {
       return data.keys().hasOnly([
             'code', 'companyId', 'companyName', 'role', 'usageType',
-            'createdAt', 'expiresAt', 'createdBy'
+            'createdAt', 'expiresAt', 'createdBy', 'assignedBranchId'
           ])
           && data.code is string && data.code.size() <= 100
           && data.companyId is string && data.companyId.size() <= 128
           && data.companyName is string && data.companyName.size() <= 200
-          && data.role is string && (data.role == 'employee' || data.role == 'admin' || data.role == 'master_admin')
+          && data.role in ['employee', 'admin']
+          && validBranch(data.companyId, data.assignedBranchId)
           && data.usageType is string && (data.usageType == 'single' || data.usageType == 'multiple')
           && data.createdAt is timestamp
           && data.expiresAt is timestamp && data.expiresAt > request.time
@@ -137,24 +299,15 @@ service cloud.firestore {
           && data.createdBy is string && data.createdBy == request.auth.uid;
     }
 
-    function invitationPath(code) {
-      return /databases/$(database)/documents/invitationCodes/$(code);
-    }
-
-    function companyPath(companyId) {
-      return /databases/$(database)/documents/companies/$(companyId);
-    }
-
-    function memberPath(companyId, memberId) {
-      return /databases/$(database)/documents/companies/$(companyId)/members/$(memberId);
-    }
-
     function isUsableInvitation(companyId, role, code) {
-      return code is string
+      return role in ['admin', 'employee'] && code is string
           && exists(invitationPath(code))
           && get(invitationPath(code)).data.code == code
           && get(invitationPath(code)).data.companyId == companyId
           && get(invitationPath(code)).data.role == role
+          && incoming().assignedBranchId == get(invitationPath(code)).data.assignedBranchId
+          && (!('permissions' in incoming()) || incoming().permissions.size() == 0)
+          && (!('isCredentialAccount' in incoming()) || incoming().isCredentialAccount == false)
           && get(invitationPath(code)).data.expiresAt is timestamp
           && get(invitationPath(code)).data.expiresAt > request.time
           && get(companyPath(companyId)).data.invitationCode == code
@@ -193,7 +346,9 @@ service cloud.firestore {
           && getAfter(memberPath(companyId, incoming().ownerId)).data.userId == incoming().ownerId
           && getAfter(memberPath(companyId, incoming().ownerId)).data.role == 'owner'
           && getAfter(memberPath(companyId, existing().ownerId)).data.userId == existing().ownerId
-          && getAfter(memberPath(companyId, existing().ownerId)).data.role == 'master_admin';
+          && get(memberPath(companyId, incoming().ownerId)).data.role in ['admin', 'employee']
+          && getAfter(memberPath(companyId, existing().ownerId)).data.role == 'admin'
+          && validBranch(companyId, getAfter(memberPath(companyId, existing().ownerId)).data.assignedBranchId);
     }
 
     function isValidProduct(data) {
@@ -369,7 +524,7 @@ service cloud.firestore {
               && incoming().currentCash == existing().currentCash + getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.cashDelta
               && (
                 incoming().initialCash == existing().initialCash
-                || isOwnerOrAdmin(companyId)
+                || isOwner(companyId)
               )
             )
           );
@@ -419,11 +574,34 @@ service cloud.firestore {
     }
 
     // User Profile Document Access Rules
+    // Credential (employee-number) accounts sign in with an unverifiable @logicpos.com identity,
+    // so isVerifiedUser() alone locked them out of their own profile: a new account could never
+    // create users/{uid} (the client then retried forever) and the role sync after a role change
+    // never landed. They may write their own profile only as the client bootstraps it: exactly
+    // one company, where the Owner already provisioned them, with the role that member doc holds.
+    // The profile grants nothing by itself; every company rule still reads the member doc.
+    function isCredentialSelfProfile(userId, data) {
+      return isSignedIn() && request.auth.uid == userId
+        && request.auth.token.email is string
+        && request.auth.token.email.matches('.*@logicpos\\.com')
+        && data.uid == userId
+        && 'activeCompanyId' in data && isValidId(data.activeCompanyId)
+        && 'companies' in data && data.companies is map
+        && data.companies.keys().hasOnly([data.activeCompanyId])
+        && data.activeCompanyId in data.companies
+        && data.companies[data.activeCompanyId] is map
+        && isMemberOfCompany(data.activeCompanyId)
+        && data.companies[data.activeCompanyId].role == getMemberRole(data.activeCompanyId);
+    }
+
     match /users/{userId} {
       allow read: if isSignedIn() && request.auth.uid == userId;
-      allow create: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
-      allow update: if isVerifiedUser() && isValidUser(incoming()) && (
-        request.auth.uid == userId
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(incoming())
+        && (isVerifiedUser() || isCredentialSelfProfile(userId, incoming()));
+      allow update: if isValidUser(incoming()) && (
+        (isVerifiedUser() && request.auth.uid == userId)
+        ||
+        isCredentialSelfProfile(userId, incoming())
         ||
         // An Owner cleaning up a departing member's cross-reference right after deleting
         // companies/{companyId}/members/{userId}: that member doc is the source of truth for
@@ -434,6 +612,7 @@ service cloud.firestore {
         // in multiple companies needs the extra ones cleared by hand), the actor genuinely
         // owns that company, and the write only touches companies/activeCompanyId.
         (
+          isVerifiedUser() &&
           'companies' in existing() && existing().companies.keys().size() == 1 &&
           isOwner(existing().companies.keys()[0]) &&
           incoming().companies.size() == 0 &&
@@ -494,7 +673,7 @@ service cloud.firestore {
       allow create: if isVerifiedUser() && isValidCompany(incoming()) && incoming().id == companyId && incoming().ownerId == request.auth.uid;
       allow update: if isValidCompany(incoming()) && incoming().id == companyId && (
         (incoming().ownerId == existing().ownerId && (
-          (isVerifiedUser() && isOwnerOrAdmin(companyId))
+          (isVerifiedUser() && isOwner(companyId))
           || (isVerifiedUser() && isConsumingSingleUseInvitation(companyId))
         ))
         || isTransferringOwnership(companyId)
@@ -503,15 +682,17 @@ service cloud.firestore {
 
       // Members Subcollection inside Company
       match /members/{memberId} {
-        allow get, list: if isSignedIn() && isMemberOfCompany(companyId);
+        allow get: if isSignedIn() && isMemberOfCompany(companyId)
+          && (request.auth.uid == memberId || isOwner(companyId));
+        allow list: if isSignedIn() && isOwner(companyId);
 
         // A member document may only be created through one of three legitimate paths:
         //   A) Founder self-claiming 'owner' right after creating their own company doc
         //   B) Self-join backed by a real invitation code matching this company + role
         //   C) The owner directly provisioning a new member (e.g. credential employees) —
-        //      Encargado/Master Admin cannot provision anyone; only the real Owner manages
+        //      Only the real Owner manages
         //      the team roster (branch reassignment, role grants, new accounts, removal).
-        allow create: if isVerifiedUser() && isValidCompanyMember(incoming()) && incoming().userId == memberId && (
+        allow create: if isVerifiedUser() && isValidCompanyMember(companyId, incoming()) && incoming().userId == memberId && (
           (request.auth.uid == memberId && incoming().role == 'owner' &&
             exists(/databases/$(database)/documents/companies/$(companyId)) &&
             get(/databases/$(database)/documents/companies/$(companyId)).data.ownerId == request.auth.uid)
@@ -519,38 +700,44 @@ service cloud.firestore {
           (request.auth.uid == memberId && 'inviteCode' in incoming()
             && isUsableInvitation(companyId, incoming().role, incoming().inviteCode))
           ||
-          (request.auth.uid != memberId && isOwner(companyId))
+          (request.auth.uid != memberId && isOwner(companyId) && incoming().role in ['admin', 'employee'])
         );
 
         // Updating a member (branch reassignment, role change, permissions) — owner-only.
-        allow update: if isVerifiedUser() && isValidCompanyMember(incoming()) &&
+        allow update: if isVerifiedUser() && isValidCompanyMember(companyId, incoming()) &&
           incoming().userId == memberId && existing().userId == memberId && isOwner(companyId)
           && get(companyPath(companyId)).data.ownerId == request.auth.uid && (
             (existing().role != 'owner' && incoming().role != 'owner')
             || (existing().role == 'owner' && incoming().role == 'owner')
             || (existing().role != 'owner' && incoming().role == 'owner'
               && getAfter(companyPath(companyId)).data.ownerId == memberId)
-            || (existing().role == 'owner' && incoming().role == 'master_admin'
+            || (existing().role == 'owner' && incoming().role == 'admin'
               && memberId == request.auth.uid
               && getAfter(companyPath(companyId)).data.ownerId != memberId)
           );
 
         // Deleting/removing a member — owner-only.
-        allow delete: if isVerifiedUser() && isOwner(companyId);
+        allow delete: if isVerifiedUser() && isOwner(companyId) && existing().role != 'owner';
       }
 
       // Products subcollection inside Company
       match /products/{productId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, delete: if canWriteCompany(companyId) && hasPermission(companyId, 'products_edit') && isValidId(productId) &&
-          (request.method == 'delete' || (isValidProduct(incoming()) && incoming().id == productId));
+        allow create, delete: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && hasPermission(companyId, 'products_edit') && isValidId(productId) &&
+          (request.method == 'delete' || (isValidProduct(incoming()) && incoming().id == productId && canCreateProductStock(companyId)));
         // Selling/transferring only ever touches stock/branchStocks — that's a basic right
         // of any cashier ringing up a sale. Changing any other field (price, cost, name,
         // sku, supplier...) is a catalogue edit and needs an explicit permission.
-        allow update: if canWriteCompany(companyId) && isValidId(productId) &&
+        allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(productId) &&
           isValidProduct(incoming()) && incoming().id == productId && (
-            (isMemberOfCompany(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks']))
-            || hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'stock_transfer') || hasPermission(companyId, 'suppliers_restock')
+            isOwner(companyId)
+            || (
+              (incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'branchStocks'])
+                || isRestockCatalogueUpdate(companyId)
+                || hasPermission(companyId, 'products_edit'))
+              && canUseBranch(companyId, assignedBranch(companyId))
+              && (!incoming().diff(existing()).affectedKeys().hasAny(['stock', 'branchStocks']) || canUpdateStock(companyId))
+            )
           );
       }
 
@@ -564,7 +751,7 @@ service cloud.firestore {
       // Branches subcollection inside Company
       match /branches/{branchId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, update: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(branchId)
+        allow create, update: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(branchId)
           && isValidBranch(incoming()) && incoming().id == branchId;
         allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(branchId);
       }
@@ -572,46 +759,55 @@ service cloud.firestore {
       // Suppliers subcollection inside Company
       match /suppliers/{supplierId} {
         allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow create, update, delete: if canWriteCompany(companyId) && hasPermission(companyId, 'suppliers_restock') && isValidId(supplierId) &&
+        allow create, update, delete: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && hasPermission(companyId, 'suppliers_restock') && isValidId(supplierId) &&
           (request.method == 'delete' || (isValidSupplier(incoming()) && incoming().id == supplierId));
       }
 
       // Sales subcollection inside Company
       match /sales/{saleId} {
-        allow get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
-        // Any member can ring up a new sale; only owner/admin can void a completed sale record
+        // The checkout transaction reads the id of the sale it is about to create (replay
+        // detection). A document that does not exist yet has no branchId to check, so for a
+        // missing document any member with a valid assigned branch may look; an existing sale is
+        // readable only within its own branch.
+        allow get: if isSignedIn() && (
+          resource == null
+            ? canUseBranch(companyId, assignedBranch(companyId))
+            : canUseBranch(companyId, existing().branchId)
+        );
+        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history') && canUseBranch(companyId, existing().branchId);
+        // Any assigned member can ring up a new sale; owner can restore/void records.
         allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) &&
           isValidSale(incoming()) && incoming().id == saleId &&
-          (isValidNewSale(incoming()) || isOwnerOrAdmin(companyId)) &&
+          (isValidNewSale(incoming()) || isOwner(companyId)) &&
           canUseBranch(companyId, incoming().branchId) &&
           (!('discount' in incoming()) || incoming().discount == 0 || hasPermission(companyId, 'apply_discount'));
-        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(saleId);
-        // Status changes (refunds) require owner/admin approval; marking an invoice as
-        // billed/pending is a routine bookkeeping action any member may perform
+        allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(saleId);
+        // Owner: refunds anywhere and company-wide invoicing. Admin (Encargado): refunds and
+        // invoicing of its own branch only.
         allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
           && (
-            (isOwnerOrAdmin(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
-            || (isOwnerOrAdmin(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus']))
+            (isOwner(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'invoiceStatus']))
+            || canAdminRefundSale(companyId)
+            || canAdminInvoiceSale(companyId)
           );
       }
 
       // Cash Registers subcollection inside Company
       match /cashRegisters/{registerId} {
-        allow list, get: if isSignedIn() && isMemberOfCompany(companyId);
+        allow list, get: if isSignedIn() && canUseBranch(companyId, registerId);
         allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(registerId)
           && canUseBranch(companyId, registerId) && isValidCashRegisterCreate(companyId, registerId);
         allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(registerId)
           && canUseBranch(companyId, registerId) && isValidCashRegisterUpdate(companyId, registerId)
           && (getAfter(cashLedgerPath(companyId, registerId, incoming().lastTransactionId)).data.type != 'Cierre'
               || hasPermission(companyId, 'cash_close'));
-        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId) && isValidId(registerId);
+        allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(registerId);
 
         // Append-only ledger. A sale entry must be committed with the matching sale document;
         // manual/open/close entries remain branch- and creator-scoped and are immutable.
         match /transactions/{transactionId} {
-          allow get: if isSignedIn() && isMemberOfCompany(companyId);
-          allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
+          allow get: if isSignedIn() && canUseBranch(companyId, registerId);
+          allow list: if isSignedIn() && hasPermission(companyId, 'sales_history') && canUseBranch(companyId, registerId);
           allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId)
             && canUseBranch(companyId, registerId) && isValidId(registerId) && isValidId(transactionId)
             && isValidCashTransaction(incoming(), registerId, transactionId)
@@ -634,35 +830,29 @@ service cloud.firestore {
 
       // Settings subcollection (branding, config, etc.)
       match /settings/{settingId} {
+        // Shared branding/config is needed by POS; only the owner may change it.
         allow read: if isSignedIn() && isMemberOfCompany(companyId);
-        allow write: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId);
+        allow write: if canWriteCompany(companyId) && isOwner(companyId);
       }
 
       // Stock movements — append-only audit log of restocks ("surtido") and inter-branch
-      // transfers. Any member can record a movement (it accompanies a stock change they're
-      // already allowed to make); nobody may edit/delete entries except owner/admin, so the
-      // history can't be quietly rewritten.
+      // transfers. Creation requires the matching permission and branch pair. Only owner
+      // may delete history; updates are denied to everyone.
       match /stockMovements/{movementId} {
-        allow get: if isSignedIn() && isMemberOfCompany(companyId);
-        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history');
+        allow get: if isSignedIn() && isMemberOfCompany(companyId) && canReadMovement(companyId, existing());
+        allow list: if isSignedIn() && hasPermission(companyId, 'sales_history') && canReadMovement(companyId, existing());
         allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(movementId)
-          && (
-            canUseBranch(companyId, incoming().branchId)
-            || (
-              (incoming().type == 'transfer_in' || incoming().type == 'transfer_out')
-              && 'counterpartBranchId' in incoming()
-              && canUseBranch(companyId, incoming().counterpartBranchId)
-            )
-          )
           && isValidStockMovement(incoming()) && incoming().id == movementId
           && (
             ((incoming().type == 'surtido' || incoming().type == 'merma')
-              && (hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'suppliers_restock')))
+              && canUseBranch(companyId, incoming().branchId)
+              && (hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'stock_restock')))
             || ((incoming().type == 'transfer_in' || incoming().type == 'transfer_out')
+              && canRecordTransfer(companyId, incoming())
               && hasPermission(companyId, 'stock_transfer'))
           );
         allow update: if false;
-        allow delete: if canWriteCompany(companyId) && isOwnerOrAdmin(companyId);
+        allow delete: if canWriteCompany(companyId) && isOwner(companyId);
       }
 
       // Checkout funnel audit log — best-effort, invisible record of every sale SAVE ATTEMPT
@@ -673,9 +863,10 @@ service cloud.firestore {
       // owner/admin — its only value is being a record that can't be quietly edited or
       // removed by exactly the people whose accountability it might be used to check.
       match /checkoutEvents/{eventId} {
-        allow list, get: if isSignedIn() && hasPermission(companyId, 'sales_history');
+        allow list, get: if isSignedIn() && hasPermission(companyId, 'sales_history') && canUseBranch(companyId, existing().branchId);
         allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(eventId)
           && isValidCheckoutEvent(incoming()) && incoming().id == eventId
+          && canUseBranch(companyId, incoming().branchId)
           && (
             incoming().status != 'success'
             || (
@@ -697,7 +888,7 @@ service cloud.firestore {
         && get(companyPath(resource.data.companyId)).data.invitationCode == code;
       allow list: if false; // Deny standard listing for security
       // Only the Owner of the target company may mint or modify an invite for it — an
-      // Encargado/Master Admin minting one would bypass the members-collection role-grant
+      // Non-owner minting one would bypass the members-collection role-grant
       // restriction above (the invite's stored role is trusted as-is on self-join).
       allow create: if isVerifiedUser() && isValidInvitationCode(incoming()) && incoming().code == code
         && isOwner(incoming().companyId);

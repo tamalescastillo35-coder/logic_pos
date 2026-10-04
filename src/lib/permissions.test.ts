@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { hasAppPermission } from './permissions.ts';
+import { getDefaultPermissions, hasAppPermission } from './permissions.ts';
 
-test('owners and administrators inherit every operational permission', () => {
+test('owners inherit every operational permission and administrators their role defaults', () => {
   assert.equal(hasAppPermission('owner', [], 'products_edit'), true);
-  assert.equal(hasAppPermission('master_admin', [], 'stock_transfer'), true);
-  assert.equal(hasAppPermission('admin', [], 'cash_close'), true);
+  for (const permission of getDefaultPermissions('admin')) {
+    assert.equal(hasAppPermission('admin', [], permission), true, permission);
+  }
+  assert.equal(hasAppPermission('admin', [], 'products_edit'), false);
 });
 
 test('employees receive only explicitly assigned permissions', () => {

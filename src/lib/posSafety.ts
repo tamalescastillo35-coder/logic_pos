@@ -163,6 +163,29 @@ export const getDayRange = (dayKey: string): { start: number; end: number } | nu
   return { start: startDate.getTime(), end: new Date(year, monthIndex, day + 1).getTime() };
 };
 
+/**
+ * Milliseconds from `now` until just after the next local midnight, when the calendar day
+ * changes. A one-second margin keeps a timer from firing a hair early and recomputing the day
+ * that is ending; the minimum keeps a bad clock from producing a busy loop.
+ */
+export const msUntilNextLocalDay = (now: Date): number => {
+  const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+  return Math.max(nextDay - now.getTime() + 1000, 1000);
+};
+
+/**
+ * True when the per-branch stock deltas applied to ONE product cancel out (a transfer between
+ * branches: units leave one branch and arrive in another). Such an operation does not change
+ * the product's consolidated total, so the total must not be rewritten: recomputing it from the
+ * branch map would also "correct" a legacy total that disagrees with the branches, and the rules
+ * reject a transfer whose total changes. Compared at the 3-decimal resolution stock uses.
+ */
+export const isNetZeroStockChange = (deltasByBranch: ReadonlyMap<string, number>): boolean => {
+  let net = 0;
+  deltasByBranch.forEach(delta => { net += delta; });
+  return Math.round(net * 1000) === 0;
+};
+
 const normalizeFirebaseCode = (error: unknown): string => {
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === 'string' ? code.replace(/^firestore\//, '') : '';
@@ -224,6 +247,78 @@ export const describeCheckoutError = (error: unknown): CheckoutErrorDescription 
   return {
     kind: 'unknown',
     message: 'Ocurrió un error interno no identificado. La venta NO se registró y el carrito permanece intacto.',
+    retryable: true,
+  };
+};
+
+export class MatrixConfigurationError extends Error {
+  constructor(message: string = 'Configuración de Matriz inválida') {
+    super(message);
+    this.name = 'MatrixConfigurationError';
+  }
+}
+
+export interface StockOperationErrorDescription {
+  kind: 'permission' | 'offline' | 'contention' | 'stock' | 'invalid-data' | 'session' | 'matrix-config' | 'unknown';
+  message: string;
+  retryable: boolean;
+}
+
+export const describeStockOperationError = (error: unknown): StockOperationErrorDescription => {
+  if (error instanceof MatrixConfigurationError) {
+    return {
+      kind: 'matrix-config',
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (error instanceof StockUnavailableError) {
+    return {
+      kind: 'stock',
+      message: error.message,
+      retryable: true,
+    };
+  }
+
+  const code = normalizeFirebaseCode(error);
+  if (code === 'permission-denied') {
+    return {
+      kind: 'permission',
+      message: 'No tienes permisos suficientes o la transferencia viola las reglas de sucursal. Solicita autorización al Propietario.',
+      retryable: false,
+    };
+  }
+  if (code === 'unauthenticated') {
+    return {
+      kind: 'session',
+      message: 'La sesión ya no es válida. La operación NO se aplicó; vuelve a iniciar sesión.',
+      retryable: false,
+    };
+  }
+  if (code === 'unavailable' || code === 'deadline-exceeded' || code === 'cancelled') {
+    return {
+      kind: 'offline',
+      message: 'No fue posible confirmar la operación con Firestore. Los datos se conservaron; reintenta cuando la conexión se estabilice.',
+      retryable: true,
+    };
+  }
+  if (code === 'aborted' || code === 'failed-precondition') {
+    return {
+      kind: 'contention',
+      message: 'Otra terminal modificó el inventario al mismo tiempo. La operación NO se aplicó; revisa las existencias e intenta de nuevo.',
+      retryable: true,
+    };
+  }
+  if (code === 'invalid-argument' || code === 'out-of-range' || code === 'data-loss') {
+    return {
+      kind: 'invalid-data',
+      message: 'Datos de la operación inválidos. Revisa las cantidades y sucursales seleccionadas.',
+      retryable: false,
+    };
+  }
+  return {
+    kind: 'unknown',
+    message: 'Ocurrió un error inesperado al aplicar la operación de stock. Los datos se conservaron.',
     retryable: true,
   };
 };
