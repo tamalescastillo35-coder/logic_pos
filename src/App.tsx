@@ -67,19 +67,20 @@ import { Share } from '@capacitor/share';
 import {
   CashRegisterClosedError,
   StockUnavailableError,
-  MatrixConfigurationError,
   describeCheckoutError,
   describeStockOperationError,
   getDayRange,
   getMonthRange,
   getRecordDayKey,
   getRecordMonthKey,
+  isNetZeroStockChange,
+  msUntilNextLocalDay,
   resolveActiveBranchId,
   safeLocalStorageRemove,
   safeLocalStorageSet,
 } from './lib/posSafety';
 import { createDocumentId } from './lib/ids';
-import { canRefundSalesRole, getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
+import { canManageInvoicingRole, canRefundSalesRole, getHistoryAccess, getInventoryExportBranches, hasAppPermission, isOwnerRole, type CompanyRole } from './lib/permissions';
 import { FirestoreConnectionController } from './lib/firestoreConnection';
 
 const isNativePlatform = Capacitor.isNativePlatform();
@@ -951,8 +952,14 @@ export default function App() {
   const canManageSuppliers = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'suppliers_restock');
   const canCloseCash = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'cash_close');
   const canApplyDiscount = hasAppPermission(activeCompanyRole, currentUserMember?.permissions, 'apply_discount');
+  // A plain cashier sees only today's sales of its branch (no statistics, cash audit, inventory
+  // log or older periods); those heavier streams are only opened for whoever uses them.
+  const { canViewCashAudit, canViewInventoryLog, canViewAnalytics, salesWindow } =
+    getHistoryAccess(activeCompanyRole, currentUserMember?.permissions);
   // Owner refunds in any branch; an Encargado (admin) only in its assigned branch.
   const canRefundSales = canRefundSalesRole(activeCompanyRole);
+  // Invoicing (Facturación): the owner for every branch, an Encargado for its assigned branch only.
+  const canManageInvoicing = canManageInvoicingRole(activeCompanyRole);
   const canCreateCompany = !activeCompanyId
     ? Object.keys(userCompanies).length === 0 || Object.values(userCompanies).some((company: { role: CompanyRole }) => isOwnerRole(company.role))
     : isOwner;
@@ -960,13 +967,14 @@ export default function App() {
 
   useEffect(() => {
     const lacksSelectedModule =
-      ((activeTab === 'history' || activeTab === 'analytics') && !canViewSalesHistory)
+      (activeTab === 'history' && !canViewSalesHistory)
+      || (activeTab === 'analytics' && !canViewAnalytics)
       || (activeTab === 'branches' && !isOwner)
       || (activeTab === 'suppliers' && !canViewSuppliers)
-      || (activeTab === 'invoicing' && !isOwner)
+      || (activeTab === 'invoicing' && !canManageInvoicing)
       || (activeTab === 'settings' && !isOwner);
     if (lacksSelectedModule) setActiveTab('pos');
-  }, [activeTab, canManageSuppliers, canRestock, canViewSalesHistory, canViewSuppliers, isOwner]);
+  }, [activeTab, canManageInvoicing, canManageSuppliers, canRestock, canViewAnalytics, canViewSalesHistory, canViewSuppliers, isOwner]);
 
   useEffect(() => {
     if (!canApplyDiscount) setDiscountVal(0);
@@ -1320,12 +1328,17 @@ export default function App() {
 
     void Network.getStatus()
       .then((status) => connectionController.notifyNetwork(status))
-      .catch(() => connectionController.notifyNetwork({ connected: false }));
+      // A failing plugin (older APK without it) leaves connectivity unknown; the Firestore probe
+      // decides instead of locking checkout behind a false "Sin conexión".
+      .catch(() => connectionController.notifyNetworkUnknown());
 
     void Network.addListener('networkStatusChange', (status) =>
       connectionController.notifyNetwork(status)
     ).then((handle) => {
       removeNetworkListener = () => handle.remove();
+    }).catch(() => {
+      // Same older APKs as above: without the plugin there are no network events to follow;
+      // the Firestore probe and the visibility retry below keep the state honest.
     });
 
     const onVisibilityChange = () => {
@@ -1721,7 +1734,7 @@ export default function App() {
     });
 
     let unsubCashTransactions = () => {};
-    if (canViewSalesHistory) {
+    if (canViewCashAudit) {
       const cashLedgerQuery = currentMonthRange
         ? query(
             collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'),
@@ -1743,7 +1756,31 @@ export default function App() {
       unsubCash();
       unsubCashTransactions();
     };
-  }, [user, activeCompanyId, operationalBranchId, canViewSalesHistory]);
+  }, [user, activeCompanyId, operationalBranchId, canViewCashAudit]);
+
+  // Local calendar day ("YYYY-MM-DD"), refreshed at midnight and whenever the app comes back to
+  // the foreground, so the day/month-scoped sales stream below rolls over on terminals that stay
+  // open overnight instead of keeping yesterday's window.
+  const [currentDayKey, setCurrentDayKey] = useState(() => msToDayKey(Date.now()));
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refresh = () => {
+      setCurrentDayKey(msToDayKey(Date.now()));
+      if (timer !== undefined) clearTimeout(timer);
+      timer = setTimeout(() => refresh(), msUntilNextLocalDay(new Date()));
+    };
+    refresh();
+    const onVisibilityChange = () => {
+      if (!document.hidden) refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      if (timer !== undefined) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, []);
+  // What the sales stream is scoped to: today for a plain cashier, the current month otherwise.
+  const salesStreamKey = salesWindow === 'today' ? currentDayKey : currentDayKey.slice(0, 7);
 
   // Sales and stock movements are the two largest, fastest-growing collections in the
   // company, so — like cashRegister above — they're scoped to the active branch's own
@@ -1761,8 +1798,11 @@ export default function App() {
     }
     const compId = activeCompanyId;
     const branchId = operationalBranchId;
-    const currentMonthRange = getMonthRange(getCurrentMonthKey());
+    const currentMonthRange = getMonthRange(salesStreamKey.slice(0, 7));
     if (!currentMonthRange) return;
+    // A plain cashier only needs today's sales of its branch (tens of documents instead of up
+    // to 2000 for the whole month); everyone else keeps the month-long stream.
+    const salesRange = (salesWindow === 'today' ? getDayRange(salesStreamKey) : null) ?? currentMonthRange;
 
     setSales([]);
     setStockMovements([]);
@@ -1771,7 +1811,7 @@ export default function App() {
       query(
         collection(db, 'companies', compId, 'sales'),
         where('branchId', '==', branchId),
-        where('createdAt', '>=', currentMonthRange.start),
+        where('createdAt', '>=', salesRange.start),
         orderBy('createdAt', 'desc'),
         limit(2000)
       ),
@@ -1789,7 +1829,8 @@ export default function App() {
       }
     );
 
-    const unsubStockMovements = onSnapshot(
+    // The inventory log is only opened for whoever can see it (not for a plain cashier).
+    const unsubStockMovements = canViewInventoryLog ? onSnapshot(
       query(
         collection(db, 'companies', compId, 'stockMovements'),
         where('branchId', '==', branchId),
@@ -1805,13 +1846,13 @@ export default function App() {
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, `companies/${compId}/stockMovements`);
       }
-    );
+    ) : () => {};
 
     return () => {
       unsubSales();
       unsubStockMovements();
     };
-  }, [user, activeCompanyId, operationalBranchId, canViewSalesHistory]);
+  }, [user, activeCompanyId, operationalBranchId, canViewSalesHistory, canViewInventoryLog, salesWindow, salesStreamKey]);
 
   const getTodayDateString = () => {
     const d = new Date();
@@ -2193,7 +2234,15 @@ export default function App() {
 
           // `stock` is only ever the consolidated total now — recomputed from the branches
           // instead of being nudged by whichever branch happened to make this change.
-          tx.update(refs[idx], { stock: sumBranchStocks(branchStocks), branchStocks });
+          // A transfer between branches (the deltas cancel out) leaves that total untouched:
+          // rewriting it would also change a legacy total that disagrees with the branches, and
+          // the rules reject any transfer that changes it. The next sale/restock/edit of the
+          // product recomputes it from the branches as usual.
+          if (isNetZeroStockChange(aggregated.get(productId)!)) {
+            tx.update(refs[idx], { branchStocks });
+          } else {
+            tx.update(refs[idx], { stock: sumBranchStocks(branchStocks), branchStocks });
+          }
         });
         normalizedMovements.forEach(movement => {
           tx.set(
@@ -3453,9 +3502,25 @@ export default function App() {
     // Fast path: the active branch's own (branch-scoped) stockMovements already has the
     // 'transfer_out' entry when reprinting from the SENDING branch's Historial.
     let outEntries = stockMovements.filter(mv => mv.transferId === transferId && mv.type === 'transfer_out');
-    if (outEntries.length === 0 && user && activeCompanyId) {
-      // Reprinting from the RECEIVING branch instead — its own scoped stockMovements only has
-      // the 'transfer_in' side, so fetch the sending branch's 'transfer_out' entries on demand.
+    if (outEntries.length === 0) {
+      // Reprinting from the RECEIVING branch instead — its own scoped stockMovements has the
+      // 'transfer_in' side, which carries the same products, quantities, prices, initiator and
+      // both branch names, so mirror it (the rules only let a non-owner list its own branch's
+      // movements, which made the old query below fail for an Encargado).
+      outEntries = stockMovements
+        .filter(mv => mv.transferId === transferId && mv.type === 'transfer_in')
+        .map(mv => ({
+          ...mv,
+          type: 'transfer_out' as const,
+          branchId: mv.counterpartBranchId || '',
+          branchName: mv.counterpartBranchName,
+          counterpartBranchId: mv.branchId,
+          counterpartBranchName: mv.branchName,
+        }));
+    }
+    if (outEntries.length === 0 && isOwner && user && activeCompanyId) {
+      // Owner looking at a transfer that is in neither side's loaded log: fetch the sending
+      // branch's 'transfer_out' entries on demand.
       try {
         const snap = await getDocs(query(
           collection(db, 'companies', activeCompanyId, 'stockMovements'),
@@ -3834,6 +3899,10 @@ export default function App() {
   };
 
   const handleDownloadDashboard = async () => {
+    if (!canViewAnalytics) {
+      alert('Tu cuenta no tiene acceso a las estad\u00EDsticas.');
+      return;
+    }
     let csvContent = "\uFEFF";
     csvContent += "REPORTE DE RENDIMIENTO - DASHBOARD GENERAL\n";
     csvContent += `Periodo: ${statsMonth === 'all' ? 'Todo el hist\u00F3rico' : getMonthLabel(statsMonth)}\n`;
@@ -3858,10 +3927,15 @@ export default function App() {
     // listener), so the other branches' totals for this cross-branch summary are fetched
     // fresh here, once, only when this export is actually clicked. Fetched in parallel but
     // appended in `branches` order afterward, since Promise.all resolves out of order.
+    // A non-owner may only read its own branch (the rules deny every other one), so for an
+    // Encargado the summary is limited to its assigned branch instead of failing silently.
+    const summaryBranches = getInventoryExportBranches<Branch>(activeCompanyRole, operationalBranchId, branches);
     if (user && activeCompanyId) {
       const compId = activeCompanyId;
       const dashboardRange = statsMonth === 'all' ? null : getMonthRange(statsMonth);
-      const branchTotals = await Promise.all(branches.map(async (b) => {
+      let branchTotals: number[];
+      try {
+      branchTotals = await Promise.all(summaryBranches.map(async (b) => {
         const salesRef = collection(db, 'companies', compId, 'sales');
         const snap = await getDocs(dashboardRange
           ? query(
@@ -3881,7 +3955,12 @@ export default function App() {
         });
         return bTotal;
       }));
-      branches.forEach((b, i) => {
+      } catch (err) {
+        console.error('Dashboard export failed:', err);
+        alert('No se pudo calcular el resumen de sucursales. El reporte NO se descargó; intenta de nuevo.');
+        return;
+      }
+      summaryBranches.forEach((b, i) => {
         csvContent += `${b.name.replace(/,/g, ' ')},${branchTotals[i].toFixed(2)} MXN\n`;
       });
     }
@@ -3941,6 +4020,10 @@ export default function App() {
   // selected branch and month — every past month with recorded sales is selectable,
   // since the underlying history in Firestore is never pruned.
   const handleDownloadMonthlyCutPdf = async () => {
+    if (!canViewCashAudit) {
+      alert('Tu cuenta no tiene acceso al corte mensual.');
+      return;
+    }
     const [{ jsPDF }, { autoTable }] = await Promise.all([
       import('jspdf'),
       import('jspdf-autotable'),
@@ -4461,25 +4544,12 @@ export default function App() {
       return;
     }
 
-    if (!isOwner) {
-      const matrixBranches = branches.filter(b => b.isMatriz);
-      if (matrixBranches.length === 0) {
-        const failure = describeStockOperationError(new MatrixConfigurationError('No existe una sucursal Matriz configurada en la empresa. El traspaso solo puede realizarse hacia o desde la Matriz.'));
-        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
-        return;
-      }
-      if (matrixBranches.length > 1) {
-        const failure = describeStockOperationError(new MatrixConfigurationError('Existe más de una sucursal configurada como Matriz. Contacta al Propietario para corregir la configuración.'));
-        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
-        return;
-      }
-      const isSourceMatrix = branches.find(b => b.id === sourceBranchId)?.isMatriz;
-      const isTargetMatrix = branches.find(b => b.id === transferTargetBranchId)?.isMatriz;
-      if (!isSourceMatrix && !isTargetMatrix) {
-        const failure = describeStockOperationError(new MatrixConfigurationError('Uno de los extremos del traspaso (origen o destino) debe ser la sucursal Matriz.'));
-        alert(`${failure.message}\n\nLos productos se conservan en la lista para reintentar.`);
-        return;
-      }
+    // A non-owner (Encargado, or Matriz staff) sends stock out of its own branch — the origin is
+    // pinned to operationalBranchId above — to any other existing branch, Matriz or not. The
+    // destination must still be a real branch of this company.
+    if (!branches.some(branch => branch.id === transferTargetBranchId)) {
+      alert('La sucursal destino ya no existe. El traspaso NO se aplicó; elige otro destino.');
+      return;
     }
 
     // Aggregate by productId defensively (not just relying on the cart's merge-on-add).
@@ -4743,35 +4813,54 @@ export default function App() {
   const [invoiceSales, setInvoiceSales] = useState<Sale[]>([]);
   // Same throttle as branchRevenueFetchedAtRef above: skip refetching if someone leaves and
   // re-enters this tab within 10 minutes — avoids repeatedly paying for the whole company's
-  // invoice-flagged sales just from someone checking back and forth.
-  const invoiceSalesFetchedAtRef = useRef(0);
+  // invoice-flagged sales just from someone checking back and forth. Keyed by what was fetched
+  // (company + branch scope) so a rotated Encargado never keeps the previous branch's list.
+  const invoiceSalesFetchRef = useRef<{ scope: string; at: number }>({ scope: '', at: 0 });
   useEffect(() => {
-    if (!isOwner || activeTab !== 'invoicing' || !user || !activeCompanyId) return;
-    if (Date.now() - invoiceSalesFetchedAtRef.current < 10 * 60 * 1000) return;
-    invoiceSalesFetchedAtRef.current = Date.now();
+    if (!canManageInvoicing || activeTab !== 'invoicing' || !user || !activeCompanyId) return;
+    // An Encargado only sees (and the rules only allow) the invoices of its own branch, so its
+    // query must carry the branch filter; the owner keeps the company-wide view.
+    if (!isOwner && !operationalBranchId) return;
+    const scope = `${activeCompanyId}|${isOwner ? '*' : operationalBranchId}`;
+    if (invoiceSalesFetchRef.current.scope !== scope) {
+      setInvoiceSales([]);
+    } else if (Date.now() - invoiceSalesFetchRef.current.at < 10 * 60 * 1000) {
+      return;
+    }
     let cancelled = false;
     const compId = activeCompanyId;
+    const branchFilter = isOwner ? [] : [where('branchId', '==', operationalBranchId)];
     (async () => {
       try {
-        const snap = await getDocs(query(collection(db, 'companies', compId, 'sales'), where('requiresInvoice', '==', true)));
+        const snap = await getDocs(query(collection(db, 'companies', compId, 'sales'), where('requiresInvoice', '==', true), ...branchFilter));
         const list: Sale[] = [];
         snap.forEach(d => list.push(d.data() as Sale));
-        if (!cancelled) setInvoiceSales(list);
+        if (!cancelled) {
+          setInvoiceSales(list);
+          // Only a completed fetch starts the throttle window for this scope.
+          invoiceSalesFetchRef.current = { scope, at: Date.now() };
+        }
       } catch (err) {
         handleFirestoreError(err, OperationType.LIST, `companies/${compId}/sales (facturacion)`);
       }
     })();
     return () => { cancelled = true; };
-  }, [activeTab, user, activeCompanyId, isOwner]);
+  }, [activeTab, user, activeCompanyId, isOwner, canManageInvoicing, operationalBranchId]);
 
   // Updates one sale's invoiceStatus directly (not via saveAllData, which would replace the
   // branch-scoped `sales` state) and reflects it in the locally-fetched invoiceSales list.
   const handleSetInvoiceStatus = async (saleId: string, status: 'completed' | 'pending') => {
-    if (!isOwner) {
-      alert('Solo el Dueño puede gestionar la facturación.');
+    if (!canManageInvoicing) {
+      alert('Solo el Dueño o el Encargado de la sucursal puede gestionar la facturación.');
       return;
     }
     if (!user || !activeCompanyId) return;
+    // An Encargado manages only the invoices of its own branch (the rules enforce the same).
+    const target = invoiceSales.find(s => s.id === saleId);
+    if (!isOwner && (!target || target.branchId !== operationalBranchId)) {
+      alert('Solo puedes gestionar la facturación de las ventas de tu sucursal.');
+      return;
+    }
     try {
       await updateDoc(doc(db, 'companies', activeCompanyId, 'sales', saleId), { invoiceStatus: status });
       setInvoiceSales(prev => prev.map(s => s.id === saleId ? { ...s, invoiceStatus: status } : s));
@@ -5115,6 +5204,12 @@ export default function App() {
   const [cashFlowAmount, setCashFlowAmount] = useState('');
   const [cashFlowDesc, setCashFlowDesc] = useState('');
   const [historySubTab, setHistorySubTab] = useState<'sales' | 'cashLog' | 'inventory'>('sales');
+  // The sub-tab buttons are hidden without access, but the selection can outlive it (shared
+  // device, a grant revoked live): never render a view the current user cannot open.
+  const visibleHistorySubTab =
+    (historySubTab === 'cashLog' && !canViewCashAudit) || (historySubTab === 'inventory' && !canViewInventoryLog)
+      ? 'sales'
+      : historySubTab;
 
   // Statistics month scope: 'all' shows all-time totals, otherwise a specific "YYYY-MM"
   const [statsMonth, setStatsMonth] = useState<string>(getCurrentMonthKey());
@@ -5132,6 +5227,8 @@ export default function App() {
   useEffect(() => {
     if (!user || !activeCompanyId || !operationalBranchId) return;
     if (activeTab !== 'analytics' && activeTab !== 'history') return;
+    // A plain cashier only sees today's live stream; it never triggers period or legacy reads.
+    if (salesWindow === 'today') return;
 
     const requestedKey = activeTab === 'history'
       ? pdfCutMonth
@@ -5143,11 +5240,12 @@ export default function App() {
         ? getDayRange(requestedKey)
         : getMonthRange(requestedKey);
     if (requestedKey !== 'all' && !range) return;
-    const isMatriz = branches.find(branch => branch.id === operationalBranchId)?.isMatriz ?? false;
+    // Old sales with no branchId can only be read by the owner (see the legacy leg below).
+    const readsLegacySales = isOwner && (branches.find(branch => branch.id === operationalBranchId)?.isMatriz ?? false);
     setHistoricalLimitWarning(false);
     // The current-month live stream is enough for migrated branches. Matriz still performs
     // the compatibility read because old sales with no branchId cannot be expressed as a query.
-    if (requestedKey === getCurrentMonthKey() && activeTab === 'history' && !isMatriz) return;
+    if (requestedKey === getCurrentMonthKey() && activeTab === 'history' && !readsLegacySales) return;
 
     let cancelled = false;
     const compId = activeCompanyId;
@@ -5171,19 +5269,23 @@ export default function App() {
 
     void (async () => {
       try {
+        // Inventory and cash legs are only read for whoever can see those views (the live
+        // listeners above follow the same gates).
         const [salesSnapshot, stockSnapshot, cashSnapshot, legacySalesSnapshot] = await Promise.all([
           getDocs(withPeriod(collection(db, 'companies', compId, 'sales'), true)),
-          getDocs(withPeriod(collection(db, 'companies', compId, 'stockMovements'), true)),
-          getDocs(withPeriod(collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'), false)),
+          canViewInventoryLog ? getDocs(withPeriod(collection(db, 'companies', compId, 'stockMovements'), true)) : Promise.resolve(null),
+          canViewCashAudit ? getDocs(withPeriod(collection(db, 'companies', compId, 'cashRegisters', branchId, 'transactions'), false)) : Promise.resolve(null),
           // Firestore cannot query for a missing field. This intentionally expensive fallback
           // runs only on-demand for Matriz reports until the migration script is executed.
-          isMatriz ? getDocs(query(collection(db, 'companies', compId, 'sales'), limit(historicalLoadLimit + 1))) : Promise.resolve(null),
+          // Owner only: the rules never let a non-owner list sales without its branch filter, and
+          // a denied leg would fail this whole Promise.all (a Matriz Encargado got no reports).
+          readsLegacySales ? getDocs(query(collection(db, 'companies', compId, 'sales'), limit(historicalLoadLimit + 1))) : Promise.resolve(null),
         ]);
         if (cancelled) return;
 
         const wasLimited = salesSnapshot.size > historicalLoadLimit
-          || stockSnapshot.size > historicalLoadLimit
-          || cashSnapshot.size > historicalLoadLimit
+          || Boolean(stockSnapshot && stockSnapshot.size > historicalLoadLimit)
+          || Boolean(cashSnapshot && cashSnapshot.size > historicalLoadLimit)
           || Boolean(legacySalesSnapshot && legacySalesSnapshot.size > historicalLoadLimit);
         setHistoricalLimitWarning(wasLimited);
 
@@ -5204,20 +5306,24 @@ export default function App() {
           return Array.from(merged.values()).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
         });
 
-        setStockMovements(previous => {
-          const merged = new Map<string, StockMovement>(previous.map(movement => [movement.id, movement]));
-          stockSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => {
-            const movement = snapshot.data() as StockMovement;
-            merged.set(movement.id, movement);
+        if (stockSnapshot) {
+          setStockMovements(previous => {
+            const merged = new Map<string, StockMovement>(previous.map(movement => [movement.id, movement]));
+            stockSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => {
+              const movement = snapshot.data() as StockMovement;
+              merged.set(movement.id, movement);
+            });
+            return Array.from(merged.values()).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
           });
-          return Array.from(merged.values()).sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-        });
+        }
 
-        setCashTransactions(previous => {
-          const merged = new Map<string, CashTransaction>(previous.filter(entry => entry.id).map(entry => [entry.id!, entry]));
-          cashSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => merged.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as CashTransaction));
-          return Array.from(merged.values()).sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
-        });
+        if (cashSnapshot) {
+          setCashTransactions(previous => {
+            const merged = new Map<string, CashTransaction>(previous.filter(entry => entry.id).map(entry => [entry.id!, entry]));
+            cashSnapshot.docs.slice(0, historicalLoadLimit).forEach(snapshot => merged.set(snapshot.id, { id: snapshot.id, ...snapshot.data() } as CashTransaction));
+            return Array.from(merged.values()).sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+          });
+        }
       } catch (error) {
         console.error('Historical period load failed:', error);
       } finally {
@@ -5226,7 +5332,7 @@ export default function App() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeTab, user, activeCompanyId, operationalBranchId, pdfCutMonth, statsMonth, statsDay, branches]);
+  }, [activeTab, user, activeCompanyId, operationalBranchId, pdfCutMonth, statsMonth, statsDay, branches, salesWindow, isOwner, canViewInventoryLog, canViewCashAudit]);
   
   const handleRecordCashFlow = async (type: 'Ingreso' | 'Egreso') => {
     if (!canCloseCash) {
@@ -5741,8 +5847,9 @@ export default function App() {
           ].filter(item =>
             item.id === 'branches' ? isOwner
               : item.id === 'suppliers' ? canViewSuppliers
-                : item.id === 'invoicing' ? isOwner
-                  : canViewSalesHistory
+                : item.id === 'invoicing' ? canManageInvoicing
+                  : item.id === 'analytics' ? canViewAnalytics
+                    : canViewSalesHistory
           ).map(({ id, label, icon }) => (
             <button key={id} id={`nav-${id}`}
               onClick={() => { setActiveTab(id as typeof activeTab); setIsMobileMenuOpen(false); }}
@@ -6170,6 +6277,9 @@ export default function App() {
                       </div>
                     )}
 
+                    {/* The shift ledger is only streamed for whoever can audit cash (see the
+                        ledger listener); without it this list would always read "empty". */}
+                    {canViewCashAudit && (
                     <div className="space-y-2 text-left">
                       <h4 className="font-extrabold text-xs text-slate-600 flex items-center gap-1"><History className="w-3.5 h-3.5" /> Transacciones del Turno</h4>
                       <div className="border border-slate-200 rounded-2xl bg-white divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
@@ -6191,6 +6301,7 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -6927,6 +7038,8 @@ export default function App() {
           {activeTab === 'history' && canViewSalesHistory && (
             <div className="space-y-6">
 
+              {/* Cash panel + monthly cut: not offered to a plain cashier, who only reads the sales list below */}
+              {canViewCashAudit && (<>
               {/* Cash Register Control Card */}
               <div className="rounded-3xl p-6 text-white shadow-md grid grid-cols-1 md:grid-cols-12 gap-6 items-center border" style={{ background: 'linear-gradient(to right, color-mix(in srgb, var(--brand-dark) 95%, black), color-mix(in srgb, var(--brand-dark) 82%, black), color-mix(in srgb, var(--brand-dark) 70%, black))', borderColor: 'color-mix(in srgb, var(--brand-dark) 55%, black)' }}>
                 <div className="md:col-span-4 space-y-1">
@@ -7088,12 +7201,16 @@ export default function App() {
                 </div>
               </div>
 
+              </>)}
+
               {/* Sales Invoice history list and Cash register details */}
               <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm p-6 space-y-6 text-left">
                 <div className="flex flex-col md:flex-row md:items-center justify-between pb-3 border-b border-slate-100 gap-4">
                   <div>
-                    <h2 className="text-xl font-extrabold text-slate-800">Historial & Control de Caja</h2>
-                    <p className="text-xs text-slate-500 mt-1">Inspecciona y revisa el listado completo de flujos de efectivo, ventas, egresos y cancelaciones correspondientes a esta sucursal.</p>
+                    <h2 className="text-xl font-extrabold text-slate-800">{canViewCashAudit ? 'Historial & Control de Caja' : 'Historial de ventas de hoy'}</h2>
+                    <p className="text-xs text-slate-500 mt-1">{canViewCashAudit
+                      ? 'Inspecciona y revisa el listado completo de flujos de efectivo, ventas, egresos y cancelaciones correspondientes a esta sucursal.'
+                      : 'Consulta las ventas registradas hoy en tu sucursal.'}</p>
                   </div>
 
                   <div className="flex flex-wrap gap-1 bg-slate-100 p-1 rounded-xl w-full sm:w-auto">
@@ -7101,46 +7218,46 @@ export default function App() {
                       type="button"
                       onClick={() => setHistorySubTab('sales')}
                       className={`px-3 sm:px-4 py-2 rounded-lg font-extrabold text-xs transition cursor-pointer flex items-center whitespace-nowrap ${
-                        historySubTab === 'sales'
+                        visibleHistorySubTab === 'sales'
                           ? 'bg-white shadow-sm'
                           : 'text-slate-500 hover:text-slate-700'
                       }`}
-                      style={historySubTab === 'sales' ? { color: 'var(--brand-primary)' } : {}}
+                      style={visibleHistorySubTab === 'sales' ? { color: 'var(--brand-primary)' } : {}}
                     >
                       <Receipt className="w-3.5 h-3.5 mr-1 text-slate-400" />
                       <span>Ventas ({branchScopedSales.length})</span>
                     </button>
-                    <button
+                    {canViewCashAudit && <button
                       type="button"
                       onClick={() => setHistorySubTab('cashLog')}
                       className={`px-3 sm:px-4 py-2 rounded-lg font-extrabold text-xs transition cursor-pointer flex items-center whitespace-nowrap ${
-                        historySubTab === 'cashLog'
+                        visibleHistorySubTab === 'cashLog'
                           ? 'bg-white shadow-sm'
                           : 'text-slate-500 hover:text-slate-700'
                       }`}
-                      style={historySubTab === 'cashLog' ? { color: 'var(--brand-primary)' } : {}}
+                      style={visibleHistorySubTab === 'cashLog' ? { color: 'var(--brand-primary)' } : {}}
                     >
                       <CircleDollarSign className="w-3.5 h-3.5 mr-1 text-slate-400" />
                       <span className="sm:hidden">Caja ({branchScopedTransactions.length})</span>
                       <span className="hidden sm:inline">Auditoría de Caja ({branchScopedTransactions.length})</span>
-                    </button>
-                    <button
+                    </button>}
+                    {canViewInventoryLog && <button
                       type="button"
                       onClick={() => setHistorySubTab('inventory')}
                       className={`px-3 sm:px-4 py-2 rounded-lg font-extrabold text-xs transition cursor-pointer flex items-center whitespace-nowrap ${
-                        historySubTab === 'inventory'
+                        visibleHistorySubTab === 'inventory'
                           ? 'bg-white shadow-sm'
                           : 'text-slate-500 hover:text-slate-700'
                       }`}
-                      style={historySubTab === 'inventory' ? { color: 'var(--brand-primary)' } : {}}
+                      style={visibleHistorySubTab === 'inventory' ? { color: 'var(--brand-primary)' } : {}}
                     >
                       <Package className="w-3.5 h-3.5 mr-1 text-slate-400" />
                       <span>Inventario ({branchScopedStockMovements.length})</span>
-                    </button>
+                    </button>}
                   </div>
                 </div>
 
-                {historySubTab === 'sales' ? (
+                {visibleHistorySubTab === 'sales' ? (
                   branchScopedSales.length === 0 ? (
                     <div className="border border-dashed rounded-xl p-12 text-center text-slate-400">
                       <Receipt className="w-12 h-12 text-slate-300 mx-auto mb-3" />
@@ -7216,7 +7333,7 @@ export default function App() {
                       ))}
                     </div>
                   )
-                ) : historySubTab === 'cashLog' ? (
+                ) : visibleHistorySubTab === 'cashLog' ? (
                   /* Cash audits view */
                   branchScopedTransactions.length === 0 ? (
                     <div className="border border-dashed rounded-xl p-12 text-center text-slate-400">
@@ -7325,7 +7442,7 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'analytics' && canViewSalesHistory && (
+          {activeTab === 'analytics' && canViewAnalytics && (
             activeCompanyRole === 'employee' ? (
               <div className="bg-white rounded-3xl border border-slate-200 p-8 shadow-sm space-y-6 max-w-2xl mx-auto mt-6 text-center select-none">
                 <div className="w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center mx-auto border border-rose-100">
@@ -7856,8 +7973,11 @@ export default function App() {
                             </button>
                           </div>
                         ) : (
-                          <span className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1">
-                            <ShieldCheck className="w-2.5 h-2.5" /> Solo Admins
+                          <span
+                            className="text-[9px] text-slate-400 font-bold select-none py-1 flex items-center gap-1"
+                            title="Solo el Dueño, o quien tenga el permiso de proveedores, puede editar o eliminar proveedores"
+                          >
+                            <ShieldCheck className="w-2.5 h-2.5" /> Solo Dueño
                           </span>
                         )}
                       </div>
@@ -7869,7 +7989,7 @@ export default function App() {
           )}
 
           {/* SCREEN: FACTURACION E HISTORIAL DE TICKETS (INVOICING) */}
-          {activeTab === 'invoicing' && isOwner && (
+          {activeTab === 'invoicing' && canManageInvoicing && (
             <div className="bg-white p-4 lg:p-6 rounded-3xl shadow-xl border border-slate-100 flex-grow animate-in fade-in slide-in-from-bottom-4 relative mb-24 lg:mb-8 mx-auto w-full max-w-7xl">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center border-b pb-5 mb-5 space-y-3 sm:space-y-0 relative z-10 w-full">
                 <div>
@@ -7878,7 +7998,7 @@ export default function App() {
                     Facturación Electrónica CFDI
                   </h2>
                   <p className="text-slate-500 text-xs mt-1">
-                    Gestiona las facturas pendientes por emitir y el historial de folios generados.
+                    Gestiona las facturas pendientes por emitir y el historial de folios generados{isOwner ? '.' : ' de tu sucursal.'}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
