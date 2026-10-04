@@ -121,6 +121,19 @@ export class FirestoreConnectionController {
     }
   }
 
+  /**
+   * The native network plugin could not report a status at all (for example an older Android
+   * build that predates the plugin). That is "unknown", not "offline": assume connectivity and
+   * let the Firestore probe decide, exactly as the app behaved before the plugin existed.
+   */
+  public notifyNetworkUnknown(): void {
+    if (this.isDisposed) return;
+    this.isNetworkConnected = true;
+    if (this.status !== 'ready' && this.companyId) {
+      this.startProbe({ force: true });
+    }
+  }
+
   public retry(): void {
     if (this.isDisposed) return;
     // A manual retry (or a resume from background) must be able to recover from a false
