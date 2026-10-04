@@ -92,12 +92,17 @@ service cloud.firestore {
         'suppliers_restock', 'cash_close', 'apply_discount'];
     }
 
-    // Stored permissions add to defaults; admin is never a permission bypass.
+    // Stored permissions add to the role defaults, which mirror DEFAULT_ROLE_PERMISSIONS in
+    // src/lib/permissions.ts. An Encargado (admin) runs its branch (history, transfers, restock,
+    // cash close, discounts) but never the catalogue or suppliers; a cashier (employee) reads its
+    // own branch history. Branch scope is enforced separately by canUseBranch(), and admin is
+    // never a blanket permission bypass.
     function hasPermission(companyId, perm) {
       let member = get(memberPath(companyId, request.auth.uid)).data;
       return perm in allowedPermissions() && (
         (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
-        || (member.role == 'admin' && perm in ['stock_transfer', 'stock_restock'])
+        || (member.role == 'admin' && perm in ['sales_history', 'stock_transfer', 'stock_restock', 'cash_close', 'apply_discount'])
+        || (member.role == 'employee' && perm == 'sales_history')
         || ('permissions' in member && member.permissions is list && perm in member.permissions)
       );
     }
@@ -120,24 +125,30 @@ service cloud.firestore {
       );
     }
 
-    function isMatrix(companyId, branchId) {
-      return validBranch(companyId, branchId)
-        && ('isMatriz' in get(branchPath(companyId, branchId)).data && get(branchPath(companyId, branchId)).data.isMatriz == true);
-    }
-
+    // A transfer pairs two existing, distinct branches. The owner may pair any two; any other
+    // member only a pair that includes its own assigned branch (the other end may be any branch,
+    // Matriz included). Used to read transfer records from either end.
     function canTransferBetween(companyId, branchId, counterpartId) {
       let member = get(memberPath(companyId, request.auth.uid)).data;
       let userBranch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
       return branchId != counterpartId && validBranch(companyId, branchId)
         && validBranch(companyId, counterpartId) && (
           (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
-          || (
-            member.role in ['admin', 'employee'] && (
-              (userBranch == branchId && isMatrix(companyId, counterpartId))
-              || (userBranch == counterpartId && isMatrix(companyId, branchId))
-            )
-          )
+          || (member.role in ['admin', 'employee'] && (userBranch == branchId || userBranch == counterpartId))
         );
+    }
+
+    // Recording a transfer: stock may only be sent OUT of the user's own branch. transfer_out is
+    // written on the origin branch and transfer_in on the destination with the origin as
+    // counterpart, so the origin of either record must be the user's own branch (owner: any).
+    function canRecordTransfer(companyId, data) {
+      let member = get(memberPath(companyId, request.auth.uid)).data;
+      let userBranch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
+      let origin = data.type == 'transfer_out' ? data.branchId : data.counterpartBranchId;
+      return canTransferBetween(companyId, data.branchId, data.counterpartBranchId) && (
+        (member.role == 'owner' && get(companyPath(companyId)).data.ownerId == request.auth.uid)
+        || userBranch == origin
+      );
     }
 
     function canReadMovement(companyId, data) {
@@ -148,8 +159,11 @@ service cloud.firestore {
 
     // Map diff restricts ordinary checkout/restock writes to the assigned key.
     // Product documents have no movement/sale ID: getAfter cannot discover the randomly
-    // named audit writes. The two-key transfer exception therefore remains uncorrelated
-    // and cannot prove its second key is Matrix. See FIRESTORE_RULES_AUDIT.json.
+    // named audit writes. The two-key transfer exception therefore remains uncorrelated: it
+    // cannot prove which branch the second key belongs to (the stockMovements rules do bind the
+    // origin of the recorded transfer to the sender's own branch via canRecordTransfer). It does
+    // pin the direction: for a non-owner the own branch must go down and no branch key may be
+    // removed, so stock can only be sent out, never pulled in. See FIRESTORE_RULES_AUDIT.json.
     function canUpdateStock(companyId) {
       let member = get(memberPath(companyId, request.auth.uid)).data;
       let branch = ('assignedBranchId' in member) ? member.assignedBranchId : '';
@@ -169,6 +183,8 @@ service cloud.firestore {
             && ((branch in before && after[branch] <= before[branch]) || canRestock))
           || (canTransfer
             && changed.size() == 2 && changed.hasAny([branch])
+            && (branch in before) && after[branch] < before[branch]
+            && after.diff(before).removedKeys().size() == 0
             && incoming().stock == existing().stock)
         )
       );
@@ -207,6 +223,18 @@ service cloud.firestore {
         && existing().status == 'Completed'
         && incoming().status == 'Refunded'
         && incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+    }
+
+    // Invoicing (Facturación): an Encargado (admin) may flip invoiceStatus on a sale of its own
+    // assigned branch that was flagged to be invoiced, and change nothing else about the sale.
+    // The owner keeps company-wide invoicing through the owner clause of the update rule.
+    function canAdminInvoiceSale(companyId) {
+      return getMemberData(companyId).role == 'admin'
+        && ('branchId' in existing())
+        && canUseBranch(companyId, existing().branchId)
+        && ('requiresInvoice' in existing()) && existing().requiresInvoice == true
+        && incoming().invoiceStatus in ['pending', 'completed']
+        && incoming().diff(existing()).affectedKeys().hasOnly(['invoiceStatus']);
     }
 
     function canCreateProductStock(companyId) {
@@ -546,11 +574,34 @@ service cloud.firestore {
     }
 
     // User Profile Document Access Rules
+    // Credential (employee-number) accounts sign in with an unverifiable @logicpos.com identity,
+    // so isVerifiedUser() alone locked them out of their own profile: a new account could never
+    // create users/{uid} (the client then retried forever) and the role sync after a role change
+    // never landed. They may write their own profile only as the client bootstraps it: exactly
+    // one company, where the Owner already provisioned them, with the role that member doc holds.
+    // The profile grants nothing by itself; every company rule still reads the member doc.
+    function isCredentialSelfProfile(userId, data) {
+      return isSignedIn() && request.auth.uid == userId
+        && request.auth.token.email is string
+        && request.auth.token.email.matches('.*@logicpos\\.com')
+        && data.uid == userId
+        && 'activeCompanyId' in data && isValidId(data.activeCompanyId)
+        && 'companies' in data && data.companies is map
+        && data.companies.keys().hasOnly([data.activeCompanyId])
+        && data.activeCompanyId in data.companies
+        && data.companies[data.activeCompanyId] is map
+        && isMemberOfCompany(data.activeCompanyId)
+        && data.companies[data.activeCompanyId].role == getMemberRole(data.activeCompanyId);
+    }
+
     match /users/{userId} {
       allow read: if isSignedIn() && request.auth.uid == userId;
-      allow create: if isVerifiedUser() && request.auth.uid == userId && isValidUser(incoming());
-      allow update: if isVerifiedUser() && isValidUser(incoming()) && (
-        request.auth.uid == userId
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(incoming())
+        && (isVerifiedUser() || isCredentialSelfProfile(userId, incoming()));
+      allow update: if isValidUser(incoming()) && (
+        (isVerifiedUser() && request.auth.uid == userId)
+        ||
+        isCredentialSelfProfile(userId, incoming())
         ||
         // An Owner cleaning up a departing member's cross-reference right after deleting
         // companies/{companyId}/members/{userId}: that member doc is the source of truth for
@@ -561,6 +612,7 @@ service cloud.firestore {
         // in multiple companies needs the extra ones cleared by hand), the actor genuinely
         // owns that company, and the write only touches companies/activeCompanyId.
         (
+          isVerifiedUser() &&
           'companies' in existing() && existing().companies.keys().size() == 1 &&
           isOwner(existing().companies.keys()[0]) &&
           incoming().companies.size() == 0 &&
@@ -713,7 +765,15 @@ service cloud.firestore {
 
       // Sales subcollection inside Company
       match /sales/{saleId} {
-        allow get: if isSignedIn() && canUseBranch(companyId, existing().branchId);
+        // The checkout transaction reads the id of the sale it is about to create (replay
+        // detection). A document that does not exist yet has no branchId to check, so for a
+        // missing document any member with a valid assigned branch may look; an existing sale is
+        // readable only within its own branch.
+        allow get: if isSignedIn() && (
+          resource == null
+            ? canUseBranch(companyId, assignedBranch(companyId))
+            : canUseBranch(companyId, existing().branchId)
+        );
         allow list: if isSignedIn() && hasPermission(companyId, 'sales_history') && canUseBranch(companyId, existing().branchId);
         // Any assigned member can ring up a new sale; owner can restore/void records.
         allow create: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) &&
@@ -722,11 +782,13 @@ service cloud.firestore {
           canUseBranch(companyId, incoming().branchId) &&
           (!('discount' in incoming()) || incoming().discount == 0 || hasPermission(companyId, 'apply_discount'));
         allow delete: if canWriteCompany(companyId) && isOwner(companyId) && isValidId(saleId);
-        // Owner: refunds anywhere and global invoicing. Admin: refunds of its own branch only.
+        // Owner: refunds anywhere and company-wide invoicing. Admin (Encargado): refunds and
+        // invoicing of its own branch only.
         allow update: if canWriteCompany(companyId) && isMemberOfCompany(companyId) && isValidId(saleId) && isValidSale(incoming()) && incoming().id == saleId
           && (
             (isOwner(companyId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'invoiceStatus']))
             || canAdminRefundSale(companyId)
+            || canAdminInvoiceSale(companyId)
           );
       }
 
@@ -786,7 +848,7 @@ service cloud.firestore {
               && canUseBranch(companyId, incoming().branchId)
               && (hasPermission(companyId, 'products_edit') || hasPermission(companyId, 'stock_restock')))
             || ((incoming().type == 'transfer_in' || incoming().type == 'transfer_out')
-              && canTransferBetween(companyId, incoming().branchId, incoming().counterpartBranchId)
+              && canRecordTransfer(companyId, incoming())
               && hasPermission(companyId, 'stock_transfer'))
           );
         allow update: if false;
