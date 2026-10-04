@@ -163,6 +163,29 @@ export const getDayRange = (dayKey: string): { start: number; end: number } | nu
   return { start: startDate.getTime(), end: new Date(year, monthIndex, day + 1).getTime() };
 };
 
+/**
+ * Milliseconds from `now` until just after the next local midnight, when the calendar day
+ * changes. A one-second margin keeps a timer from firing a hair early and recomputing the day
+ * that is ending; the minimum keeps a bad clock from producing a busy loop.
+ */
+export const msUntilNextLocalDay = (now: Date): number => {
+  const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+  return Math.max(nextDay - now.getTime() + 1000, 1000);
+};
+
+/**
+ * True when the per-branch stock deltas applied to ONE product cancel out (a transfer between
+ * branches: units leave one branch and arrive in another). Such an operation does not change
+ * the product's consolidated total, so the total must not be rewritten: recomputing it from the
+ * branch map would also "correct" a legacy total that disagrees with the branches, and the rules
+ * reject a transfer whose total changes. Compared at the 3-decimal resolution stock uses.
+ */
+export const isNetZeroStockChange = (deltasByBranch: ReadonlyMap<string, number>): boolean => {
+  let net = 0;
+  deltasByBranch.forEach(delta => { net += delta; });
+  return Math.round(net * 1000) === 0;
+};
+
 const normalizeFirebaseCode = (error: unknown): string => {
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === 'string' ? code.replace(/^firestore\//, '') : '';
